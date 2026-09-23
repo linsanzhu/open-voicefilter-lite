@@ -1,0 +1,90 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Type checkers / linters
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Logs
+logs/
+*.log
+
+# Training artefacts (kept locally, never pushed)
+checkpoints/
+runs/
+tb_logs/
+*.pt
+*.pth
+*.ckpt
+
+# Exported models (kept locally)
+*.onnx
+*.torchscript
+*.torch
+
+# Local data / caches / model weights
+data/
+models/
+datasets/
+.cache/
+models/             # HuggingFace / speechbrain local cache
+hf_cache/
+artifacts/
+
+# Multimedia
+*.wav
+*.flac
+*.mp3
+*.m4a
+*.ogg
+
+# Secrets / local config
+.env
+.env.*
+*.local
+
+# OS
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
