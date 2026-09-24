@@ -8,6 +8,7 @@ import copy
 import math
 import os
 import queue
+import resource
 import threading
 import time
 import warnings
@@ -151,31 +152,61 @@ class ModelEMA:
             # Hold EMA = model.
             for name, param in model.named_parameters():
                 if param.requires_grad:
-                    self.shadow[name].copy_(param.detach().float())
+                    shadow = self.shadow[name]
+                    p = param.detach().float()
+                    if p.device != shadow.device:
+                        # Defensive: align devices. Rare in practice but
+                        # cheap, and shields us from MPS cast quirks or
+                        # any future model re-location.
+                        p = p.to(shadow.device)
+                    shadow.copy_(p)
             return
         d = self.decay
         for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
             shadow = self.shadow[name]
-            shadow.mul_(d).add_(param.detach().float(), alpha=1.0 - d)
+            p = param.detach().float()
+            if p.device != shadow.device:
+                # See warmup branch above — keep operands on the same
+                # device for the in-place mul_/add_ below.
+                p = p.to(shadow.device)
+            shadow.mul_(d).add_(p, alpha=1.0 - d)
 
     def state_dict(self) -> dict[str, torch.Tensor]:
         return {k: v.clone() for k, v in self.shadow.items()}
 
-    def load_state_dict(self, sd: dict[str, torch.Tensor]) -> None:
+    def load_state_dict(
+        self,
+        sd: dict[str, torch.Tensor],
+        map_location: Optional[torch.device] = None,
+    ) -> None:
+        """Restore EMA shadow from a checkpoint.
+
+        `map_location` lets the caller force the loaded tensors onto a
+        specific device — important because checkpoints are loaded with
+        `torch.load(..., map_location="cpu")` (for portability), but the
+        live model may live on MPS/CUDA. Without this, `shadow` would
+        end up on CPU while `param` is on MPS and the next `update()`
+        crashes with a device-mismatch RuntimeError.
+        """
         missing = set(self.shadow.keys()) - set(sd.keys())
         if missing:
             raise ValueError(f"[ema] missing params in checkpoint: {sorted(missing)[:5]}…")
         for k, v in sd.items():
-            self.shadow[k] = v.clone().float()
+            t = v.clone().float()
+            if map_location is not None and t.device != map_location:
+                t = t.to(map_location)
+            self.shadow[k] = t
 
     def apply_to(self, model: torch.nn.Module) -> None:
         """Copy EMA shadow weights into the live model's trainable params."""
         with torch.no_grad():
             for name, param in model.named_parameters():
                 if param.requires_grad and name in self.shadow:
-                    param.data.copy_(self.shadow[name].to(param.dtype))
+                    shadow = self.shadow[name]
+                    target = shadow.to(device=param.device, dtype=param.dtype)
+                    param.data.copy_(target)
 
 
 # ---- Core training routine ----
@@ -183,6 +214,9 @@ class ModelEMA:
 
 def count_params(module: torch.nn.Module) -> int:
     return sum(p.numel() for p in module.parameters() if p.requires_grad)
+
+
+# ---- Core training routine ----
 
 
 def train(hp: HParams, args: argparse.Namespace) -> None:
@@ -211,14 +245,16 @@ def train(hp: HParams, args: argparse.Namespace) -> None:
     model = VoiceFilterLite(hp).to(device)
     n_params = count_params(model)
     print(f"[train] trainable params: {n_params:,}")
-    # Paper §4.4: 3 LSTM × 256 + 2-FC×64 noise-type predictor ≈ 2.2 M
-    # params at 8-bit quantization (2.2 MB). Our FP32 model is ~1.82 M,
-    # ~17% smaller than the paper number — same architecture, the gap
-    # is within quantization-overhead tolerance (paper §3.5 FlatBuffer
-    # metadata not counted here). Allow 1.5–2.5 M to catch obvious drift
-    # (e.g., wrong `hidden_dim` or extra linear layers).
-    assert 1.5e6 <= n_params <= 2.5e6, (
-        f"param count {n_params:,} outside expected ~1.8-2.2M range; "
+    # Paper §4.4: 3 LSTM × 256 + 2-FC×64 noise-type predictor ≈ 2.2 MB
+    # post-INT8 (≈ 2.4 M FP32). Actual FP32 count scales with `hidden_dim`
+    # and `num_lstm_layers` — defaults (256 × 2) → ~1.8 M, paper-faithful
+    # (256 × 3) → ~2.2 M, the common "wider" setting (384 × 2) → ~2.7 M,
+    # (384 × 3) → ~3.5 M. Bounds below guard against *silent* architecture
+    # mistakes (forgot to instantiate the LSTM stack, accidentally added
+    # an extra predictor branch) without rejecting deliberate hyperparam
+    # choices that deviate from §4.4.
+    assert 1.0e6 <= n_params <= 4.0e6, (
+        f"param count {n_params:,} outside expected ~1.5-3.5M range; "
         "double-check the model architecture before training."
     )
 
@@ -280,9 +316,18 @@ def train(hp: HParams, args: argparse.Namespace) -> None:
         writer = SummaryWriter(log_dir=str(out_dir / "tb"))
         writer.add_scalar("model/params", n_params, 0)
 
+    # ---- Start from scratch ----
+    # Resume-from-checkpoint is intentionally not supported: the dataset
+    # iterator's RNG state and `_target_buffer` aren't persisted, so
+    # resuming would silently restart epoch-1 — the model re-sees samples
+    # 0..104 000 with optimizer momentum already trained on them, which
+    # skews the loss curve. If a run dies, restart fresh into a new
+    # `--output-dir` and accept the loss; the model's `ckpt_step*.pt`
+    # files remain on disk for offline evaluation.
+    step = 0
+
     # ---- Train ----
     model.train()
-    step = 0
     last_log = time.time()
     running_loss = 0.0
     running_loss_asym = 0.0
@@ -351,6 +396,23 @@ def train(hp: HParams, args: argparse.Namespace) -> None:
         running_count += 1
         step += 1
 
+        # ---- Periodic allocator cache release ----
+        # PyTorch's MPS / CUDA caching allocators keep a high-water mark
+        # of every unique tensor shape they ever saw and don't return
+        # chunks to the OS until the process ends. Without this, RSS on
+        # Apple Silicon climbs steadily even when no Python object is
+        # leaking (see hparams.empty_cache_every). Only call on the
+        # "big-leak" cadence (default 2000 steps) — empty_cache has
+        # measurable per-call cost.
+        if (
+            hp.empty_cache_every > 0
+            and step % hp.empty_cache_every == 0
+        ):
+            if device.type == "mps":
+                torch.mps.empty_cache()
+            elif device.type == "cuda":
+                torch.cuda.empty_cache()
+
         if step % hp.log_every == 0:
             now = time.time()
             avg_loss = running_loss / max(1, running_count)
@@ -359,15 +421,22 @@ def train(hp: HParams, args: argparse.Namespace) -> None:
             elapsed = now - last_log
             sps = hp.log_every * hp.batch_size / max(1.0, elapsed)
             cur_lr = scheduler.get_last_lr()[0]
+            # RSS in GiB — `getrusage` is the lowest-overhead portable
+            # option (no /proc scan, no psutil dep). macOS and Linux both
+            # populate `ru_maxrss` in bytes (despite the name — that's
+            # historically a BSD-ism that POSIX kept). Useful for spotting
+            # leaks: should plateau within a few hundred steps, not climb.
+            rss_gib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 ** 3)
             print(
                 f"[train] step={step}/{hp.total_steps} "
                 f"loss={avg_loss:.4f} asym={avg_loss_asym:.4f} hinge={avg_loss_hinge:.4f} "
-                f"lr={cur_lr:.2e} samples/s={sps:.1f}"
+                f"lr={cur_lr:.2e} samples/s={sps:.1f} rss={rss_gib:.2f}GiB"
             )
             if writer is not None:
                 writer.add_scalar("train/loss", avg_loss, step)
                 writer.add_scalar("train/loss_asym", avg_loss_asym, step)
                 writer.add_scalar("train/lr", cur_lr, step)
+                writer.add_scalar("train/rss_gib", rss_gib, step)
                 if hp.use_noise_type_predictor:
                     writer.add_scalar("train/loss_hinge", avg_loss_hinge, step)
             running_loss = 0.0
@@ -459,6 +528,13 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--ema-decay", type=float, default=None,
                    help="Override hp.ema_decay (e.g. 0.999).")
 
+    p.add_argument("--dataloader-workers", type=int, default=None,
+                   help="Number of DataLoader worker PROCESSES "
+                        "(0 = single-threaded; n>0 = n parallel processes). "
+                        "PyTorch's multiprocessing batch queue is UNBOUNDED, "
+                        "so on memory-constrained machines (MPS, shared "
+                        "unified memory) prefer 0; on CUDA, 2-4 is fine.")
+
     # HF Hub endpoint override (highest-priority in the precedence chain —
     # see `cli.apply_hf_endpoint`). Useful for users behind firewalls or in
     # regions where `huggingface.co` is blocked; e.g. China: `--hf-endpoint
@@ -506,6 +582,13 @@ def main() -> None:
         hp.use_real_rir = True
     if args.ema_decay is not None:
         hp.ema_decay = args.ema_decay
+    if args.dataloader_workers is not None:
+        # Most useful on memory-constrained machines (MPS): PyTorch's
+        # multiprocessing batch queue is unbounded, so 4 workers on a
+        # 16 GB Mac will OOM the process long before the queue drains.
+        # Switching to 0 makes the iterator single-threaded; PrefetchIterator's
+        # bounded queue (max_prefetch) keeps memory predictable.
+        hp.dataloader_workers = args.dataloader_workers
 
     # Resolve HF Hub endpoint as early as possible — before any
     # `datasets.load_dataset` / `huggingface_hub` / speechbrain call.

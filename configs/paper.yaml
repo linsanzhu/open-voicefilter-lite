@@ -31,7 +31,7 @@ frame_stack: 4
 
 # ---- Data / mixture ----
 sample_length_sec: 3.0 # paper Fig 2: "segment of 3 seconds during training"
-snr_min_db: 1.0 # paper §3.2: "random within 1dB to 10dB"
+snr_min_db: -1.0 # paper §3.2: "random within -1dB to 10dB"
 snr_max_db: 10.0
 silent_target_prob: 0.10 # train the "do nothing" mode
 silent_interference_prob: 0.10
@@ -92,9 +92,9 @@ ema_decay: 0.999
 ema_warmup_steps: 100
 
 # ---- Loss (paper §3.3 — asymmetric L2, α = 10) ----
-loss_alpha: 10.0 # paper Tables 1 & 2 ("asym L2, α = 10")
-loss_beta: 0.0
-loss_lambda: 5.0
+# g_asym(x, α) = α·x if x > 0 else x; loss = mean(g_asym(target - pred, α)²)
+# Over-suppression errors (S_enh < S_cln) are amplified by α² = 100.
+loss_alpha: 10.0
 
 # ---- Noise-type predictor (paper §4.2 / §3.4) ----
 # Trained with hinge loss for per-frame binary classification

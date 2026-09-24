@@ -27,7 +27,7 @@ frame_stack: 4
 
 # ---- Data / mixture ----
 sample_length_sec: 3.0 # paper Fig 2: "segment of 3 seconds during training"
-snr_min_db: 1.0 # paper §3.2: "random within 1dB to 10dB"
+snr_min_db: -1.0 # paper §3.2: "random within -1dB to 10dB"
 snr_max_db: 10.0
 silent_target_prob: 0.10 # train the "do nothing" mode
 silent_interference_prob: 0.10
@@ -42,7 +42,7 @@ interference_split: train.500
 # run `python scripts/download_data.py --assets librispeech` and have the
 # cache locally, flip this to false — `streaming=False` is much faster
 # per batch (no network fetch) and recommended for any non-smoke run.
-streaming: true
+streaming: false
 
 # ---- Augmentation (paper §3.2 — speech + non-speech, additive or reverb) ----
 # Paper's non-speech source is "ambient noises recorded in cafes, cars, and
@@ -61,12 +61,12 @@ streaming: true
 # If a dataset is enabled but fails to load, training degrades gracefully:
 #   - Musan unavailable → interference falls back to all-LibriSpeech
 #   - real RIR unavailable → procedural exponential-decay RIRs (always works)
-use_musan: false
+use_musan: true
 musan_prob: 0.7 # P(interference = Musan noise vs LibriSpeech speaker)
 musan_subset: babble,music,noise
-musan_babble: false
+musan_babble: true
 musan_babble_n_speakers: 3
-use_real_rir: false
+use_real_rir: true
 rir_prob: 0.4 # P(target is convolved with a random RIR)
 # Primary `confit/rir-noise` is a loader that pulls SLR28 from openslr.org;
 # fallback `quinnlue/rirs` is a HF-resident mirror with the same
@@ -90,9 +90,9 @@ ema_decay: 0.999
 ema_warmup_steps: 100
 
 # ---- Loss (paper §3.3 — asymmetric L2, α = 10) ----
-loss_alpha: 10.0 # paper Tables 1 & 2 ("asym L2, α = 10")
-loss_beta: 0.0
-loss_lambda: 5.0
+# g_asym(x, α) = α·x if x > 0 else x; loss = mean(g_asym(target - pred, α)²)
+# Over-suppression errors (S_enh < S_cln) are amplified by α² = 100.
+loss_alpha: 10.0
 
 # ---- Noise-type predictor (paper §4.2 / §3.4) ----
 # Trained with hinge loss for per-frame binary classification

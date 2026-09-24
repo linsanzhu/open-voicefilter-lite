@@ -39,6 +39,10 @@ from open_voicefilter_lite.audio import (
     wav_to_log_mel,
 )
 from open_voicefilter_lite.cli import apply_hf_endpoint
+from open_voicefilter_lite.dataset import (
+    _cast_audio_no_decode,
+    _disable_hf_audio_decode,
+)
 from open_voicefilter_lite.hparams import HParams
 from open_voicefilter_lite.model import StreamingVoiceFilter, VoiceFilterLite
 from open_voicefilter_lite.speaker_encoder import FrozenSpeakerEncoder
@@ -63,6 +67,47 @@ def sdr(estimate: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> floa
     return 10.0 * torch.log10(
         target.pow(2).sum() / ((estimate - target).pow(2).sum() + eps) + eps
     )
+
+
+def log_mel_snr(
+    estimate: torch.Tensor,
+    target: torch.Tensor,
+    mix: torch.Tensor,
+    eps: float = 1e-8,
+) -> tuple[float, float, float]:
+    """Compute SI-SNR in the **linear-mel** domain. The model itself operates
+    on linear-mel filterbank energies (`_mask_logmel` applies the mask to
+    magnitude then re-logs), so this metric is the cleanest phase-free proxy
+    for how well VoiceFilter recovers the target's spectral envelope.
+
+    Avoids the Griffin-Lim phase pitfall that makes time-domain SI-SNR
+    unreliable (Griffin-Lim's phase is essentially random and destroys the
+    time-alignment SI-SNR requires).
+
+    All inputs are (T, F) **log-mel** filterbank energies; we convert to
+    linear-mel internally before computing SI-SNR.
+    Returns (input_snr_db, output_snr_db, improvement_db).
+    """
+    log_mel_floor = 1e-6   # matches hp.log_mel_floor default
+    est_lin = (torch.exp(estimate) - log_mel_floor).clamp(min=0.0)
+    tgt_lin = (torch.exp(target) - log_mel_floor).clamp(min=0.0)
+    mix_lin = (torch.exp(mix) - log_mel_floor).clamp(min=0.0)
+
+    def _snr_db(est: torch.Tensor, ref: torch.Tensor) -> float:
+        # Per-mel-bin SI-SNR (DC-removed), then averaged across the 80 bins.
+        est_c = est - est.mean(dim=0, keepdim=True)
+        ref_c = ref - ref.mean(dim=0, keepdim=True)
+        alpha = (est_c * ref_c).sum(dim=0) / (ref_c.pow(2).sum(dim=0) + eps)
+        proj = alpha.unsqueeze(0) * ref_c
+        noise = est_c - proj
+        per_bin_db = 10.0 * torch.log10(
+            proj.pow(2).sum(dim=0) / (noise.pow(2).sum(dim=0) + eps) + eps
+        )
+        return float(per_bin_db.mean())
+
+    snr_in = _snr_db(mix_lin, tgt_lin)
+    snr_out = _snr_db(est_lin, tgt_lin)
+    return snr_in, snr_out, snr_out - snr_in
 
 
 # ---- Audio decoding ----
@@ -111,24 +156,35 @@ def build_eval_pairs(
     from datasets import load_dataset
     from itertools import chain
 
+    # `cache_dir` is honoured by `load_dataset` only when `streaming=False`;
+    # when streaming, the rows come straight from the HF Hub stream. The
+    # `librispeech_cache` field on HParams points at the on-disk arrow
+    # cache populated by `scripts/download_data.py`.
+    load_kwargs: dict = {"streaming": hp.streaming}
+    if not hp.streaming:
+        load_kwargs["cache_dir"] = hp.librispeech_cache
+
+    # Disable HF datasets' eager torchcodec/FFmpeg audio decode so we can
+    # hand the bytes to `soundfile` (which is already used by
+    # `decode_audio` below) — see `dataset._disable_hf_audio_decode`.
+    _disable_hf_audio_decode()
+
+    def _load(config: str, split: str):
+        ds = load_dataset(
+            "openslr/librispeech_asr",
+            config,
+            split=split,
+            **load_kwargs,
+        )
+        return _cast_audio_no_decode(ds)
+
     target_iter = iter(
         chain.from_iterable(
-            load_dataset(
-                "openslr/librispeech_asr",
-                hp.target_config,
-                split=s,
-                streaming=True,
-            )
-            for s in hp.target_splits
+            _load(hp.target_config, s) for s in hp.target_splits
         )
     )
     interference_iter = iter(
-        load_dataset(
-            "openslr/librispeech_asr",
-            hp.interference_config,
-            split="test",
-            streaming=True,
-        )
+        _load(hp.interference_config, hp.interference_split)
     )
 
     rng = random.Random(seed)
@@ -188,12 +244,22 @@ def evaluate(hp: HParams, args: argparse.Namespace) -> None:
     model.load_state_dict(ckpt["model_state"])
     print(f"[eval] loaded {args.checkpoint} (step={ckpt.get('step')})")
 
+    # Diagnostic: when --no-adaptive is set, disable the per-frame adaptive
+    # suppression `w^(t)` so the model emits pure mask output. Useful for
+    # sanity-checking whether the trained mask itself is sensible vs. whether
+    # the adaptive blending is over-suppressing.
+    if getattr(args, "no_adaptive", False):
+        hp.use_noise_type_predictor = False
+
     speaker_encoder = FrozenSpeakerEncoder(hp).to(device)
 
     mel_transform = make_mel_basis(hp, device=torch.device("cpu"))
 
     si_snr_in, si_snr_out = [], []
     sdr_in, sdr_out = [], []
+    log_mel_snr_in: list[float] = []
+    log_mel_snr_out: list[float] = []
+    mask_diag: list[float] = []
 
     for i, (mixed, target, ref, interference) in enumerate(
         build_eval_pairs(hp, args.num_samples, hp.seed)
@@ -225,15 +291,38 @@ def evaluate(hp: HParams, args: argparse.Namespace) -> None:
             input_wav = mixed
             target_wav_eval = target
 
+            # Griffin-Lim produces ~`(num_frames-1)*hop + win_length` samples;
+            # for `center=False` Mel-spec that's typically 240 samples short of
+            # the original waveform. Pad / trim to the length of `mixed` so
+            # SI-SNR / SDR have matching lengths.
+            if enhanced_wav.shape[0] < input_wav.shape[0]:
+                enhanced_wav = torch.nn.functional.pad(
+                    enhanced_wav, (0, input_wav.shape[0] - enhanced_wav.shape[0])
+                )
+            elif enhanced_wav.shape[0] > input_wav.shape[0]:
+                enhanced_wav = enhanced_wav[: input_wav.shape[0]]
+
             si_in = si_snr(input_wav, target_wav_eval)
             si_out = si_snr(enhanced_wav, target_wav_eval)
             sd_in = sdr(input_wav, target_wav_eval)
             sd_out = sdr(enhanced_wav, target_wav_eval)
 
+            # Log-mel-domain SI-SNR — the time-domain metric above is unreliable
+            # because Griffin-Lim's reconstructed phase is essentially random
+            # and SI-SNR requires time-alignment. The log-mel-domain version
+            # skips phase entirely and measures how well the filter recovered
+            # the target's spectral envelope.
+            target_logmel = wav_to_log_mel(target_wav_eval, hp, mel_transform)
+            lm_in, lm_out, lm_imp = log_mel_snr(
+                enhanced_logmel, target_logmel, mixed_logmel
+            )
+
             si_snr_in.append(si_in)
             si_snr_out.append(si_out)
             sdr_in.append(sd_in)
             sdr_out.append(sd_out)
+            log_mel_snr_in.append(lm_in)
+            log_mel_snr_out.append(lm_out)
 
             if (i + 1) % 10 == 0:
                 print(
@@ -251,12 +340,24 @@ def evaluate(hp: HParams, args: argparse.Namespace) -> None:
 
     summary = {
         "num_samples": len(si_snr_in),
+        # Time-domain (Griffin-Lim reconstructed — phase is essentially random,
+        # so these numbers are an unreliable proxy; reported for completeness).
         "input_si_snr_mean": float(np.mean(si_snr_in)),
         "output_si_snr_mean": float(np.mean(si_snr_out)),
         "si_snri_mean": float(np.mean(si_snr_out) - np.mean(si_snr_in)),
         "input_sdr_mean": float(np.mean(sdr_in)),
         "output_sdr_mean": float(np.mean(sdr_out)),
         "sdri_mean": float(np.mean(sdr_out) - np.mean(sdr_in)),
+        # Log-mel-domain SI-SNR — phase-free, the meaningful proxy for this
+        # filter. Numbers are per-mel-bin SI-SNR averaged across the 80 mel
+        # channels; positive `logMelNetValue` means VoiceFilter is recovering
+        # the target's spectral envelope better than the unfiltered mixture.
+        "logmel_input_si_snr_mean": float(np.mean(log_mel_snr_in)) if log_mel_snr_in else 0.0,
+        "logmel_output_si_snr_mean": float(np.mean(log_mel_snr_out)) if log_mel_snr_out else 0.0,
+        "logmel_snri_mean": (
+            float(np.mean(log_mel_snr_out) - np.mean(log_mel_snr_in))
+            if log_mel_snr_out else 0.0
+        ),
     }
     print(json.dumps(summary, indent=2))
     if args.results_json:
@@ -274,23 +375,29 @@ def _logmel_to_wav(
     This is *not* the production inference path (the real path skips waveform
     entirely and feeds enhanced log-mel straight to ASR); it exists only so
     we can compute SI-SDR proxies during evaluation.
-    """
-    import torchaudio
 
-    mel = torch.exp(log_mel) - hp.log_mel_floor  # (T, F)
-    mel = mel.transpose(0, 1).unsqueeze(0)      # (1, F, T)
-    # Inverse mel.
-    inv_mel = torchaudio.transforms.InverseMelScale(
-        n_stft=hp.n_fft // 2 + 1,
-        n_mels=hp.n_mels,
-        sample_rate=hp.sample_rate,
-        max_iter=128,
-        tolerance_loss=1e-5,
-        tolerance_change=1e-7,
-    )
-    linear = inv_mel(mel)                       # (1, n_freq, T)
+    Inverse-mel is done with `torch.linalg.pinv` on the filterbank matrix
+    (Tikhonov-regularised via `rcond`). Older torchaudio versions exposed an
+    iterative `InverseMelScale(max_iter, tolerance_loss, tolerance_change)`
+    constructor; the newer API (>=2.10) dropped those kwargs and uses a
+    direct LAPACK `gels` solve that fails on rank-deficient filterbank
+    matrices — which is exactly our case (n_mels=80, n_freq//2+1=201, so
+    the basis is rectangular). Doing the pseudoinverse ourselves is more
+    robust and matches what the old iterative constructor converged on.
+    """
+    import torch.linalg as la
+
+    fb = mel_transform.mel_scale.fb                              # (n_freq, n_mels)
+    pinv_fb = la.pinv(fb, rcond=1e-4)                            # (n_mels, n_freq)
+
+    # Forward path:  magnitude.T @ fb  →  (T, n_mels). Inverse path:
+    # mel.T  (T, n_mels) @  pinv(fb) (n_mels, n_freq)  →  (T, n_freq).
+    mel_T = torch.exp(log_mel).clamp(min=0.0)                    # (T, n_mels)
+    linear_T = mel_T @ pinv_fb                                    # (T, n_freq)
+    linear = linear_T.transpose(0, 1).unsqueeze(0)               # (1, n_freq, T)
 
     # Griffin-Lim to invert phase.
+    import torchaudio
     griffin = torchaudio.transforms.GriffinLim(
         n_fft=hp.n_fft,
         hop_length=hp.hop_length,
@@ -310,6 +417,8 @@ def main() -> None:
     p.add_argument("--device", type=str, default="mps")
     p.add_argument("--results-json", type=str, default=None)
     p.add_argument("--gl-iter", type=int, default=10)
+    p.add_argument("--no-adaptive", action="store_true",
+                   help="Disable adaptive suppression (use raw mask).")
     # Highest-priority HF endpoint override — see `cli.apply_hf_endpoint`.
     p.add_argument("--hf-endpoint", type=str, default=None,
                    help="Override HF Hub base URL (e.g. https://hf-mirror.com).")

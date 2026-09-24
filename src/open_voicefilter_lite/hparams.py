@@ -40,8 +40,12 @@ class HParams:
 
     # ---- Training ----
     sample_length_sec: float = 4.0
-    snr_min_db: float = -5.0
-    snr_max_db: float = 5.0
+    # Paper §3.2: "random within 1 dB to 10 dB". Negative SNRs (target
+    # quieter than interference) push the mask network into a regime the
+    # paper doesn't evaluate and tend to destabilise the asymmetric loss
+    # — keep both bounds ≥ 1.
+    snr_min_db: float = 1.0
+    snr_max_db: float = 10.0
     silent_target_prob: float = 0.10    # P(target is silence) — train the "do nothing" mode
     silent_interference_prob: float = 0.10  # P(interference is silence)
     batch_size: int = 6
@@ -55,10 +59,27 @@ class HParams:
     ckpt_every: int = 1_000
     num_eval_samples: int = 32
 
-    # ---- Loss (asymmetric L2) ----
-    loss_alpha: float = 4.0    # weight on (1 - M) term → penalty for over-suppression
-    loss_beta: float = 0.0     # threshold for soft mask M = sigmoid(lambda*(Y - beta))
-    loss_lambda: float = 5.0   # sharpness of soft mask M
+    # How often (in optimizer steps) to call `torch.<device>.empty_cache()`
+    # mid-training. PyTorch's MPS / CUDA caching allocators keep a high-water
+    # mark of every unique tensor shape they ever saw; on long runs that
+    # cache grows monotonically and shows up as a slowly climbing RSS even
+    # when nothing is leaking in the Python sense. Calling `empty_cache()`
+    # periodically returns unused chunks to the OS — small per-call overhead,
+    # but it keeps the resident set flat. Set to 0 to disable.
+    #   - MPS (Apple Silicon): every 2000 steps is a good starting point
+    #     (the cache grows fast on the first few thousand steps, then
+    #      plateaus once unique shapes are exhausted).
+    #   - CUDA: every 5000 steps is usually sufficient on a single GPU;
+    #     larger models on multi-GPU may prefer every 1000.
+    empty_cache_every: int = 2000
+
+    # ---- Loss (asymmetric L2, paper §3.3) ----
+    # `alpha` is the asymmetry factor: over-suppression errors are amplified
+    # by α² in the loss (g_asym(x,α) = α·x for x>0). Paper Tables 1 & 2 use
+    # α = 10 → 100× amplification on dropped speech. Going much lower kills
+    # the "err on the side of passing through" behaviour; going much higher
+    # makes gradients unstable at training start.
+    loss_alpha: float = 10.0
 
     # ---- Noise-type predictor (paper §4.2 / §3.4) ----
     # Two feedforward layers (256 → 64 → 64 → 1) emit **per-frame** logits
@@ -80,6 +101,11 @@ class HParams:
     # round-tripped through `HParams.from_dict`.
     alpha_min: float = 1.0
     alpha_max: float = 10.0
+    # Old soft-mask L2 (loss_beta / loss_lambda) — superseded by the paper's
+    # sign-based g_asym(x, α). Silently ignored by the current loss; kept so
+    # configs/checkpoints that still mention them don't fail HParams.from_dict.
+    loss_beta: float = 0.0
+    loss_lambda: float = 5.0
 
     # ---- EMA (exponential moving average of model weights) ----
     # EMA weights are what gets saved as ckpt_final.pt so downstream
@@ -109,6 +135,21 @@ class HParams:
     # the in-flight CPU batch *and* every batch sitting in
     # `PrefetchIterator`'s queue.
     ref_max_sec: float = 6.0
+
+    # Same-speaker reference cache, in `LibriSpeechTripletStream`.
+    # The iterator decodes every target utterance once, then caches a
+    # ref_max_len-capped slice so 70% of the next samples from the same
+    # speaker can reuse it without re-running soundfile. Two caps apply:
+    #   - `ref_buffer_max_per_spk`: max cached utterances per speaker.
+    #     2 is the floor (the same-speaker pick gate is `len(buf) >= 2`);
+    #     4–8 gives a touch more d-vector coverage at negligible cost.
+    #   - `ref_buffer_max_speakers`: max distinct speaker keys held.
+    #     LibriSpeech-500h has ~1172 speakers; without this cap every
+    #     speaker ever seen stays in the dict until process exit, and
+    #     with ref_max_sec=6 the in-flight buffer can grow past 20 GB
+    #     on MPS. Old default was 64 × ∞; this fixes the unbounded leak.
+    ref_buffer_max_per_spk: int = 4
+    ref_buffer_max_speakers: int = 512
 
     # ---- Data-loading parallelism ----
     # `LibriSpeechTripletStream` decodes 3 audio files per training sample

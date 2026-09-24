@@ -22,8 +22,10 @@ import os
 import random
 import time
 from collections import deque
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from itertools import chain
 from typing import Iterator, Optional
 
 import numpy as np
@@ -225,6 +227,77 @@ def _convolve(wav: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
     return y[..., :n]
 
 
+# ---- HF datasets audio-decode workaround ----
+#
+# HF datasets 5.x eagerly constructs a torchcodec `AudioDecoder`
+# (FFmpeg-backed) on every audio row during iteration. When FFmpeg
+# isn't installed, that `dlopen` raises OSError that propagates all
+# the way out and kills the process. When FFmpeg IS installed, certain
+# malformed FLAC packets trigger `SIGSEGV` inside
+# `av_packet_make_refcounted` — a native crash Python can't catch.
+#
+# Workaround (apply once per process):
+#   1) `_disable_hf_audio_decode()` monkey-patches
+#      `Audio.decode_example` so it returns the raw
+#      `{"bytes", "path": ...}` dict without instantiating AudioDecoder.
+#   2) `_cast_audio_no_decode(ds)` rewrites the dataset's audio feature
+#      schema to `Audio(decode=False)` so HF datasets keeps raw FLAC
+#      bytes in the column instead of trying to instantiate an
+#      `AudioDecoder` per row.
+# Callers then feed the bytes through `_decode_audio` (libsndfile via
+# `soundfile`), which is more lenient than FFmpeg with corrupt FLAC
+# frames.
+_HF_AUDIO_DECODE_PATCHED: bool = False
+
+
+def _disable_hf_audio_decode() -> None:
+    """Idempotently monkey-patch HF `Audio.decode_example` to never decode."""
+    global _HF_AUDIO_DECODE_PATCHED
+    if _HF_AUDIO_DECODE_PATCHED:
+        return
+    from datasets.features import audio as _hf_audio
+
+    _orig_decode_example = _hf_audio.Audio.decode_example
+
+    def _passthrough_decode_example(self, value, token_per_repo_id=None):
+        # Always return the raw dict — never instantiate AudioDecoder.
+        # HF datasets' format_batch calls this for every row, so without
+        # this patch we don't even get a chance to decode with libsndfile
+        # first.
+        if value is None:
+            return None
+        if isinstance(value, dict):
+            return value
+        # Last-resort fallback to upstream behavior for non-dict inputs
+        # (e.g. AudioDecoder objects from older datasets).
+        return _orig_decode_example(self, value, token_per_repo_id)
+
+    _hf_audio.Audio.decode_example = _passthrough_decode_example
+    _HF_AUDIO_DECODE_PATCHED = True
+
+
+def _cast_audio_no_decode(ds):
+    """Cast every `Audio` feature in `ds` to `decode=False` (raw FLAC bytes)."""
+    from datasets import Audio, Features
+
+    new_features = Features(
+        {k: (Audio(decode=False) if k == "audio" else v)
+         for k, v in ds.features.items()}
+    )
+    try:
+        ds = ds.cast_features(new_features)
+    except Exception:
+        # Fallback for old datasets without `cast_features`.
+        ds.features.update(new_features)
+    # Belt-and-suspenders: flip `decode=False` in place too, in case
+    # `cast_features` on IterableDataset doesn't propagate the change
+    # into the `python_features_decoder` that `format_batch` consults.
+    for k, v in ds.features.items():
+        if isinstance(v, Audio):
+            v.decode = False
+    return ds
+
+
 # ---- Dataset ----
 
 
@@ -264,9 +337,14 @@ class LibriSpeechTripletStream(IterableDataset):
         self._rir_open = False
         self._rir_failed: Optional[str] = None
 
-        # Speaker → list of utterances index for picking same-speaker ref.
+        # Speaker → list of cached ref audios for picking same-speaker ref.
+        # Bounded by `hp.ref_buffer_max_per_spk` (per-speaker) and
+        # `hp.ref_buffer_max_speakers` (total distinct speakers, LRU) —
+        # see `hparams.py` for the leak that motivated both caps.
+        # OrderedDict so we can LRU-evict speakers we haven't touched
+        # recently (a hot talker stays cached; cold ones get dropped first).
         # Split by worker_id in __iter__ so workers don't race on appends.
-        self._target_buffer: dict[str, list[dict]] = {}
+        self._target_buffer: "OrderedDict[str, list[dict]]" = OrderedDict()
 
         # Thread pool for parallel audio decoding (set up lazily in __iter__
         # so the dataset is still picklable if anyone forks it later).
@@ -278,9 +356,7 @@ class LibriSpeechTripletStream(IterableDataset):
         if self._target_ds is not None:
             return
 
-        from datasets import Audio, Features, load_dataset
-        from datasets.features import audio as _hf_audio
-        from itertools import chain
+        from datasets import load_dataset
 
         # `cache_dir` is ignored when `streaming=True` (HF datasets streams
         # directly from the Hub cache); when streaming=False, point HF at
@@ -289,39 +365,9 @@ class LibriSpeechTripletStream(IterableDataset):
         if not self.hp.streaming:
             load_kwargs["cache_dir"] = self.hp.librispeech_cache
 
-        # ---- Disable HF datasets' built-in audio decoding ----
-        # HF datasets 5.x eagerly constructs a torchcodec `AudioDecoder`
-        # (FFmpeg-backed) on every audio row during iteration. When FFmpeg
-        # isn't installed, that `dlopen` raises an OSError that propagates
-        # all the way out and kills training. When FFmpeg IS installed,
-        # certain malformed FLAC packets trigger `SIGSEGV` inside
-        # `av_packet_make_refcounted` — a native crash Python can't catch.
-        #
-        # We work around BOTH failure modes by:
-        #   1) Casting the audio feature to `Audio(decode=False)` so HF
-        #      keeps the column as `{"bytes", "path": ...}` raw FLAC.
-        #   2) Monkey-patching `Audio.decode_example` so that even if some
-        #      other code path on the dataset still calls it, it returns
-        #      the raw dict instead of instantiating `AudioDecoder`.
-        # Our `_decode_audio` then feeds the bytes to `soundfile`
-        # (libsndfile), which is more lenient than FFmpeg with corrupt
-        # FLAC frames.
-        _orig_decode_example = _hf_audio.Audio.decode_example
-
-        def _passthrough_decode_example(self, value, token_per_repo_id=None):
-            # Always return the raw dict — never instantiate AudioDecoder.
-            # HF datasets' format_batch calls this for every row, so
-            # without this patch we don't even get a chance to decode
-            # with libsndfile first.
-            if value is None:
-                return None
-            if isinstance(value, dict):
-                return value
-            # Last-resort fallback to upstream behavior for non-dict
-            # inputs (e.g. AudioDecoder objects from older datasets).
-            return _orig_decode_example(self, value, token_per_repo_id)
-
-        _hf_audio.Audio.decode_example = _passthrough_decode_example
+        # Disable HF datasets' eager torchcodec/FFmpeg audio decode once
+        # per process — see the module-level helper docstring for the why.
+        _disable_hf_audio_decode()
 
         def _load_no_decode(config: str, split: str):
             ds = load_dataset(
@@ -330,31 +376,21 @@ class LibriSpeechTripletStream(IterableDataset):
                 split=split,
                 **load_kwargs,
             )
-            # Replace the audio feature schema with `decode=False`.
-            new_features = Features(
-                {k: (Audio(decode=False) if k == "audio" else v)
-                 for k, v in ds.features.items()}
-            )
-            try:
-                ds = ds.cast_features(new_features)
-            except Exception:
-                # Fallback for old datasets without `cast_features`.
-                ds.features.update(new_features)
-            # Belt-and-suspenders: flip `decode=False` in place too,
-            # in case cast_features on IterableDataset doesn't propagate
-            # the change into the python_features_decoder that
-            # `format_batch` actually consults.
-            for k, v in ds.features.items():
-                if isinstance(v, Audio):
-                    v.decode = False
-            return ds
+            return _cast_audio_no_decode(ds)
 
         target_splits = list(self.hp.target_splits)
-        target_ds_list = [
+        # Store the list rather than a one-shot `chain.from_iterable(...)`.
+        # The chain is stateful (its `__iter__` returns self and `__next__`
+        # tracks a cursor) — once exhausted, re-calling `iter(chain)` gives
+        # the same exhausted object, and `_infinite_iter`'s `while True: for`
+        # busy-loops with no yields. We rebuild the chain inside `_iter_target`
+        # so the dataset can cycle back to the start (LibriSpeech train.360
+        # has ~104 000 utterances — we'd hang exactly there otherwise).
+        self._target_ds_list = [
             _load_no_decode(self.hp.target_config, s)
             for s in target_splits
         ]
-        self._target_ds = chain.from_iterable(target_ds_list)
+        self._target_ds = chain.from_iterable(self._target_ds_list)
 
         self._interference_ds = _load_no_decode(
             self.hp.interference_config, self.hp.interference_split,
@@ -463,17 +499,27 @@ class LibriSpeechTripletStream(IterableDataset):
 
     @staticmethod
     def _infinite_iter(ds) -> Iterator[dict]:
+        # Yield from `ds` forever. **Must not** be a `while True: for ex in ds`
+        # loop over a one-shot iterator: when `ds` is a `chain.from_iterable`
+        # object, `for ex in ds` returns the chain itself on `iter()`, and
+        # once the chain is exhausted `for ex in ds` becomes an empty `for`
+        # loop that runs forever with no yields — `next()` on the caller side
+        # would then hang forever (LibriSpeech train.360 is ~104 000
+        # utterances, so the hang lands exactly there). The fix is to
+        # rebuild the chain on every pass with `chain.from_iterable(...)`,
+        # which iter()'s the underlying HF streams afresh; streaming-mode
+        # HF `IterableDataset`s support this (`__iter__` returns a fresh
+        # `ArrowExamplesIterable` each call).
         while True:
-            for ex in ds:
-                yield ex
+            yield from chain.from_iterable(ds)
 
     def _iter_target(self) -> Iterator[dict]:
-        assert self._target_ds is not None
-        return self._infinite_iter(self._target_ds)
+        assert self._target_ds_list is not None
+        return self._infinite_iter(self._target_ds_list)
 
     def _iter_interference(self) -> Iterator[dict]:
         assert self._interference_ds is not None
-        return self._infinite_iter(self._interference_ds)
+        return self._infinite_iter([self._interference_ds])
 
     # ---- Sampling helpers ----
 
@@ -564,8 +610,9 @@ class LibriSpeechTripletStream(IterableDataset):
             self._rng = random.Random(self._seed + worker_info.id)
             # Also split the per-speaker utterance buffer so two workers
             # don't race on `_target_buffer[spk].append(...)` and stomp
-            # each other's ref-pick history.
-            self._target_buffer = {}
+            # each other's ref-pick history. Must stay an OrderedDict so
+            # the global LRU cap (`ref_buffer_max_speakers`) still applies.
+            self._target_buffer = OrderedDict()
 
         # Heartbeat: the first batch through audio decode + mel + ECAPA is
         # multi-second on Apple Silicon. Print progress so the user can see
@@ -585,7 +632,15 @@ class LibriSpeechTripletStream(IterableDataset):
         target_iter = self._iter_target()
         interference_iter = self._iter_interference()
 
-        max_buf = 64
+        # ---- Same-speaker ref cache caps ----
+        # `max_buf` caps each speaker's local cache (entries ≤ ref_max_len).
+        # `max_speakers` caps the total number of distinct speaker keys in
+        # the dict — without this, every speaker LibriSpeech has ever fed
+        # us stays in the dict holding up to `max_buf` decoded audios, and
+        # on a 1172-speaker corpus × 64 × 384 KB the buffer can top 28 GB.
+        # We LRU-evict from the dict so hot speakers stay warm.
+        max_buf = hp.ref_buffer_max_per_spk
+        max_speakers = hp.ref_buffer_max_speakers
 
         # ---- Parallel decode via thread pool ----
         # `soundfile.read` (libsndfile under C) and `torchcodec` (FFmpeg
@@ -625,7 +680,10 @@ class LibriSpeechTripletStream(IterableDataset):
 
             Returns a dict with the example refs + futures, or None on
             StopIteration. Decoding of `ref_ex` is skipped if it's the same
-            Python object as `tgt_ex` (reuse target's already-decoded wav).
+            Python object as `tgt_ex` (reuse target's already-decoded wav)
+            **or** if `ref_ex` was picked from the same-speaker buffer
+            (already-decoded, ref-capped tensor — see notes on
+            `_target_buffer` in the class docstring).
             """
             try:
                 tgt_ex = next(target_iter)
@@ -634,15 +692,20 @@ class LibriSpeechTripletStream(IterableDataset):
                 return None
 
             spk = str(tgt_ex.get("speaker_id", rng.randint(0, 10_000)))
-            buf = self._target_buffer.setdefault(spk, [])
-            buf.append(tgt_ex)
-            if len(buf) > max_buf:
-                self._target_buffer[spk] = buf[-max_buf:]
 
             # Same-speaker reference for d-vector (70% of the time).
+            # `buf` (after refactor) holds dicts shaped like
+            # `{"audio": <1D float32 tensor, ref_max_len-capped>, "spk": <str>}`
+            # — already-decoded, ready to use as ref_wav without re-running
+            # soundfile. See the buffer-write step at the bottom of the
+            # main iterator loop for how those entries get populated.
+            buf = self._target_buffer.get(spk, [])
             ref_ex = tgt_ex
+            ref_cached: Optional[torch.Tensor] = None
             if len(buf) >= 2 and rng.random() < 0.7:
-                ref_ex = rng.choice(buf[:-1])
+                cached = rng.choice(buf[:-1])
+                ref_ex = cached
+                ref_cached = cached["audio"]
 
             if decode_pool is not None:
                 fut_t = decode_pool.submit(
@@ -651,21 +714,21 @@ class LibriSpeechTripletStream(IterableDataset):
                 fut_i = decode_pool.submit(
                     _decode_audio, int_ex["audio"], hp.sample_rate
                 )
-                # Reuse target's decode future when ref_ex IS tgt_ex
-                # (avoids a redundant flac decode for the common
-                # "first sample of a new speaker" case).
-                fut_r = fut_t if ref_ex is tgt_ex else decode_pool.submit(
-                    _decode_audio, ref_ex["audio"], hp.sample_rate
-                )
+                # `ref_ex` is either `tgt_ex` (covered by fut_t) or a
+                # buffer entry with a cached tensor (no decode needed).
+                # In neither case do we submit a third decode.
+                fut_r = None
             else:
                 fut_t = fut_i = fut_r = None  # sentinel: decode inline
 
-            ref_spk = str(ref_ex.get("speaker_id", spk))
+            ref_spk = spk  # buffer is keyed by speaker, so any ref pick is same-spk
             return {
                 "tgt_ex": tgt_ex,
+                "tgt_spk": spk,
                 "int_ex": int_ex,
                 "ref_ex": ref_ex,
                 "ref_spk": ref_spk,
+                "ref_cached": ref_cached,
                 "fut_t": fut_t,
                 "fut_i": fut_i,
                 "fut_r": fut_r,
@@ -679,28 +742,24 @@ class LibriSpeechTripletStream(IterableDataset):
             """
             tgt_ex = job["tgt_ex"]
             int_ex = job["int_ex"]
-            ref_ex = job["ref_ex"]
             try:
                 if job["fut_t"] is not None:
                     target_wav = job["fut_t"].result()
                     interference_wav = job["fut_i"].result()
-                    if job["fut_r"] is job["fut_t"]:
-                        ref_wav = target_wav
-                    else:
-                        ref_wav = job["fut_r"].result()
                 else:
                     target_wav = _decode_audio(tgt_ex["audio"], hp.sample_rate)
                     interference_wav = _decode_audio(int_ex["audio"], hp.sample_rate)
-                    ref_wav = (
-                        target_wav
-                        if ref_ex is tgt_ex
-                        else _decode_audio(ref_ex["audio"], hp.sample_rate)
-                    )
-                # Cap ref_wav to the ECAPA-needed length. Without this, one
-                # ~30 s LibriSpeech utterance in the batch inflates the
-                # padded `ref_wavs` tensor 16x in `collate_triplets`, and the
-                # same waste multiplies by `PrefetchIterator.max_prefetch`
-                # copies of every batch sitting in the queue.
+                # ref is either a pre-decoded cached tensor (`ref_cached`)
+                # or `tgt_ex` itself (reuse `target_wav`). With the buffer
+                # refactor there is no third decode path here.
+                ref_cached = job.get("ref_cached")
+                if ref_cached is not None:
+                    ref_wav = ref_cached
+                else:
+                    ref_wav = target_wav
+                # Defensive cap: cached tensors are already capped at append
+                # time, but if `ref_max_sec` ever shrinks between runs we
+                # still want the safer crop.
                 if ref_wav.shape[-1] > ref_max_len:
                     ref_wav = ref_wav[..., :ref_max_len]
                 return target_wav, interference_wav, ref_wav
@@ -749,6 +808,31 @@ class LibriSpeechTripletStream(IterableDataset):
                 # a 3 s random crop is required — without this, snr_mix raises
                 # "size mismatch" because interference stays at full utterance
                 # length while target is cropped.
+                # Capture a *pre-crop* ref-cap of `target_wav` BEFORE the in-place
+                # mutations below (RIR conv, silent zeroing) so we cache clean
+                # audio for future ref picks. Truncating to `ref_max_len` here is
+                # the same cap `_await_decodes` applies for dvec extraction,
+                # so cached entries are ready to use as-is on a cache hit.
+                target_spk_for_buf = job["tgt_spk"]
+                tgt_buf = self._target_buffer.setdefault(target_spk_for_buf, [])
+                # `clone()` because the in-place RIR conv / silence-zero below
+                # would otherwise mutate the cached tensor in place.
+                cached_audio = target_wav[..., :min(target_wav.shape[-1], ref_max_len)].clone()
+                tgt_buf.append({"audio": cached_audio, "spk": target_spk_for_buf})
+                # Per-speaker FIFO: drop oldest entries beyond `max_buf`.
+                # Slicing rebinds the list to a fresh one so the dropped
+                # `cached_audio` tensors are released for GC.
+                if len(tgt_buf) > max_buf:
+                    self._target_buffer[target_spk_for_buf] = tgt_buf[-max_buf:]
+                # Global LRU cap on distinct speakers. `move_to_end` makes
+                # this speaker the most-recently-used; if we just crossed
+                # the cap, popitem(last=False) drops the LRU speaker (and
+                # its entire per-speaker list of decoded audios).
+                self._target_buffer.move_to_end(target_spk_for_buf)
+                while len(self._target_buffer) > max_speakers:
+                    evicted_spk, evicted_list = self._target_buffer.popitem(last=False)
+                    del evicted_list
+
                 target_wav = random_crop(target_wav, sample_len)
                 interference_wav = random_crop(interference_wav, sample_len)
 
@@ -805,9 +889,19 @@ class LibriSpeechTripletStream(IterableDataset):
                 ):
                     _elapsed = _now - _t0
                     _rate = _samples / max(0.001, _elapsed)
+                    # Buffer diagnostics: how many speakers and how many
+                    # cached ref audios the iterator is currently holding.
+                    # With the LRU cap (`ref_buffer_max_speakers`) the
+                    # first number saturates; the second stays bounded by
+                    # `ref_buffer_max_per_spk × ref_buffer_max_speakers`.
+                    _buf = self._target_buffer
+                    _n_speakers = len(_buf)
+                    _n_entries = sum(len(v) for v in _buf.values())
                     print(
                         f"[dataset] {_samples} samples ready "
-                        f"(t={_elapsed:.1f}s, {_rate:.1f} samples/s)",
+                        f"(t={_elapsed:.1f}s, {_rate:.1f} samples/s, "
+                        f"buf={_n_speakers}/{hp.ref_buffer_max_speakers} "
+                        f"entries={_n_entries})",
                         flush=True,
                     )
                     _last_beat = _now

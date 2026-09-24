@@ -1,6 +1,6 @@
 """VoiceFilter-Lite main model + streaming inference wrapper.
 
-Architecture (≈ 2.2-2.6 M params; matches paper §2 closely):
+Architecture (≈ 1.8-3.5 M params depending on `hidden_dim` × `num_lstm_layers`):
     Linear(d_vector_dim + n_mels * frame_stack → hidden_dim)
     LayerNorm
     LSTM(hidden_dim) × num_lstm_layers (unidirectional — streaming)
@@ -8,9 +8,11 @@ Architecture (≈ 2.2-2.6 M params; matches paper §2 closely):
     Linear(hidden_dim → n_mels)
     Sigmoid → soft mask M ∈ [0, 1]^F
 
-The mask is element-wise multiplied with the *current frame's* log-mel to
-produce the enhanced log-mel. Training targets are clean log-mel;
-the loss is the asymmetric L2 penalty on (enhanced, clean).
+The mask is applied in the **linear-mel** domain (paper §3.2: "multiplied
+with the original input spectrogram") and then converted back to log-mel
+for the loss; see `_mask_logmel`. Training targets are clean log-mel;
+the loss is the paper's sign-based asymmetric L2 (paper §3.3) on
+(enhanced, clean).
 """
 
 from __future__ import annotations
@@ -21,6 +23,41 @@ import torch
 import torch.nn as nn
 
 from open_voicefilter_lite.hparams import HParams
+
+
+def _mask_logmel(mask: torch.Tensor, cur_logmel: torch.Tensor, log_mel_floor: float) -> torch.Tensor:
+    """Apply a [0, 1] mask in the **linear mel** domain (paper §3.2).
+
+    The mask is multiplied with the *magnitude* (linear-mel) spectrogram,
+    not the log-mel; the loss / caller still consumes log-mel, so we
+    convert back at the end. Concretely:
+
+        log_mel = log(mel + floor)   ⟹   mel = exp(log_mel) - floor
+
+    With this mapping:
+
+      - ``mask=0`` on a silence frame (cur_logmel = log(floor)) gives
+        enhanced_mel = 0 and enhanced_logmel = log(floor) ≈ −13.8 —
+        i.e. the model can actually output silence. The previous
+        ``mask * cur_logmel`` formulation gave enhanced_logmel = 0
+        (positive!), which is wildly off the target value of −13.8
+        and made silent_target training diverge.
+
+      - ``mask=1`` is the identity on the log-mel channel: enhanced
+        equals the input frame. So a model that decides "do nothing"
+        for a frame still produces the right log-mel output.
+
+    Args:
+        mask:         (..., n_mels) ∈ [0, 1] from `sigmoid(out_proj(...))`.
+        cur_logmel:   (..., n_mels) current frame's log-mel.
+        log_mel_floor: scalar matching `hp.log_mel_floor`.
+
+    Returns:
+        enhanced_logmel, same shape as `cur_logmel`.
+    """
+    mix_mel = (torch.exp(cur_logmel) - log_mel_floor).clamp(min=0.0)
+    enhanced_mel = mask * mix_mel
+    return torch.log(enhanced_mel + log_mel_floor)
 
 
 class VoiceFilterLite(nn.Module):
@@ -76,7 +113,7 @@ class VoiceFilterLite(nn.Module):
         # nn.Sequential of Linear+ReLU layers; iterate its children so each
         # Linear gets xavier_uniform_(weight) and zero bias.
         init_modules = [self.dvec_proj, self.in_proj, self.out_proj]
-        init_modules.extend(self.alpha_head)  # add Linear children of Sequential
+        init_modules.extend(m for m in self.alpha_head if isinstance(m, nn.Linear))
         for m in init_modules:
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
@@ -120,7 +157,8 @@ class VoiceFilterLite(nn.Module):
         cur_idx = self.hp.frame_stack - 1
         cur = stacked_logmel[..., cur_idx * self.hp.n_mels:(cur_idx + 1) * self.hp.n_mels]
 
-        enhanced = mask * cur
+        # Apply mask in linear-mel domain (paper §3.2) — see `_mask_logmel`.
+        enhanced = _mask_logmel(mask, cur, self.hp.log_mel_floor)
         return enhanced, hidden
 
     def forward_train(
@@ -154,11 +192,12 @@ class VoiceFilterLite(nn.Module):
         mask = torch.sigmoid(self.out_proj(self.dropout(x)))   # (B, T, n_mels)
 
         # Per-frame noise-type logits (paper §4.2: 2 FC × 64 + sigmoid).
-        frame_logits = self.alpha_head(x).squeeze(-1)   # (B, T)
+        frame_logits = self.alpha_head(x).squeeze(-1)               # (B, T)
 
         cur_idx = self.hp.frame_stack - 1
         cur = stacked_logmel[..., cur_idx * self.hp.n_mels:(cur_idx + 1) * self.hp.n_mels]
-        enhanced = mask * cur
+        # Apply mask in linear-mel domain (paper §3.2) — see `_mask_logmel`.
+        enhanced = _mask_logmel(mask, cur, self.hp.log_mel_floor)
 
         return enhanced, hidden, frame_logits
 
@@ -292,12 +331,21 @@ class StreamingVoiceFilter:
         for i, f in enumerate(ctx):
             stacked[0, stack - len(ctx) + i, :] = f[0]
 
+        # The model lives on whatever device `self.model` was moved to;
+        # `frame_logmel` may be on CPU while the model is on MPS/CUDA.
+        # Keep `stacked` on the caller's device so the returned `enhanced`
+        # tensor lives where they expect it, but move the flattened input
+        # to the model's device for the LSTM forward.
+
         # Flatten the time+mel dims into (1, 1, stack*n_mels).
         stacked_flat = stacked.reshape(1, 1, -1)
 
         dvec_proj = self._dvec_proj
         if dvec_proj.dim() == 2:
             dvec_proj = dvec_proj.unsqueeze(1)  # (1, 1, d_vector_dim)
+
+        if stacked_flat.device != dvec_proj.device:
+            stacked_flat = stacked_flat.to(dvec_proj.device)
 
         # Concat and run a 1-step LSTM.
         x = torch.cat([stacked_flat, dvec_proj], dim=-1)
@@ -312,17 +360,35 @@ class StreamingVoiceFilter:
         # that this frame is overlapped speech (paper §4.2 binary head).
         # AdaptiveSuppression smooths it into w^(t) and we blend the filtered
         # output with the raw input:
-        #     out = w · mask·input + (1-w) · input
-        #        = input · (w·mask + (1-w))
+        #     out = w · (mask·input) + (1-w) · input
+        # To stay paper-§3.2 consistent we apply `mask` in linear-mel space
+        # (see `_mask_logmel`) and blend after — blending in log-mel is
+        # wrong (linear blend of log values ≠ log of linear blend).
         if self.hp.use_noise_type_predictor and self._adaptive is not None:
             logit = self.model.alpha_head(x)                  # (1, 1, 1)
             f_adapt = float(torch.sigmoid(logit).item())
             w = self._adaptive.update(f_adapt)
         else:
             w = 1.0   # no adaptive suppression → apply mask as-is
-        effective_mask = w * mask[0, 0] + (1.0 - w)            # (1, n_mels)
-        enhanced = effective_mask * stacked[0, -1]
+
+        # `mask[0, 0]` and `last_frame` may live on different devices
+        # (caller vs model); align them before `_mask_logmel`.
+        last_frame = stacked[0, -1]
+        if last_frame.device != mask.device:
+            last_frame = last_frame.to(mask.device)
+
+        filtered = _mask_logmel(mask[0, 0], last_frame, self.hp.log_mel_floor)
+        # Blend in linear-mel space (otherwise the (1-w)·pass-through term
+        # would be `exp((1-w)·log_mix)` instead of `(mix)^(1-w)`):
+        #     out = w · (mask · mix) + (1-w) · mix
+        mix_mel = (torch.exp(last_frame) - self.hp.log_mel_floor).clamp(min=0.0)
+        enhanced_mel = w * (torch.exp(filtered) - self.hp.log_mel_floor).clamp(min=0.0) \
+                     + (1.0 - w) * mix_mel
+        enhanced = torch.log(enhanced_mel + self.hp.log_mel_floor)
 
         if squeeze:
-            return enhanced.squeeze(0)
+            enhanced = enhanced.squeeze(0)
+        # Restore caller's expected device/dtype.
+        if enhanced.device != frame_logmel.device:
+            enhanced = enhanced.to(frame_logmel.device)
         return enhanced

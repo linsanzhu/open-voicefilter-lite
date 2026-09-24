@@ -214,21 +214,27 @@ Following the paper §4.2 / §4.4 (best 2.2 MB variant):
   Sigmoid`. The sigmoid mask is multiplied with the current frame's
   log-mel. Output is the per-frame mask; the elementwise product with
   the current frame gives the enhanced log-mel.
-- **Noise-type predictor** (`alpha_head`): a 2-FC×64 head over the LSTM
-  features (256 → 64 → 64 → 1, paper §4.2) emitting a **per-frame**
-  logit for "is this frame overlapped speech?". Trained with a hinge
-  loss (binary classification).
+- **Noise-type predictor** (`alpha_lstm` + `alpha_fc`, paper §3.4):
+  2-layer unidirectional LSTM × 128 nodes over the main LSTM's per-frame
+  features, followed by a `Linear(128 → 1)` head. Emits **per-frame**
+  logits for "is this frame overlapped speech?" binary classification.
+  Trained with a hinge loss. ~330 K params (LSTM dominates over the
+  original paper's smaller variant).
 - **Loss**: `L_asym + hinge_loss_weight · L_hinge`
-  - `L_asym = mean((M·(Y−Ŷ))²) + α · mean(((1−M)·(Y−Ŷ))²)` where
-    `M = sigmoid(λ·(Y−β))` is a soft mask derived from the target's
-    energy. The α=10 weight on the (1−M) term penalises
-    over-suppression — the paper's central contribution (Tables 1 & 2).
+  - `L_asym = mean( g_asym(target − pred, α)² )` where
+    `g_asym(x, α) = α·x if x > 0 else x`. The asymmetry is on the
+    **sign of the residual**, not on target energy: when the model
+    suppresses too much (S_enh < S_cln, residual > 0) the error is
+    amplified by α² = 100. This is the paper's central contribution
+    (Tables 1 & 2, α = 10): the model is trained to *err on the side
+    of passing the input through* when uncertain, so ASR never gets
+    target speech deleted.
   - `L_hinge = mean(max(0, 1 − y·logits))` for `y ∈ {−1, +1}`. Trains
     the noise-type predictor per frame.
 - **Adaptive suppression at inference** (paper §3.4):
   `w^(t) = β · w^(t-1) + (1 − β) · (a · f_adapt + b)`, where
-  `f_adapt = sigmoid(alpha_head output)` and β=0.8 (paper §4.4). The
-  final output blends filtered and raw frames:
+  `f_adapt = sigmoid(alpha_fc(alpha_lstm(features)))` and β=0.8
+  (paper §4.4). The final output blends filtered and raw frames:
   `out = w · mask·input + (1 − w) · input`, so w=0 means "pass through"
   and w=1 means "full filtering". This is what makes the model "always
   harmless and sometimes helpful" in clean / non-speech conditions.

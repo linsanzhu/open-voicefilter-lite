@@ -1,14 +1,16 @@
 """Losses for VoiceFilter-Lite.
 
-Two terms (paper §3.3, §4.2):
+Two terms (paper §3.3, §3.4):
 
-    1. `asymmetric_l2_loss` — the soft mask loss that drives the actual
-       suppression output. Penalises over-suppression more than
-       under-suppression via the α term on (1-M)·diff².
+    1. `asymmetric_l2_loss` — the paper's sign-based asymmetric L2, which
+       amplifies the penalty on *over-suppression* errors (model dropped
+       target energy) by α² (paper Tables 1 & 2 use α = 10). The asymmetry
+       is on the **sign of the residual** `target − pred`, not on the
+       target's energy.
     2. `hinge_loss` — per-frame binary classification loss for the
-       noise-type predictor (alpha_head), trained to predict "is this
-       frame overlapped speech?". At inference its sigmoid drives the
-       adaptive suppression `w^(t)` (§3.4).
+       noise-type predictor (2 FC × 64 + sigmoid head), trained to
+       predict "is this frame overlapped speech?". At inference its
+       sigmoid drives the adaptive suppression `w^(t)` (§3.4).
 
 The combined objective is:
     L_total = L_asym + hinge_loss_weight · L_hinge
@@ -27,47 +29,33 @@ from open_voicefilter_lite.hparams import HParams
 def asymmetric_l2_loss(
     pred: torch.Tensor,
     target: torch.Tensor,
-    alpha: float = 4.0,
-    beta: float = 0.0,
-    lam: float = 5.0,
-    reduction: str = "mean",
+    alpha: float = 10.0,
 ) -> torch.Tensor:
     """Asymmetric L2 loss penalising over-suppression (paper §3.3).
 
-    Loss = mean( (M · (Y_pred - Y_target))^2 )
-         + α · mean( ((1-M) · (Y_pred - Y_target))^2 )
+    Residual: ``x = S_cln − S_enh = target − pred``.
 
-    where M = sigmoid(lam * (Y_target - beta)) is a soft mask derived from
-    the target's energy. The (1-M) term is weighted by `α > 1` so the
-    model is *more* penalised when it under-suppresses than when it
-    over-suppresses — i.e., it is encouraged to err on the side of
-    passing through the input when in doubt. Paper Tables 1 & 2 use α=10.
+      - ``x > 0``  (over-suppression: model dropped target energy):
+        penalty = ``α·x``  → contribution ``α²·x²``
+      - ``x ≤ 0``  (under-suppression: residual interference):
+        penalty = ``x``    → contribution ``x²``
+
+    So ``L_asym = mean( g_asym(x, α)² ) = mean( α²·x²  if x>0  else  x² )``.
+
+    The α² amplification on over-suppression errors is the central trick:
+    ASR hates dropped speech far more than residual noise, so the model is
+    trained to err on the side of *passing through* the input when it is
+    uncertain. Paper Tables 1 & 2 use α = 10 (→ 100× amplification on
+    over-suppression).
 
     Args:
         pred:   (B, T, F) predicted enhanced log-mel.
         target: (B, T, F) clean target log-mel (same shape as pred).
-        alpha:  scalar weight on the over-suppression term (paper: 10).
-        beta:   threshold for the soft mask. Defaults to 0.0 (log-mel floor ≈ 0).
-        lam:    sharpness of the soft mask.
-        reduction: "mean" (default) or "none" (debug per-frame loss).
+        alpha:  asymmetry factor (paper: 10). Effective amplification is α².
     """
-    diff = pred - target                                # (B, T, F)
-    soft_mask = torch.sigmoid(lam * (target - beta))    # (B, T, F)
-
-    under = soft_mask * diff                            # (B, T, F)
-    over = (1.0 - soft_mask) * diff                     # (B, T, F)
-
-    under_sq = under ** 2                               # (B, T, F)
-    over_sq = over ** 2                                 # (B, T, F)
-
-    loss = under_sq.mean() + alpha * over_sq.mean()
-
-    if reduction == "none":
-        # Per-frame reconstruction loss for debugging.
-        per_frame = ((under + alpha * over) ** 2).mean(dim=-1)
-        return per_frame
-
-    return loss
+    diff = target - pred                                # (B, T, F)  > 0 ⟹ over-suppression
+    g = torch.where(diff > 0, alpha * diff, diff)       # (B, T, F)  g_asym
+    return (g ** 2).mean()
 
 
 def hinge_loss(
@@ -99,7 +87,7 @@ def hinge_loss(
 
 
 class AsymmetricL2Loss(nn.Module):
-    """Combined objective: asymmetric L2 + per-frame hinge (§3.3 + §4.2).
+    """Combined objective: asymmetric L2 + per-frame hinge (§3.3 + §3.4).
 
     Total loss = L_asym + hp.hinge_loss_weight · L_hinge
 
@@ -110,8 +98,6 @@ class AsymmetricL2Loss(nn.Module):
     def __init__(self, hp: HParams):
         super().__init__()
         self.alpha = hp.loss_alpha
-        self.beta = hp.loss_beta
-        self.lam = hp.loss_lambda
         self.use_noise_type_predictor = hp.use_noise_type_predictor
         self.hinge_loss_weight = hp.hinge_loss_weight
 
@@ -127,21 +113,15 @@ class AsymmetricL2Loss(nn.Module):
         Args:
             pred:          (B, T, F) enhanced log-mel from `VoiceFilterLite.forward_train`.
             target:        (B, T, F) clean target log-mel.
-            frame_logits:  (B, T) raw logits from alpha_head; required when
-                           use_noise_type_predictor=True.
+            frame_logits:  (B, T) raw logits from alpha_head (2 FC × 64);
+                           required when use_noise_type_predictor=True.
             frame_labels:  (B, T) in {-1, +1}; required when
                            use_noise_type_predictor=True.
 
         Returns:
-            Scalar loss (or dict with 'loss', 'loss_asym', 'loss_hinge' if
-            `return_components=True`).
+            Scalar loss.
         """
-        loss_asym = asymmetric_l2_loss(
-            pred, target,
-            alpha=self.alpha,
-            beta=self.beta,
-            lam=self.lam,
-        )
+        loss_asym = asymmetric_l2_loss(pred, target, alpha=self.alpha)
 
         loss_hinge = pred.new_zeros(())
         if (
@@ -161,12 +141,7 @@ class AsymmetricL2Loss(nn.Module):
         frame_labels: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
         """Like `forward` but returns each component for logging."""
-        loss_asym = asymmetric_l2_loss(
-            pred, target,
-            alpha=self.alpha,
-            beta=self.beta,
-            lam=self.lam,
-        )
+        loss_asym = asymmetric_l2_loss(pred, target, alpha=self.alpha)
 
         loss_hinge = pred.new_zeros(())
         if (
