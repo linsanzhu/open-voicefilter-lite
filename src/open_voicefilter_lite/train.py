@@ -35,7 +35,7 @@ from open_voicefilter_lite.cli import apply_hf_endpoint, load_and_apply
 from open_voicefilter_lite.dataset import LibriSpeechTripletStream, collate_triplets
 from open_voicefilter_lite.dvec_cache import DVecCache
 from open_voicefilter_lite.hparams import HParams
-from open_voicefilter_lite.losses import AsymmetricL2Loss
+from open_voicefilter_lite.losses import build_loss
 from open_voicefilter_lite.model import VoiceFilterLite
 from open_voicefilter_lite.speaker_encoder import FrozenSpeakerEncoder
 
@@ -259,7 +259,8 @@ def train(hp: HParams, args: argparse.Namespace) -> None:
     )
 
     # ---- Loss ----
-    loss_fn = AsymmetricL2Loss(hp)
+    loss_fn = build_loss(hp)
+    print(f"[train] loss_type={hp.loss_type}")
 
     # ---- Optimiser + scheduler ----
     optimizer = torch.optim.Adam(
@@ -331,8 +332,21 @@ def train(hp: HParams, args: argparse.Namespace) -> None:
     last_log = time.time()
     running_loss = 0.0
     running_loss_asym = 0.0
+    running_loss_sisdr = 0.0
+    running_loss_bimodal = 0.0
     running_loss_hinge = 0.0
     running_count = 0
+    # Mask diagnostics. `mask` is the per-bin sigmoid output (B, T, n_mels)
+    # ∈ [0, 1]; tracking its distribution tells us whether the model has
+    # collapsed to pass-through (mask ≈ 1) or learned selective filtering.
+    # All accumulators are simple sums over batches — we average on log.
+    running_mask_mean = 0.0
+    running_mask_std = 0.0
+    running_mask_range = 0.0
+    running_mask_on_active = 0.0
+    running_mask_on_silent = 0.0
+    running_mask_target_corr = 0.0
+    running_mask_batches = 0
 
     # First-batch visibility: the iterable dataset pulls a full batch of
     # 16 kHz audio through `soundfile` and STFT, then the main thread runs
@@ -370,16 +384,64 @@ def train(hp: HParams, args: argparse.Namespace) -> None:
         )
         overlap_labels = batch["overlap_label"].to(device) if hp.use_noise_type_predictor else None
 
-        # forward_train returns (enhanced, hidden, frame_logits) — the
-        # last is the per-frame logit from the 2-FC×64 noise-type predictor
-        # (paper §4.2). Combined loss = L_asym + hinge_loss_weight · L_hinge.
-        enhanced, _hidden, frame_logits = model.forward_train(stacked, dvec)
+        # forward returns (enhanced, hidden, frame_logits, mask) — `mask` is
+        # the raw sigmoid output (B, T, n_mels) ∈ [0, 1], kept here purely for
+        # diagnostics (logging "is the mask collapsing?"). The loss is
+        # computed from `enhanced` in log-mel space (paper §3.3).
+        enhanced, _hidden, frame_logits, mask = model(stacked, dvec)
         comps = loss_fn.forward_with_components(
             enhanced, target,
             frame_logits=frame_logits,
             frame_labels=overlap_labels,
+            mask=mask,
         )
         loss = comps["loss"]
+
+        # ---- Mask diagnostics (no grad; cheap) ----
+        # `target` is (B, T, n_mels) log-mel. We call a frame "active" if its
+        # average log-mel energy > -5 (well above the log(floor) ≈ -13.8 floor)
+        # and "silent" if < -10 (close to the floor). The split is purely for
+        # observability — the loss treats all frames equally.
+        with torch.no_grad():
+            target_frame_energy = target.mean(dim=-1)  # (B, T)
+            mask_per_frame = mask.mean(dim=-1)         # (B, T)
+            active_mask = target_frame_energy > -5.0
+            silent_mask = target_frame_energy < -10.0
+            n_active = int(active_mask.sum().item())
+            n_silent = int(silent_mask.sum().item())
+            m_mean = float(mask.mean().item())
+            m_std = float(mask.std().item())
+            m_range = float((mask.max() - mask.min()).item())
+            if n_active > 0:
+                m_on_active = float(
+                    mask_per_frame[active_mask].mean().item()
+                )
+            else:
+                m_on_active = m_mean
+            if n_silent > 0:
+                m_on_silent = float(
+                    mask_per_frame[silent_mask].mean().item()
+                )
+            else:
+                m_on_silent = m_mean
+            # Per-frame Pearson corr between mask and target energy. When the
+            # mask correctly tracks target presence this is positive; when
+            # the mask collapses to ~1 everywhere it sits near 0.
+            t_flat = target_frame_energy.flatten()
+            m_flat = mask_per_frame.flatten()
+            if t_flat.std() > 1e-3 and m_flat.std() > 1e-3:
+                corr = float(
+                    torch.corrcoef(torch.stack([t_flat, m_flat]))[0, 1].item()
+                )
+            else:
+                corr = 0.0
+            running_mask_mean += m_mean
+            running_mask_std += m_std
+            running_mask_range += m_range
+            running_mask_on_active += m_on_active
+            running_mask_on_silent += m_on_silent
+            running_mask_target_corr += corr
+            running_mask_batches += 1
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -391,7 +453,9 @@ def train(hp: HParams, args: argparse.Namespace) -> None:
             ema.update(model)
 
         running_loss += comps["loss"].item()
-        running_loss_asym += comps["loss_asym"].item()
+        running_loss_asym += comps["loss_asym"].item() if "loss_asym" in comps else 0.0
+        running_loss_sisdr += comps["loss_sisdr"].item() if "loss_sisdr" in comps else 0.0
+        running_loss_bimodal += comps["loss_bimodal"].item() if "loss_bimodal" in comps else 0.0
         running_loss_hinge += comps["loss_hinge"].item()
         running_count += 1
         step += 1
@@ -417,6 +481,8 @@ def train(hp: HParams, args: argparse.Namespace) -> None:
             now = time.time()
             avg_loss = running_loss / max(1, running_count)
             avg_loss_asym = running_loss_asym / max(1, running_count)
+            avg_loss_sisdr = running_loss_sisdr / max(1, running_count)
+            avg_loss_bimodal = running_loss_bimodal / max(1, running_count)
             avg_loss_hinge = running_loss_hinge / max(1, running_count)
             elapsed = now - last_log
             sps = hp.log_every * hp.batch_size / max(1.0, elapsed)
@@ -427,22 +493,66 @@ def train(hp: HParams, args: argparse.Namespace) -> None:
             # historically a BSD-ism that POSIX kept). Useful for spotting
             # leaks: should plateau within a few hundred steps, not climb.
             rss_gib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 ** 3)
+            # Mask diagnostics — averaged over the last `log_every` batches.
+            mb = max(1, running_mask_batches)
+            avg_mask_mean = running_mask_mean / mb
+            avg_mask_std = running_mask_std / mb
+            avg_mask_range = running_mask_range / mb
+            avg_mask_on_active = running_mask_on_active / mb
+            avg_mask_on_silent = running_mask_on_silent / mb
+            avg_mask_target_corr = running_mask_target_corr / mb
+            mask_active_silent_delta = avg_mask_on_active - avg_mask_on_silent
+            # Build a single "[train]" line that includes whichever main-loss
+            # term is active for the chosen `loss_type`.
+            main_term = (
+                f"asym={avg_loss_asym:+.3f}" if hp.loss_type == "asym_l2"
+                else f"sisdr={avg_loss_sisdr:+.3f}dB bimodal={avg_loss_bimodal:.3f}"
+            )
             print(
                 f"[train] step={step}/{hp.total_steps} "
-                f"loss={avg_loss:.4f} asym={avg_loss_asym:.4f} hinge={avg_loss_hinge:.4f} "
+                f"loss={avg_loss:.4f} {main_term} hinge={avg_loss_hinge:.4f} "
                 f"lr={cur_lr:.2e} samples/s={sps:.1f} rss={rss_gib:.2f}GiB"
+            )
+            print(
+                f"[mask]  mean={avg_mask_mean:.4f} std={avg_mask_std:.4f} "
+                f"range={avg_mask_range:.4f} on_active={avg_mask_on_active:.4f} "
+                f"on_silent={avg_mask_on_silent:.4f} Δ={mask_active_silent_delta:+.4f} "
+                f"corr_target={avg_mask_target_corr:+.4f}"
             )
             if writer is not None:
                 writer.add_scalar("train/loss", avg_loss, step)
-                writer.add_scalar("train/loss_asym", avg_loss_asym, step)
+                if hp.loss_type == "asym_l2":
+                    writer.add_scalar("train/loss_asym", avg_loss_asym, step)
+                else:
+                    writer.add_scalar("train/loss_sisdr", avg_loss_sisdr, step)
+                    writer.add_scalar("train/loss_bimodal", avg_loss_bimodal, step)
                 writer.add_scalar("train/lr", cur_lr, step)
                 writer.add_scalar("train/rss_gib", rss_gib, step)
                 if hp.use_noise_type_predictor:
                     writer.add_scalar("train/loss_hinge", avg_loss_hinge, step)
+                # Mask diagnostics to TB (so you can plot `mask/mean` and
+                # `mask/on_active` over steps and see exactly when the mask
+                # collapses).
+                writer.add_scalar("mask/mean", avg_mask_mean, step)
+                writer.add_scalar("mask/std", avg_mask_std, step)
+                writer.add_scalar("mask/range", avg_mask_range, step)
+                writer.add_scalar("mask/on_active", avg_mask_on_active, step)
+                writer.add_scalar("mask/on_silent", avg_mask_on_silent, step)
+                writer.add_scalar("mask/active_minus_silent", mask_active_silent_delta, step)
+                writer.add_scalar("mask/corr_target", avg_mask_target_corr, step)
             running_loss = 0.0
             running_loss_asym = 0.0
+            running_loss_sisdr = 0.0
+            running_loss_bimodal = 0.0
             running_loss_hinge = 0.0
             running_count = 0
+            running_mask_mean = 0.0
+            running_mask_std = 0.0
+            running_mask_range = 0.0
+            running_mask_on_active = 0.0
+            running_mask_on_silent = 0.0
+            running_mask_target_corr = 0.0
+            running_mask_batches = 0
             last_log = now
 
         if step % hp.ckpt_every == 0 or step == hp.total_steps:
@@ -527,6 +637,23 @@ def build_argparser() -> argparse.ArgumentParser:
 
     p.add_argument("--ema-decay", type=float, default=None,
                    help="Override hp.ema_decay (e.g. 0.999).")
+    p.add_argument("--loss-alpha", type=float, default=None,
+                   help="Override hp.loss_alpha (paper uses 10; lower values "
+                        "e.g. 2-3 let the mask escape the 'mask=1 everywhere' "
+                        "local minimum caused by α²=100 amplification on "
+                        "over-suppression errors).")
+
+    p.add_argument("--loss-type", type=str, default=None,
+                   choices=["asym_l2", "sisdr_mel"],
+                   help="Loss backend: 'asym_l2' (paper's asymmetric L2, "
+                        "default) or 'sisdr_mel' (linear-mel SI-SDR; "
+                        "symmetric, breaks the mask=1 collapse that "
+                        "AsymmetricL2Loss can't escape).")
+
+    p.add_argument("--mask-binary-reg-weight", type=float, default=None,
+                   help="Override hp.mask_binary_reg_weight. Pushes the mask "
+                        "away from 0.5 (saddle point of SI-SDR). Only used "
+                        "by SISDRMelLoss. Set 0 to disable.")
 
     p.add_argument("--dataloader-workers", type=int, default=None,
                    help="Number of DataLoader worker PROCESSES "
@@ -582,6 +709,12 @@ def main() -> None:
         hp.use_real_rir = True
     if args.ema_decay is not None:
         hp.ema_decay = args.ema_decay
+    if args.loss_alpha is not None:
+        hp.loss_alpha = args.loss_alpha
+    if args.loss_type is not None:
+        hp.loss_type = args.loss_type
+    if args.mask_binary_reg_weight is not None:
+        hp.mask_binary_reg_weight = args.mask_binary_reg_weight
     if args.dataloader_workers is not None:
         # Most useful on memory-constrained machines (MPS): PyTorch's
         # multiprocessing batch queue is unbounded, so 4 workers on a

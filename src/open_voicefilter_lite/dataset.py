@@ -856,8 +856,29 @@ class LibriSpeechTripletStream(IterableDataset):
                 if interference_silent:
                     interference_wav = torch.zeros_like(interference_wav)
 
+                # Bypass `snr_mix` when either side is silent. `snr_mix` clamps
+                # `clean_power` to 1e-12 when clean=0, which collapses the SNR
+                # scaling to ~0 and silently turns `mixed_wav` into silence
+                # even when interference is fully active. That removed the
+                # training signal for "target absent → suppress": the model
+                # saw silent inputs paired with silent targets and learned
+                # mask≈1 unconditionally. By bypassing `snr_mix` for the
+                # silent branches:
+                #   * both silent → mixed = 0
+                #   * target silent → mixed = interference (model must learn
+                #     to suppress the active interference to hit target=-13.8)
+                #   * interference silent → mixed = target (clean pass-through,
+                #     same end result as snr_mix but explicit + cheap)
+                #   * both active → snr_mix as before
                 snr = rng.uniform(hp.snr_min_db, hp.snr_max_db)
-                mixed_wav = snr_mix(target_wav, interference_wav, snr)
+                if target_silent and interference_silent:
+                    mixed_wav = torch.zeros_like(target_wav)
+                elif target_silent:
+                    mixed_wav = interference_wav.clone()
+                elif interference_silent:
+                    mixed_wav = target_wav.clone()
+                else:
+                    mixed_wav = snr_mix(target_wav, interference_wav, snr)
 
                 # ---- Features (CPU-side) ----
                 # ECAPA used to run here too, but moved off this iterator

@@ -24,8 +24,15 @@ sys.path.insert(0, os.path.abspath(os.path.join(HERE, "..", "src")))
 import torch
 
 from open_voicefilter_lite.hparams import HParams
-from open_voicefilter_lite.losses import AsymmetricL2Loss, hinge_loss
-from open_voicefilter_lite.model import StreamingVoiceFilter, VoiceFilterLite
+from open_voicefilter_lite.losses import (
+    AsymmetricL2Loss,
+    SISDRMelLoss,
+    build_loss,
+    hinge_loss,
+    sisdr_loss_on_logmel,
+)
+from open_voicefilter_lite.model import VoiceFilterLite
+from open_voicefilter_lite.streaming import StreamingVoiceFilter
 
 
 def _select_device() -> torch.device:
@@ -60,9 +67,10 @@ def test_forward_backward(hp: HParams, device: torch.device) -> None:
     frame_labels = torch.randint(0, 2, (B, T), device=device).mul(2).sub(1)
 
     model.train()
-    enhanced, _hidden, frame_logits = model.forward_train(stacked, dvec)
+    enhanced, _hidden, frame_logits, mask = model(stacked, dvec)
     assert enhanced.shape == target.shape, f"shape mismatch {enhanced.shape} vs {target.shape}"
     assert frame_logits.shape == (B, T), f"frame_logits shape {frame_logits.shape} != {(B, T)}"
+    assert mask.shape == (B, T, hp.n_mels), f"mask shape {mask.shape} != {(B, T, hp.n_mels)}"
 
     comps = loss_fn.forward_with_components(
         enhanced, target,
@@ -102,7 +110,7 @@ def test_streaming_matches_batched(hp: HParams, device: torch.device) -> None:
 
     # Batched forward (no adaptive suppression at inference — uses pure mask).
     with torch.no_grad():
-        ref_enhanced, _ = model(stacked, dvec)
+        ref_enhanced, _, _, _ = model(stacked, dvec)
 
     # Streaming forward (adaptive w^(t) per §3.4).
     sf = StreamingVoiceFilter(model, hp)
@@ -156,6 +164,55 @@ def test_hinge_loss_sanity() -> None:
     )
 
 
+def test_sisdr_loss_sanity(hp: HParams) -> None:
+    """SI-SDR on log-mel: better-aligned estimate ⇒ lower loss."""
+    target = torch.randn(2, 10, hp.n_mels)
+    # `good` = target + tiny noise (close alignment); `bad` = target + large noise.
+    good = target + 0.01 * torch.randn_like(target)
+    bad = target + 2.0 * torch.randn_like(target)
+
+    good_loss = sisdr_loss_on_logmel(good, target).item()
+    bad_loss = sisdr_loss_on_logmel(bad, target).item()
+    print(f"  sisdr(good)={good_loss:+.4f}, sisdr(bad)={bad_loss:+.4f}")
+    assert bad_loss > good_loss, (
+        f"SISDR ordering wrong (good={good_loss} vs bad={bad_loss})"
+    )
+    # `good` should be very close to 0 (perfect SI-SDR ≈ 0 dB).
+    assert good_loss < 1.0, f"SISDR(good) should be near 0, got {good_loss}"
+
+
+def test_sisdr_module_forward_backward(hp: HParams, device: torch.device) -> None:
+    """SISDRMelLoss is drop-in compatible with the train loop (returns the
+    same forward / forward_with_components signature as AsymmetricL2Loss)."""
+    hp_sisdr = HParams(loss_type="sisdr_mel")
+    loss_fn = SISDRMelLoss(hp_sisdr).to(device)
+
+    B, T = 2, hp.num_frames
+    pred = torch.randn(B, T, hp.n_mels, device=device, requires_grad=True)
+    target = torch.randn(B, T, hp.n_mels, device=device)
+    frame_logits = torch.randn(B, T, device=device, requires_grad=True)
+    frame_labels = torch.randint(0, 2, (B, T), device=device).mul(2).sub(1)
+
+    loss = loss_fn(pred, target, frame_logits=frame_logits, frame_labels=frame_labels)
+    assert torch.isfinite(loss), f"loss not finite: {loss}"
+    loss.backward()
+    print(f"  SISDRMelLoss forward+backward OK — loss={loss.item():+.4f}")
+
+
+def test_build_loss_factory(hp: HParams) -> None:
+    """build_loss picks AsymmetricL2Loss vs SISDRMelLoss from hp.loss_type."""
+    hp_a = HParams(loss_type="asym_l2")
+    hp_s = HParams(loss_type="sisdr_mel")
+    assert isinstance(build_loss(hp_a), AsymmetricL2Loss)
+    assert isinstance(build_loss(hp_s), SISDRMelLoss)
+    try:
+        build_loss(HParams(loss_type="bogus"))
+    except ValueError as e:
+        print(f"  build_loss correctly rejects bogus type: {str(e)[:60]}…")
+    else:
+        raise AssertionError("build_loss should raise on unknown loss_type")
+
+
 def main() -> None:
     print("== VoiceFilter-Lite smoke test ==")
     hp = HParams()
@@ -176,6 +233,15 @@ def main() -> None:
 
     print("[5/5] hinge loss sanity")
     test_hinge_loss_sanity()
+
+    print("[6/8] SI-SDR loss sanity")
+    test_sisdr_loss_sanity(hp)
+
+    print("[7/8] SISDRMelLoss forward+backward")
+    test_sisdr_module_forward_backward(hp, device)
+
+    print("[8/8] build_loss factory")
+    test_build_loss_factory(hp)
 
     print("== ALL SMOKE TESTS PASSED ==")
 

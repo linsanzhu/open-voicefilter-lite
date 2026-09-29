@@ -44,7 +44,8 @@ from open_voicefilter_lite.dataset import (
     _disable_hf_audio_decode,
 )
 from open_voicefilter_lite.hparams import HParams
-from open_voicefilter_lite.model import StreamingVoiceFilter, VoiceFilterLite
+from open_voicefilter_lite.model import VoiceFilterLite
+from open_voicefilter_lite.streaming import StreamingVoiceFilter
 from open_voicefilter_lite.speaker_encoder import FrozenSpeakerEncoder
 
 
@@ -76,9 +77,10 @@ def log_mel_snr(
     eps: float = 1e-8,
 ) -> tuple[float, float, float]:
     """Compute SI-SNR in the **linear-mel** domain. The model itself operates
-    on linear-mel filterbank energies (`_mask_logmel` applies the mask to
-    magnitude then re-logs), so this metric is the cleanest phase-free proxy
-    for how well VoiceFilter recovers the target's spectral envelope.
+    on linear-mel filterbank energies (`VoiceFilterLite._apply_mask` applies
+    the mask to magnitude then re-logs), so this metric is the cleanest
+    phase-free proxy for how well VoiceFilter recovers the target's spectral
+    envelope.
 
     Avoids the Griffin-Lim phase pitfall that makes time-domain SI-SNR
     unreliable (Griffin-Lim's phase is essentially random and destroys the

@@ -81,6 +81,26 @@ class HParams:
     # makes gradients unstable at training start.
     loss_alpha: float = 10.0
 
+    # Which loss backend to use. `asym_l2` is the paper's asymmetric L2
+    # (loss_alpha above controls the asymmetry strength). `sisdr_mel` is
+    # a scale-invariant SDR computed in the linear-mel domain — symmetric,
+    # so the gradient at mask ≈ 1 is non-zero; that breaks the failure
+    # mode where AsymmetricL2Loss converges to pass-through (mask ≈ 1,
+    # loss stuck ≈ 5). The hinge loss for the noise-type predictor is
+    # added on top of either backend.
+    loss_type: str = "asym_l2"        # "asym_l2" | "sisdr_mel"
+
+    # Numerical floor for SI-SDR divisions (losses.sisdr_loss_on_logmel).
+    # 1e-7 is plenty at fp32. Bump to 1e-5 if you see NaNs on MPS fp16.
+    sisdr_eps: float = 1e-7
+
+    # Weight on the mask-binary regulariser in SISDRMelLoss. Pushes the
+    # mask away from 0.5 (a saddle point of the SI-SDR alpha-projection)
+    # so it has to commit to either 0 or 1 per bin. The regulariser
+    # itself is non-directional — SI-SDR is what picks 0 vs 1. Set to 0
+    # to disable (lets the mask collapse to 0.5).
+    mask_binary_reg_weight: float = 0.05
+
     # ---- Noise-type predictor (paper §4.2 / §3.4) ----
     # Two feedforward layers (256 → 64 → 64 → 1) emit **per-frame** logits
     # indicating "is this frame overlapped speech?". Trained with a hinge
@@ -116,7 +136,7 @@ class HParams:
 
     # ---- Data ----
     target_config: str = "clean"
-    target_splits: tuple[str, ...] = ("train.360")
+    target_splits: tuple[str, ...] = ("train.360",)
     interference_config: str = "other"
     interference_split: str = "train.500"
     streaming: bool = True     # HF datasets streaming=True (saves disk)
