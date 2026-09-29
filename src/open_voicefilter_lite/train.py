@@ -503,14 +503,21 @@ def train(hp: HParams, args: argparse.Namespace) -> None:
             avg_mask_target_corr = running_mask_target_corr / mb
             mask_active_silent_delta = avg_mask_on_active - avg_mask_on_silent
             # Build a single "[train]" line that includes whichever main-loss
-            # term is active for the chosen `loss_type`.
-            main_term = (
-                f"asym={avg_loss_asym:+.3f}" if hp.loss_type == "asym_l2"
-                else f"sisdr={avg_loss_sisdr:+.3f}dB bimodal={avg_loss_bimodal:.3f}"
+            # term is active for the chosen `loss_type`. `bimodal` is the
+            # per-bin Bernoulli entropy of the mask, in [0, ln 2]. Small
+            # (= mask close to 0 or 1) is good; large (= mask stuck at 0.5)
+            # is the failure mode the regulariser is supposed to prevent.
+            if hp.loss_type == "asym_l2":
+                main_term = f"asym={avg_loss_asym:+.3f}"
+            else:
+                main_term = f"sisdr={avg_loss_sisdr:+.3f}dB"
+            bimodal_str = (
+                f" bimodal={avg_loss_bimodal:.3f}"
+                if hp.mask_binary_reg_weight > 0.0 else ""
             )
             print(
                 f"[train] step={step}/{hp.total_steps} "
-                f"loss={avg_loss:.4f} {main_term} hinge={avg_loss_hinge:.4f} "
+                f"loss={avg_loss:.4f} {main_term}{bimodal_str} hinge={avg_loss_hinge:.4f} "
                 f"lr={cur_lr:.2e} samples/s={sps:.1f} rss={rss_gib:.2f}GiB"
             )
             print(
