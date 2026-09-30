@@ -28,6 +28,7 @@ dependencies = [
     # CLI / config
     "pyyaml>=6.0",
     "torchcodec>=0.16.0",
+    "librosa>=0.11.0",
 ]
 
 [project.optional-dependencies]

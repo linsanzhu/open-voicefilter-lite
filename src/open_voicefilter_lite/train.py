@@ -4,15 +4,12 @@ predictor, Musan noise and real-RIR augmentation (see `configs/paper.yaml`)."""
 from __future__ import annotations
 
 import argparse
-import copy
 import math
-import os
 import queue
 import resource
 import threading
 import time
 import warnings
-from dataclasses import asdict
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -31,13 +28,13 @@ warnings.filterwarnings(
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 
+from open_voicefilter_lite.audio import extract_dvec
 from open_voicefilter_lite.cli import apply_hf_endpoint, load_and_apply
 from open_voicefilter_lite.dataset import LibriSpeechTripletStream, collate_triplets
-from open_voicefilter_lite.dvec_cache import DVecCache
 from open_voicefilter_lite.hparams import HParams
 from open_voicefilter_lite.losses import build_loss
 from open_voicefilter_lite.model import VoiceFilterLite
-from open_voicefilter_lite.speaker_encoder import FrozenSpeakerEncoder
+from open_voicefilter_lite.speaker_encoder import SpeakerEncoder
 
 
 # ---- Background prefetch ----
@@ -49,7 +46,7 @@ class PrefetchIterator:
     The main thread consumes items via `for x in PrefetchIterator(src)` —
     by the time the GPU finishes step N, batch N+1 is already built and
     sitting in the queue, so the GPU is never idle waiting for soundfile
-    decodes / ECAPA forwards.
+    decodes / mel extractions / encoder forwards.
 
     Exceptions raised in the producer thread are re-raised on the consumer
     side at the next `__next__` call (a sentinel `None` would be ambiguous
@@ -216,9 +213,6 @@ def count_params(module: torch.nn.Module) -> int:
     return sum(p.numel() for p in module.parameters() if p.requires_grad)
 
 
-# ---- Core training routine ----
-
-
 def train(hp: HParams, args: argparse.Namespace) -> None:
     device = select_device(hp.device)
     print(f"[train] device={device}")
@@ -230,16 +224,39 @@ def train(hp: HParams, args: argparse.Namespace) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "hparams.json").write_text(_json_dumps(hp.to_dict()))
 
-    # ---- Speaker encoder (frozen) + dvec cache ----
-    # ECAPA-TDNN used to live inside `LibriSpeechTripletStream.__iter__`,
-    # which is called from `PrefetchIterator`'s background thread. That
-    # cross-thread MPS use is what blew up `python3.13` with
-    # `BUG IN CLIENT OF LIBMALLOC: memory corruption of free block`
-    # (see `~/Library/Logs/DiagnosticReports/python3.13-*.ips`). The
-    # encoder is now held by the main process via `DVecCache` and runs
-    # only on the main thread inside the training loop.
-    speaker_encoder = FrozenSpeakerEncoder(hp).to(device)
-    dvec_cache = DVecCache(hp, speaker_encoder, device=device)
+    # ---- Speaker encoder (frozen) ----
+    # `SpeakerEncoder` (VoiceFilter 3-layer LSTM × 768) is held by the main
+    # process only. The reference waveform is small (~2 MB at batch=16,
+    # capped at `hp.ref_max_sec`); `extract_dvec` (in `audio.py`) handles
+    # fbank extraction + the 80-frame sliding-window aggregation, then
+    # feeds the windows through the frozen encoder. The encoder itself
+    # is kept on CPU when training device is MPS — frozen encoder under
+    # `@torch.no_grad`, so CPU cost is bounded and amortised.
+    enc_device = device
+    if device.type == "mps":
+        enc_device = torch.device("cpu")
+        print(
+            f"[train] device={device}; keeping SpeakerEncoder on CPU"
+        )
+    speaker_encoder = SpeakerEncoder(hp).to(enc_device)
+    if Path(hp.dvector_pt_path).is_file():
+        speaker_encoder.load_pretrained(hp.dvector_pt_path)
+        print(
+            f"[train] SpeakerEncoder loaded from {hp.dvector_pt_path}"
+        )
+    else:
+        print(
+            f"[train] WARNING: dvector weights not found at "
+            f"{hp.dvector_pt_path}; encoder will use RANDOM init. "
+            f"The pretrained embedder (`models/embedder.pt`) ships with "
+            f"this repo (from "
+            f"https://github.com/maum-ai/voicefilter/blob/master/model/"
+            f"embedder.py)."
+        )
+        speaker_encoder.freeze()
+    print(
+        f"[train] SpeakerEncoder ready (d_vector_dim={hp.d_vector_dim})"
+    )
 
     # ---- Model ----
     model = VoiceFilterLite(hp).to(device)
@@ -260,7 +277,7 @@ def train(hp: HParams, args: argparse.Namespace) -> None:
 
     # ---- Loss ----
     loss_fn = build_loss(hp)
-    print(f"[train] loss_type={hp.loss_type}")
+    print(f"[train] loss=asym_l2 alpha={hp.loss_alpha}")
 
     # ---- Optimiser + scheduler ----
     optimizer = torch.optim.Adam(
@@ -300,7 +317,7 @@ def train(hp: HParams, args: argparse.Namespace) -> None:
     )
     # Background prefetch: decouple CPU data prep from GPU compute so the
     # GPU sees a continuous stream of ready batches instead of waiting on
-    # soundfile + ECAPA between every step. Depth is `hp.prefetch_batches_max`
+    # soundfile + mel between every step. Depth is `hp.prefetch_batches_max`
     # (default 2) — on memory-constrained MPS machines the queue holds
     # `prefetch × batch_size × ref_padded_len` of CPU memory plus a copy
     # on MPS after `.to(device)`; deep queues just trade idle-GPU time
@@ -332,8 +349,6 @@ def train(hp: HParams, args: argparse.Namespace) -> None:
     last_log = time.time()
     running_loss = 0.0
     running_loss_asym = 0.0
-    running_loss_sisdr = 0.0
-    running_loss_bimodal = 0.0
     running_loss_hinge = 0.0
     running_count = 0
     # Mask diagnostics. `mask` is the per-bin sigmoid output (B, T, n_mels)
@@ -350,10 +365,11 @@ def train(hp: HParams, args: argparse.Namespace) -> None:
 
     # First-batch visibility: the iterable dataset pulls a full batch of
     # 16 kHz audio through `soundfile` and STFT, then the main thread runs
-    # the frozen ECAPA encoder on MPS to fill dvecs. First time around this
-    # is multi-minute on Apple Silicon because MPS has to compile kernels +
-    # warm caches. Print a heartbeat so the user knows the run isn't dead.
-    print("[train] building first batch (loading + decoding + mel + ECAPA)…")
+    # the frozen SpeakerEncoder on MPS to fill dvecs. First time around
+    # this is multi-minute on Apple Silicon because MPS has to compile
+    # kernels + warm caches. Print a heartbeat so the user knows the run
+    # isn't dead.
+    print("[train] building first batch (loading + decoding + mel + SpeakerEncoder)…")
     first_batch_t0 = time.time()
     first_batch_done = False
 
@@ -373,15 +389,42 @@ def train(hp: HParams, args: argparse.Namespace) -> None:
         # tensors through a queue.
         stacked = batch["stacked_mixed"].to(device)
         target = batch["target_logmel"].to(device)
-        # Compute dvecs on the main thread (the only thread that touches
-        # MPS). `dvec_cache` does cache lookup → ECAPA forward → cache
-        # write-back; this is the moved-out version of what used to be
-        # `_flush_buffer` inside the dataset's iterator.
-        dvec = dvec_cache.get_dvecs(
-            batch["ref_wavs"].to(device),
-            batch["ref_lens"].to(device),
-            batch["ref_spk_ids"],
-        )
+        # Compute dvecs on the main thread. `extract_dvec` does the full
+        # pipeline: fbank (librosa, CPU) → 80-frame sliding windows →
+        # frozen `SpeakerEncoder` forward → per-window L2 → mean → final
+        # L2. Audio preprocessing lives in `audio.py`; the encoder stays
+        # pure model. `ref_lens` lets `extract_dvec` crop the
+        # `collate_triplets` zero-padding before mel extraction.
+        #
+        # Per-buffer-entry dvec cache: when every ref in the batch came
+        # from a same-speaker buffer hit, `collate_triplets` already
+        # stacked the cached d-vectors into `batch["ref_dvecs"]` and we
+        # skip the `extract_dvec` call entirely. On a miss (fresh target
+        # or a buffer entry whose dvec hasn't been computed yet), we fall
+        # back to the full batch compute and write the result back into
+        # the dataset's `_target_buffer` keyed by `ref_entry_ids`, so the
+        # next time the same entry is picked as a ref it comes back
+        # non-None. Cache-hit rate after per-speaker warmup approaches
+        # the 0.7 buffer-revisit probability.
+        cached_dvecs = batch.get("ref_dvecs")
+        ref_entry_ids = batch.get("ref_entry_ids") or []
+        if cached_dvecs is not None:
+            dvec = cached_dvecs.to(device)
+        else:
+            dvec = extract_dvec(
+                batch["ref_wavs"],
+                hp, speaker_encoder,
+                device=enc_device,
+                ref_lens=batch["ref_lens"],
+            ).to(device)
+            # Write-back: stash each row's dvec on its buffer entry. The
+            # fresh-target row's entry was just appended to `_target_buffer`
+            # during the iterator's `tgt_buf.append(...)` call, so its id
+            # is still valid. Evicted entries (FIFO/LRU) silently miss —
+            # the next batch will simply recompute.
+            for entry_id, dvec_row in zip(ref_entry_ids, dvec.detach().cpu()):
+                if entry_id is not None:
+                    train_ds.set_dvec_for_entry(entry_id, dvec_row)
         overlap_labels = batch["overlap_label"].to(device) if hp.use_noise_type_predictor else None
 
         # forward returns (enhanced, hidden, frame_logits, mask) — `mask` is
@@ -454,8 +497,6 @@ def train(hp: HParams, args: argparse.Namespace) -> None:
 
         running_loss += comps["loss"].item()
         running_loss_asym += comps["loss_asym"].item() if "loss_asym" in comps else 0.0
-        running_loss_sisdr += comps["loss_sisdr"].item() if "loss_sisdr" in comps else 0.0
-        running_loss_bimodal += comps["loss_bimodal"].item() if "loss_bimodal" in comps else 0.0
         running_loss_hinge += comps["loss_hinge"].item()
         running_count += 1
         step += 1
@@ -481,8 +522,6 @@ def train(hp: HParams, args: argparse.Namespace) -> None:
             now = time.time()
             avg_loss = running_loss / max(1, running_count)
             avg_loss_asym = running_loss_asym / max(1, running_count)
-            avg_loss_sisdr = running_loss_sisdr / max(1, running_count)
-            avg_loss_bimodal = running_loss_bimodal / max(1, running_count)
             avg_loss_hinge = running_loss_hinge / max(1, running_count)
             elapsed = now - last_log
             sps = hp.log_every * hp.batch_size / max(1.0, elapsed)
@@ -502,22 +541,12 @@ def train(hp: HParams, args: argparse.Namespace) -> None:
             avg_mask_on_silent = running_mask_on_silent / mb
             avg_mask_target_corr = running_mask_target_corr / mb
             mask_active_silent_delta = avg_mask_on_active - avg_mask_on_silent
-            # Build a single "[train]" line that includes whichever main-loss
-            # term is active for the chosen `loss_type`. `bimodal` is the
-            # per-bin Bernoulli entropy of the mask, in [0, ln 2]. Small
-            # (= mask close to 0 or 1) is good; large (= mask stuck at 0.5)
-            # is the failure mode the regulariser is supposed to prevent.
-            if hp.loss_type == "asym_l2":
-                main_term = f"asym={avg_loss_asym:+.3f}"
-            else:
-                main_term = f"sisdr={avg_loss_sisdr:+.3f}dB"
-            bimodal_str = (
-                f" bimodal={avg_loss_bimodal:.3f}"
-                if hp.mask_binary_reg_weight > 0.0 else ""
-            )
+            # Single-line training summary. `asym` is the paper §3.3 main
+            # loss term; `hinge` is the noise-type predictor loss (§4.2).
             print(
                 f"[train] step={step}/{hp.total_steps} "
-                f"loss={avg_loss:.4f} {main_term}{bimodal_str} hinge={avg_loss_hinge:.4f} "
+                f"loss={avg_loss:.4f} asym={avg_loss_asym:+.3f} "
+                f"hinge={avg_loss_hinge:.4f} "
                 f"lr={cur_lr:.2e} samples/s={sps:.1f} rss={rss_gib:.2f}GiB"
             )
             print(
@@ -528,11 +557,7 @@ def train(hp: HParams, args: argparse.Namespace) -> None:
             )
             if writer is not None:
                 writer.add_scalar("train/loss", avg_loss, step)
-                if hp.loss_type == "asym_l2":
-                    writer.add_scalar("train/loss_asym", avg_loss_asym, step)
-                else:
-                    writer.add_scalar("train/loss_sisdr", avg_loss_sisdr, step)
-                    writer.add_scalar("train/loss_bimodal", avg_loss_bimodal, step)
+                writer.add_scalar("train/loss_asym", avg_loss_asym, step)
                 writer.add_scalar("train/lr", cur_lr, step)
                 writer.add_scalar("train/rss_gib", rss_gib, step)
                 if hp.use_noise_type_predictor:
@@ -549,8 +574,6 @@ def train(hp: HParams, args: argparse.Namespace) -> None:
                 writer.add_scalar("mask/corr_target", avg_mask_target_corr, step)
             running_loss = 0.0
             running_loss_asym = 0.0
-            running_loss_sisdr = 0.0
-            running_loss_bimodal = 0.0
             running_loss_hinge = 0.0
             running_count = 0
             running_mask_mean = 0.0
@@ -650,18 +673,6 @@ def build_argparser() -> argparse.ArgumentParser:
                         "local minimum caused by α²=100 amplification on "
                         "over-suppression errors).")
 
-    p.add_argument("--loss-type", type=str, default=None,
-                   choices=["asym_l2", "sisdr_mel"],
-                   help="Loss backend: 'asym_l2' (paper's asymmetric L2, "
-                        "default) or 'sisdr_mel' (linear-mel SI-SDR; "
-                        "symmetric, breaks the mask=1 collapse that "
-                        "AsymmetricL2Loss can't escape).")
-
-    p.add_argument("--mask-binary-reg-weight", type=float, default=None,
-                   help="Override hp.mask_binary_reg_weight. Pushes the mask "
-                        "away from 0.5 (saddle point of SI-SDR). Only used "
-                        "by SISDRMelLoss. Set 0 to disable.")
-
     p.add_argument("--dataloader-workers", type=int, default=None,
                    help="Number of DataLoader worker PROCESSES "
                         "(0 = single-threaded; n>0 = n parallel processes). "
@@ -718,10 +729,6 @@ def main() -> None:
         hp.ema_decay = args.ema_decay
     if args.loss_alpha is not None:
         hp.loss_alpha = args.loss_alpha
-    if args.loss_type is not None:
-        hp.loss_type = args.loss_type
-    if args.mask_binary_reg_weight is not None:
-        hp.mask_binary_reg_weight = args.mask_binary_reg_weight
     if args.dataloader_workers is not None:
         # Most useful on memory-constrained machines (MPS): PyTorch's
         # multiprocessing batch queue is unbounded, so 4 workers on a
@@ -731,7 +738,7 @@ def main() -> None:
         hp.dataloader_workers = args.dataloader_workers
 
     # Resolve HF Hub endpoint as early as possible — before any
-    # `datasets.load_dataset` / `huggingface_hub` / speechbrain call.
+    # `datasets.load_dataset` / `huggingface_hub` call.
     # Precedence: --hf-endpoint > $HF_ENDPOINT > hp.hf_endpoint > default.
     # Same precedence chain for the hf_transfer toggle (CLI > hp > env).
     apply_hf_endpoint(

@@ -54,6 +54,7 @@ checkpoints/
 runs/
 tb_logs/
 *.pt
+!embedder.pt
 *.pth
 *.ckpt
 
@@ -64,10 +65,11 @@ tb_logs/
 
 # Local data / caches / model weights
 data/
-models/
 datasets/
 .cache/
 models/             # HuggingFace / speechbrain local cache
+models/*
+!models/embedder.pt
 hf_cache/
 artifacts/
 

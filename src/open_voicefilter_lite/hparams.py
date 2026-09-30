@@ -1,9 +1,20 @@
-"""Centralised hyperparameters for VoiceFilter-Lite."""
+"""Centralised hyperparameters for VoiceFilter-Lite.
+
+Only one speaker encoder is supported: the paper §3.1 d-vector
+(`SpeakerEncoder`, 3-layer LSTM × 768 → Linear → 256). 256 is the only
+d-vector dimension in the codebase — no `hp.speaker_encoder` selection,
+no factory dispatch.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Optional
+
+
+# d-vector output dim — matches `SpeakerEncoder` (paper §3.1, 256-d).
+# Hardcoded here so the model's `in_proj` input shape is always 320+256.
+D_VECTOR_DIM = 256
 
 
 @dataclass
@@ -22,24 +33,61 @@ class HParams:
     # Paper §4.5: "stacked-by-4 log Mel-filterbank energies" — model I/O is
     # 80*4 = 320-dim stacked filterbanks.
     frame_stack: int = 4
-    right_context: int = 0
 
-    # ---- d-vector ----
-    # Raw ECAPA-TDNN from speechbrain (`spkrec-ecapa-voxceleb`) emits 192-dim
-    # embeddings; we project to d_vector_dim inside the model. The raw dim
-    # lives in HParams so model.py and speaker_encoder.py stay in sync.
-    speaker_encoder_source: str = "speechbrain/spkrec-ecapa-voxceleb"
-    speaker_encoder_raw_dim: int = 192
-    d_vector_dim: int = 256
-    speaker_encoder_cache: str = "models/spkrec-ecapa-voxceleb"
+    # ---- d-vector encoder (paper §3.1) ----
+    # 3-layer LSTM (input=40, hidden=768) → LinearNorm(768 → 256) →
+    # L2-normalise. Architecture mirrors the upstream `SpeechEmbedder`
+    # from https://github.com/maum-ai/voicefilter/blob/master/model/
+    # embedder.py so the pretrained `models/embedder.pt` (PyTorch
+    # state_dict, bundled with this repo) loads with zero key remapping.
+    #
+    # The reference-recipe aggregates 80-frame windows with 40-frame
+    # hop, runs each through the LSTM + LinearNorm, L2-normalises each,
+    # averages, then L2-normalises the final vector.
+    dvector_pt_path: str = "models/embedder.pt"
+    dvector_lstm_hidden: int = 768
+    dvector_lstm_layers: int = 3
+    dvector_emb_dim: int = 256
+    dvector_n_mels: int = 40
+    dvector_n_fft: int = 512         # 32 ms window @ 16 kHz; matches the pretrained
+                                     # embedder weights (paper §3.1)
+    dvector_win_length: int = 400    # 25 ms — hamming window
+    dvector_hop_length: int = 160    # 10 ms hop
+    dvector_window: int = 80
+    dvector_stride: int = 40
+    # d-vector dim is fixed at 256 (paper §3.1); kept as a field so
+    # model / streaming / ONNX graph can read it via `hp.d_vector_dim`.
+    d_vector_dim: int = D_VECTOR_DIM
 
     # ---- Model ----
-    hidden_dim: int = 384
-    num_lstm_layers: int = 2
+    # Paper §4.4: 3 LSTM × 256 (2.2 MB production variant) and 3 LSTM × 512
+    # (6.8 MB main variant). We default to the 256-node / 3-layer variant —
+    # matches `configs/paper.yaml` exactly without requiring an overlay.
+    hidden_dim: int = 256
+    num_lstm_layers: int = 3
     dropout: float = 0.1
 
+    # ---- 1D CNN (paper §3.2, optional) ----
+    # Paper topology includes 1D conv layers with frequency-axis-only kernels
+    # ("Convolutional layers are 1D (kernels for frequency dimension only)").
+    # §4.4 also notes "most of our models actually remove these CNN layers and
+    # purely consist of LSTM layers", so the canonical 2.2 MB variant leaves
+    # them out. We default to OFF for backward compatibility; flip `use_cnn`
+    # to True to opt into the paper's literal topology. When enabled,
+    # `num_cnn_layers` Conv1d layers (`cnn_channels_first` inter-channel width,
+    # last layer outputs `hidden_dim` to feed the LSTM stack) are inserted
+    # between `in_norm` and the LSTM stack. Kernel slides along the frequency
+    # axis (Conv1d's L dim after `(B, T, H) → (B*T, 1, H)` reshape).
+    use_cnn: bool = False
+    num_cnn_layers: int = 2           # paper Figure 2: 2 stacked Conv1d
+    cnn_kernel_size: int = 3          # kernel width along frequency
+    cnn_channels_first: int = 8       # output channels of the first Conv1d
+                                      # (and all intermediate layers); the
+                                      # LAST conv always outputs `hidden_dim`
+                                      # so it feeds the LSTM directly.
+
     # ---- Training ----
-    sample_length_sec: float = 4.0
+    sample_length_sec: float = 3.0
     # Paper §3.2: "random within 1 dB to 10 dB". Negative SNRs (target
     # quieter than interference) push the mask network into a regime the
     # paper doesn't evaluate and tend to destabilise the asymmetric loss
@@ -48,6 +96,16 @@ class HParams:
     snr_max_db: float = 10.0
     silent_target_prob: float = 0.10    # P(target is silence) — train the "do nothing" mode
     silent_interference_prob: float = 0.10  # P(interference is silence)
+    # Per-frame activity burst (paper §4.2 — frame-level "is this frame
+    # overlapped speech?" labelling). For non-silent target/interference,
+    # a random burst window of `[activity_burst_min_sec, activity_burst_max_sec]`
+    # seconds is drawn and the waveform is gated by a soft 0/1 mask with
+    # `activity_fade_ms` fade in/out (avoids click artefacts). The noise-
+    # type predictor's per-frame label is +1 where BOTH target and
+    # interference bursts cover the frame's centre, -1 elsewhere.
+    activity_burst_min_sec: float = 0.5
+    activity_burst_max_sec: float = 3.0
+    activity_fade_ms: float = 50.0
     batch_size: int = 6
     learning_rate: float = 1e-3
     weight_decay: float = 1e-5
@@ -81,51 +139,51 @@ class HParams:
     # makes gradients unstable at training start.
     loss_alpha: float = 10.0
 
-    # Which loss backend to use. `asym_l2` is the paper's asymmetric L2
-    # (loss_alpha above controls the asymmetry strength). `sisdr_mel` is
-    # a scale-invariant SDR computed in the linear-mel domain — symmetric,
-    # so the gradient at mask ≈ 1 is non-zero; that breaks the failure
-    # mode where AsymmetricL2Loss converges to pass-through (mask ≈ 1,
-    # loss stuck ≈ 5). The hinge loss for the noise-type predictor is
-    # added on top of either backend.
-    loss_type: str = "asym_l2"        # "asym_l2" | "sisdr_mel"
-
-    # Numerical floor for SI-SDR divisions (losses.sisdr_loss_on_logmel).
-    # 1e-7 is plenty at fp32. Bump to 1e-5 if you see NaNs on MPS fp16.
-    sisdr_eps: float = 1e-7
-
-    # Weight on the mask-binary regulariser in SISDRMelLoss. Pushes the
-    # mask away from 0.5 (a saddle point of the SI-SDR alpha-projection)
-    # so it has to commit to either 0 or 1 per bin. The regulariser
-    # itself is non-directional — SI-SDR is what picks 0 vs 1. Set to 0
-    # to disable (lets the mask collapse to 0.5).
-    mask_binary_reg_weight: float = 0.05
+    # ---- Mask saturation regulariser (anti-mask-collapse safety net) ----
+    # With α ≥ 2 the asymmetric L2 gradient landscape has a stable local
+    # minimum at mask ≈ 1 (pass-through): over-suppression is α²-amplified
+    # so the model learns to "always emit 1" to dodge the penalty, and once
+    # sigmoid saturates the discrimination signal vanishes (mask mean→1,
+    # std→0, corr_target→0). The companion `out_proj.bias = -1` init in
+    # `model.py` gives the model a healthier starting point (mask≈0.27);
+    # this regulariser is the late-training safety net that prevents the
+    # bias drift from re-entering the dead state.
+    #
+    # Penalty (element-wise, summed):
+    #     loss_mask_sat = weight · Σ max(0, mask − target)²
+    # Below `target` the penalty is exactly zero (model free to discriminate
+    # in 0–0.85 range). Above, it grows quadratically per element. The
+    # per-element gradient magnitude is `weight · 2 · (mask − target)`, which
+    # is directly comparable to L_asym's per-element gradient (~10–40
+    # depending on data), so weight ≈ 5–20 hits the right ballpark — high
+    # enough to push back against the local-minimum pull, low enough not
+    # to flatten legitimate discrimination in the 0.6–0.85 range.
+    mask_sat_target: float = 0.85
+    mask_sat_weight: float = 10.0
 
     # ---- Noise-type predictor (paper §4.2 / §3.4) ----
-    # Two feedforward layers (256 → 64 → 64 → 1) emit **per-frame** logits
-    # indicating "is this frame overlapped speech?". Trained with a hinge
-    # loss (binary classification). At inference, the sigmoid of the logit
-    # drives the adaptive suppression strength `w^(t)` per §3.4.
-    # Adds ~20.6 K trainable params on top of the 3-LSTM backbone; total
-    # sits at ~2.2 M params (the paper's 2.2 MB post-quantization target).
+    # Two feedforward layers emit **per-frame** logits indicating "is this
+    # frame overlapped speech?". Trained with a hinge loss (binary
+    # classification). At inference, the sigmoid of the logit drives the
+    # adaptive suppression strength `w^(t)` per §3.4.
+    #
+    # Paper §3.4 says `f_adapt` takes `S_in^(t)` (the current frame's noisy
+    # filterbank, 80-d) — this is the literal primary spec. §4.2 also
+    # allows the alternative of feeding the LSTM output features. The
+    # `alpha_head_use_current_frame` switch selects between the two; paper
+    # default is True (S_in^(t)), legacy was False (LSTM output).
     use_noise_type_predictor: bool = True
-    hinge_loss_weight: float = 0.1  # weight on hinge loss in the total objective
+    alpha_head_use_current_frame: bool = True  # True → S_in^(t) (paper §3.4)
+    hinge_loss_weight: float = 1e-5  # paper §3.3 sum() magnifies L_asym by ~T·F
+                                    # vs legacy mean(), so weight is ~1/(T·F)
+                                    # of the old 0.1 default. With
+                                    # sample_length_sec=3, hop=10ms, n_mels=80:
+                                    # ~1/(T·F) ≈ 1/(300·80) ≈ 4e-5; we round
+                                    # to 1e-5 for a slightly hinge-favouring
+                                    # starting point. Tune per-run.
     adaptive_w_beta: float = 0.8    # paper §4.4 "moving average coefficient β = 0.8"
     adaptive_w_a: float = 1.0       # paper §3.4 linear transform "a > 0"
     adaptive_w_b: float = 0.0       # paper §3.4 linear transform "b ≥ 0"
-
-    # ---- Deprecated (kept for backward-compat with older checkpoints) ----
-    # The per-sample α regression that used to live here is replaced by the
-    # per-frame hinge-loss classifier above. These fields are no longer
-    # consumed by the model or loss; they remain so old checkpoints can be
-    # round-tripped through `HParams.from_dict`.
-    alpha_min: float = 1.0
-    alpha_max: float = 10.0
-    # Old soft-mask L2 (loss_beta / loss_lambda) — superseded by the paper's
-    # sign-based g_asym(x, α). Silently ignored by the current loss; kept so
-    # configs/checkpoints that still mention them don't fail HParams.from_dict.
-    loss_beta: float = 0.0
-    loss_lambda: float = 5.0
 
     # ---- EMA (exponential moving average of model weights) ----
     # EMA weights are what gets saved as ckpt_final.pt so downstream
@@ -135,6 +193,12 @@ class HParams:
     ema_warmup_steps: int = 100  # before this step, EMA == model (no averaging)
 
     # ---- Data ----
+    # Paper §3.2: clean speech comes from VCTK, interference from LibriSpeech.
+    # We honour that with `target_source="vctk"` (paper-faithful) or
+    # `target_source="librispeech"` (legacy — uses LibriSpeech `clean` split
+    # as the clean target source instead).
+    target_source: str = "librispeech"        # "librispeech" | "vctk"
+    vctk_repo: str = "CSTR-Edinburgh/vctk"    # HF repo hosting paper's VCTK
     target_config: str = "clean"
     target_splits: tuple[str, ...] = ("train.360",)
     interference_config: str = "other"
@@ -144,16 +208,18 @@ class HParams:
     # datasets arrow format). The repo's `scripts/download_data.py` writes here.
     librispeech_cache: str = "data/librispeech/hf_cache"
 
-    # Reference-waveform length for ECAPA d-vector extraction. ECAPA-TDNN
-    # needs ~3-6 s to produce a stable speaker embedding; longer refs only
-    # inflate memory. The dataset caps `ref_wav` to this length before
-    # yielding, so `collate_triplets` pads to at most `int(ref_max_sec *
-    # sample_rate)` samples instead of the longest utterance in the batch
-    # (which can be ~30 s for some LibriSpeech speakers). This is the
-    # single biggest memory win on MPS — at batch_size=16 the padded tensor
-    # drops from ~30 MB/eye to ~2 MB/eye per batch (8x). Applies to both
-    # the in-flight CPU batch *and* every batch sitting in
-    # `PrefetchIterator`'s queue.
+    # Reference-waveform length for d-vector extraction. The VoiceFilter
+    # d-vector (3-layer LSTM × 768, 80-frame windows / 40-hop aggregation)
+    # stabilises within ~1 s of clean speech and benefits only marginally
+    # from longer refs; capping at 6 s keeps `collate_triplets` memory in
+    # check. The dataset caps `ref_wav` to this length before yielding, so
+    # `collate_triplets` pads to at most `int(ref_max_sec * sample_rate)`
+    # samples instead of the longest utterance in the batch (which can be
+    # ~30 s for some LibriSpeech speakers). This is the single biggest
+    # memory win on MPS — at batch_size=16 the padded tensor drops from
+    # ~30 MB/eye to ~2 MB/eye per batch (8x). Applies to both the
+    # in-flight CPU batch *and* every batch sitting in `PrefetchIterator`'s
+    # queue.
     ref_max_sec: float = 6.0
 
     # Same-speaker reference cache, in `LibriSpeechTripletStream`.
@@ -193,21 +259,11 @@ class HParams:
     # default on MPS, drop to 1 if you're still OOMing.
     prefetch_batches_max: int = 2
 
-    # ---- Speaker d-vector cache ----
-    # ECAPA-TDNN on the reference waveform dominates per-batch CPU cost
-    # (~50 ms × batch_size per flush). The d-vector is a function of the
-    # *speaker*, not the utterance, so once we've computed one for a given
-    # speaker_id we never need to re-run ECAPA for them. In-memory cache
-    # always-on; set `dvec_cache_dir` to also persist to disk so subsequent
-    # training runs (or checkpoint resumes) don't pay the ECAPA warm-up
-    # cost again. `None` = in-memory only (cache lost on process exit).
-    dvec_cache_dir: Optional[str] = "models/dvec_cache"
-
     # ---- DataLoader workers ----
     # Number of background processes PyTorch spawns to prefetch training
     # batches from the dataset. With `0` (default), the main training
     # thread pulls each batch inline — simplest and lowest overhead, but
-    # the GPU sits idle while it waits for audio decode + ECAPA + mel.
+    # the GPU sits idle while it waits for audio decode + d-vector + mel.
     # With `N > 0`, N worker processes each load + augment + collate
     # batches in parallel; the main thread consumes from a queue.
     #
@@ -262,8 +318,8 @@ class HParams:
     # Override the HuggingFace Hub base URL — useful for users behind
     # firewalls or in regions where `huggingface.co` is unreachable
     # (e.g. China → `https://hf-mirror.com`). Anything `datasets` /
-    # `huggingface_hub` / speechbrain's `from_hparams` would normally
-    # fetch from HF is redirected through this endpoint instead.
+    # `huggingface_hub` would normally fetch from HF is redirected
+    # through this endpoint instead.
     #
     # Precedence (first non-empty wins) is applied by
     # `open_voicefilter_lite.cli.apply_hf_endpoint`:
@@ -292,14 +348,19 @@ class HParams:
     # Equivalent CLI: `--hf-transfer` / `--no-hf-transfer`.
     hf_transfer: Optional[bool] = None
 
-    # ---- Derived ----
+    # ---- Derived (no derivation needed — d_vector_dim is fixed) ----
+    # `__post_init__` is intentionally minimal: there is no longer any
+    # derived dim to refresh (the d-vector is always 256). It is kept
+    # as a method so `cli.apply_overrides` can call it after `setattr`
+    # without needing a special-case path.
+    def __post_init__(self) -> None:
+        # Re-affirm the fixed d-vector dim even if a YAML overrides it
+        # to a stale value — keeps older configs from breaking the model.
+        self.d_vector_dim = D_VECTOR_DIM
+
     @property
     def input_dim(self) -> int:
         return self.n_mels * self.frame_stack + self.d_vector_dim
-
-    @property
-    def output_dim(self) -> int:
-        return self.n_mels
 
     @property
     def sample_length_samples(self) -> int:

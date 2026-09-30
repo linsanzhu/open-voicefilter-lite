@@ -42,14 +42,14 @@ from open_voicefilter_lite.audio import (
 from open_voicefilter_lite.hparams import HParams
 
 
-# Note: `_safe_filename` and the per-speaker d-vector cache moved to
-# `open_voicefilter_lite.dvec_cache` (see `DVecCache`). The cache used to
-# live inside this module's `__iter__` and was updated from the
-# `PrefetchIterator` background thread — that concurrent MPS use from
-# two threads is what crashed the process with `BUG IN CLIENT OF
-# LIBMALLOC: memory corruption of free block` (see
-# `~/Library/Logs/DiagnosticReports/python3.13-*.ips`). ECAPA now runs
-# on the main training thread only.
+# Note: the d-vector is computed on the main training thread by
+# `audio.extract_dvec(batch["ref_wavs"], hp, speaker_encoder)` in
+# `train.py`. The dataset yields the raw reference waveform; the encoder
+# lives in `train.py` and is held by the main process only. Earlier
+# versions ran `SpeakerEncoder` inside this iterator's background thread
+# — the cross-thread MPS use crashed the process with `BUG IN CLIENT OF
+# LIBMALLOC` (DiagnosticReports/python3.13-*.ips). The encoder has since
+# moved out of the dataset entirely.
 
 
 NOISE_KIND_BABBLE = "babble"
@@ -59,16 +59,101 @@ NOISE_KIND_LIBRISPEECH = "librispeech"
 NOISE_KIND_RIR = "rir"   # tag for the *target* (informational)
 
 
+def _sample_activity_burst(
+    sample_len: int,
+    hp: HParams,
+    rng: random.Random,
+) -> torch.Tensor:
+    """Build a sample-level 0/1 activity mask with one active burst (deviation 5).
+
+    The burst is a single contiguous window of
+    `[activity_burst_min_sec, activity_burst_max_sec]` seconds, drawn
+    uniformly within `[0, sample_len]`. Edges fade linearly over
+    `activity_fade_ms` (avoids click artefacts at burst boundaries).
+    The mask is returned at sample rate (length `sample_len`).
+
+    Paper §4.2 doesn't prescribe burst sizes; the activity-mask framing
+    is the deviation-5 alignment — see plan section "偏差 5".
+    """
+    burst_min_samples = max(1, int(hp.activity_burst_min_sec * hp.sample_rate))
+    burst_max_samples = max(
+        burst_min_samples,
+        int(hp.activity_burst_max_sec * hp.sample_rate),
+    )
+    # `rng.randint(a, b)` is inclusive on both ends, so the upper bound is
+    # already `burst_max_samples` — adding `+ 1` here would let `burst_len`
+    # reach `sample_len + 1`, after which `burst_start` (in
+    # `[0, sample_len - burst_len + 1]`) can push `burst_end` past
+    # `sample_len` and the trailing fade slice clamps to a length shorter
+    # than the ramp (the 799-vs-800 mismatch the training log crashed on).
+    burst_max_samples = min(burst_max_samples, sample_len)
+    burst_len = rng.randint(burst_min_samples, burst_max_samples)
+    # Same inclusive-randint fix as above: `burst_start + burst_len` must
+    # not exceed `sample_len`, so the upper bound here is `sample_len -
+    # burst_len` (already inclusive on both ends).
+    burst_start = rng.randint(0, sample_len - burst_len)
+    burst_end = burst_start + burst_len
+
+    fade = max(1, int(hp.activity_fade_ms * 1e-3 * hp.sample_rate))
+    fade = min(fade, burst_len // 2)
+
+    act = torch.zeros(sample_len, dtype=torch.float32)
+    # Pre-fade region stays at 0 (no ramp from 0 to 1 at burst start).
+    if fade > 1 and burst_len > 2 * fade:
+        ramp = torch.linspace(0.0, 1.0, steps=fade + 1, dtype=torch.float32)[1:]
+        act[burst_start : burst_start + fade] = ramp
+        act[burst_end - fade : burst_end] = ramp.flip(0)
+        act[burst_start + fade : burst_end - fade] = 1.0
+    else:
+        # Burst too short for a fade — just hard on/off (no click risk
+        # when fade ≥ burst_len / 2 would already collapse to 0).
+        act[burst_start:burst_end] = 1.0
+    return act
+
+
+def _per_frame_overlap_label(
+    target_act: torch.Tensor,
+    interference_act: torch.Tensor,
+    T_frames: int,
+    sample_len: int,
+    hp: HParams,
+) -> torch.Tensor:
+    """Compute per-frame noise-type labels (paper §4.2 / deviation 5).
+
+    For each frame `t`, look at the sample index at the frame's centre:
+        center = t * hp.hop_length + hp.n_fft // 2
+    The label is `+1` iff both target and interference activity masks
+    are > 0 at that centre (i.e. the two bursts overlap at the frame's
+    temporal centre), else `-1`. Frames whose centre is past
+    `sample_len` clamp to the last sample so we always return a
+    `(T_frames,)` tensor.
+    """
+    labels = torch.full((T_frames,), -1, dtype=torch.long)
+    # Vectorised: build the centre index for every frame, then sample.
+    centre_idx = torch.arange(T_frames, dtype=torch.long) * hp.hop_length + hp.n_fft // 2
+    centre_idx = centre_idx.clamp(max=sample_len - 1)
+    tgt_at = target_act[centre_idx] > 0.0
+    int_at = interference_act[centre_idx] > 0.0
+    both = tgt_at & int_at
+    labels[both] = 1
+    return labels
+
+
 @dataclass
 class Sample:
     stacked_mixed: torch.Tensor   # (T, n_mels * frame_stack)  — model input
     target_logmel: torch.Tensor   # (T, n_mels)                — loss target
-    # Reference waveform + speaker_id for d-vector extraction. ECAPA-TDNN
+    # Reference waveform + speaker_id for d-vector extraction. SpeakerEncoder
     # runs on these in the main training loop (via `DVecCache.get_dvecs`)
     # — the dataset itself stays MPS-free so the PrefetchIterator's
     # background thread can stream samples without touching MPS.
+    # Reference waveform + speaker_id for d-vector extraction. The encoder
+    # lives in `train.py` and runs on the main training thread via
+    # `audio.extract_dvec(...)` — the dataset itself stays MPS-free so
+    # the PrefetchIterator's background thread can stream samples
+    # without touching MPS.
     ref_wav: torch.Tensor         # 1-D float32 CPU; variable length
-    ref_spk_id: str               # LibriSpeech speaker_id; dvec cache key
+    ref_spk_id: str               # LibriSpeech speaker_id (kept for diagnostics)
     noise_kind: str = NOISE_KIND_LIBRISPEECH  # diagnostic tag
     # Per-frame label for the noise-type predictor (paper §4.2):
     # +1 = "this frame is overlapped speech", -1 = "pass-through / clean".
@@ -76,6 +161,16 @@ class Sample:
     # or fully active for the whole sample, so every frame in a sample
     # shares the same label — we broadcast a single int to (T,).
     overlap_label: Optional[torch.Tensor] = None  # (T,) of {-1, +1}
+    # Cached d-vector (256-d) for the ref wav, if this ref came from the
+    # same-speaker buffer on a *revisit* — `None` means the main training
+    # thread still needs to compute it via `audio.extract_dvec`. Paired
+    # with `ref_entry_id` so the main thread can write the freshly
+    # computed dvec back into the buffer entry (see
+    # `LibriSpeechTripletStream.set_dvec_for_entry`). Cache hit rate after
+    # per-speaker warmup approaches `musan_prob`-free buffer-revisit
+    # probability (currently ~70%).
+    ref_dvec: Optional[torch.Tensor] = None       # (256,) or None
+    ref_entry_id: Optional[int] = None            # id(entry dict) for write-back
 
 
 def _decode_audio(audio_field, target_sr: int) -> torch.Tensor:
@@ -378,18 +473,46 @@ class LibriSpeechTripletStream(IterableDataset):
             )
             return _cast_audio_no_decode(ds)
 
+        def _load_vctk_no_decode(split: str):
+            # Paper §3.2: target speakers come from VCTK. CSTR-Edinburgh/vctk
+            # exposes one `train` split (and `test`); each row has the usual
+            # `audio` dict plus a `speaker_id` string (e.g. "p225"). We keep
+            # audio in `Audio(decode=False)` form (bytes in memory) and let
+            # `_decode_audio` decode via soundfile like the LibriSpeech path,
+            # so the dvec pipeline is identical for both sources.
+            ds = load_dataset(
+                self.hp.vctk_repo,
+                split=split,
+                **load_kwargs,
+            )
+            return _cast_audio_no_decode(ds)
+
         target_splits = list(self.hp.target_splits)
+        if self.hp.target_source == "vctk":
+            # Paper-faithful: target = VCTK. CSTR-Edinburgh/vctk exposes a
+            # single `train` split; we map our `target_splits` tuple
+            # (kept as a config knob for future VCTK subsets) to that.
+            vctk_splits = target_splits or ["train"]
+            self._target_ds_list = [
+                _load_vctk_no_decode(s) for s in vctk_splits
+            ]
+        elif self.hp.target_source == "librispeech":
+            # Legacy: target = LibriSpeech `clean` split.
+            self._target_ds_list = [
+                _load_no_decode(self.hp.target_config, s)
+                for s in target_splits
+            ]
+        else:
+            raise ValueError(
+                f"[dataset] unknown hp.target_source={self.hp.target_source!r}; "
+                "expected 'librispeech' or 'vctk'."
+            )
         # Store the list rather than a one-shot `chain.from_iterable(...)`.
         # The chain is stateful (its `__iter__` returns self and `__next__`
         # tracks a cursor) — once exhausted, re-calling `iter(chain)` gives
         # the same exhausted object, and `_infinite_iter`'s `while True: for`
         # busy-loops with no yields. We rebuild the chain inside `_iter_target`
-        # so the dataset can cycle back to the start (LibriSpeech train.360
-        # has ~104 000 utterances — we'd hang exactly there otherwise).
-        self._target_ds_list = [
-            _load_no_decode(self.hp.target_config, s)
-            for s in target_splits
-        ]
+        # so the dataset can cycle back to the start.
         self._target_ds = chain.from_iterable(self._target_ds_list)
 
         self._interference_ds = _load_no_decode(
@@ -590,6 +713,32 @@ class LibriSpeechTripletStream(IterableDataset):
             return None
         return self._rng.choice(self._rirs)
 
+    # ---- Dvec cache write-back (called from main training thread) ----
+
+    def set_dvec_for_entry(self, entry_id: int, dvec: torch.Tensor) -> bool:
+        """Cache a freshly-computed d-vector back into a buffer entry.
+
+        `train.py` calls this after `audio.extract_dvec` returns, with the
+        `entry_id` it read from `batch["ref_entry_ids"]`. On a buffer-hit
+        cache, the next iteration that picks the same entry as a ref will
+        find `entry["dvec"]` populated and skip the recompute.
+
+        Returns `True` if the entry was found and updated, `False` if the
+        entry has been evicted (which is a benign race: a buffer overflow
+        or LRU cap drop is the only way this can happen, and the next
+        batch will simply compute the dvec again).
+
+        Iterates every speaker's list — O(num_speakers × max_buf), which is
+        ~2k iterations on the default 512-speaker cap. Cheap enough that
+        a side index isn't worth its complexity.
+        """
+        for spk, buf in self._target_buffer.items():
+            for entry in buf:
+                if id(entry) == entry_id:
+                    entry["dvec"] = dvec.detach().cpu()
+                    return True
+        return False
+
     # ---- Main iterator ----
 
     def __iter__(self) -> Iterator[Sample]:
@@ -614,12 +763,11 @@ class LibriSpeechTripletStream(IterableDataset):
             # the global LRU cap (`ref_buffer_max_speakers`) still applies.
             self._target_buffer = OrderedDict()
 
-        # Heartbeat: the first batch through audio decode + mel + ECAPA is
+        # Heartbeat: the first batch through audio decode + mel is
         # multi-second on Apple Silicon. Print progress so the user can see
-        # the dataset is alive. ECAPA itself moved off this iterator and
-        # runs on the main thread via `DVecCache.get_dvecs` (see
-        # `dvec_cache.py`); the dvec cache hit ratio is reported from
-        # `train.py` instead of here.
+        # the dataset is alive. SpeakerEncoder is held by the main process
+        # and runs on the main thread (see `train.py`'s
+        # `extract_dvec(...)` call) so the dataset stays MPS-free.
         _t0 = time.time()
         _last_beat = _t0
         _samples = 0
@@ -650,8 +798,9 @@ class LibriSpeechTripletStream(IterableDataset):
         # training sample needs 3 audio decodes (target, interference,
         # reference), so with `decode_workers=4` the pool keeps 4 decodes
         # in flight while the main thread continues preparing mel/mix.
-        # ECAPA used to also run here (the source of the MPS race that
-        # crashed the process); it now runs on the main thread instead.
+        # SpeakerEncoder used to also run here (the source of the MPS race
+        # that crashed the process); it now runs on the main thread
+        # instead.
         decode_workers = max(1, hp.decode_workers)
         decode_pool: Optional[ThreadPoolExecutor] = (
             ThreadPoolExecutor(
@@ -667,12 +816,14 @@ class LibriSpeechTripletStream(IterableDataset):
         # of consumption so the main thread's `fut.result()` rarely blocks.
         pipeline: deque = deque()
 
-        # Cap ref_wav to this many samples (default ~6 s @ 16 kHz). ECAPA only
-        # needs ~3-6 s for a stable embedding; capping here keeps the padded
-        # ref_wavs tensor small (≈2 MB vs ≈30 MB at batch=16), which is the
-        # single biggest memory win on memory-constrained MPS machines. The
-        # ECAPA dvec cap inside `DVecCache` uses the same field, so cache hits
-        # vs misses stay consistent regardless of source-utterance length.
+        # Cap ref_wav to this many samples (default ~6 s @ 16 kHz).
+        # SpeakerEncoder only needs ~3-6 s for a stable embedding; capping
+        # here keeps the padded ref_wavs tensor small (≈2 MB vs ≈30 MB at
+        # batch=16), which is the single biggest memory win on
+        # memory-constrained MPS machines. The dvec forward in
+        # `audio.extract_dvec` enforces the same cap, so refs longer
+        # than `ref_max_sec` get cleanly truncated to the cap before
+        # the encoder forward.
         ref_max_len = int(hp.ref_max_sec * hp.sample_rate)
 
         def _submit_next_decode() -> Optional[dict]:
@@ -702,10 +853,23 @@ class LibriSpeechTripletStream(IterableDataset):
             buf = self._target_buffer.get(spk, [])
             ref_ex = tgt_ex
             ref_cached: Optional[torch.Tensor] = None
+            # `ref_cached_dvec` + `ref_entry_id` capture the buffer hit's
+            # already-computed d-vector (if any) and a write-back handle so
+            # the main training thread can populate the entry's `dvec`
+            # field after it runs `extract_dvec`. Both are None when the
+            # ref is the just-decoded target (no buffer hit).
+            ref_cached_dvec: Optional[torch.Tensor] = None
+            ref_entry_id: Optional[int] = None
             if len(buf) >= 2 and rng.random() < 0.7:
                 cached = rng.choice(buf[:-1])
                 ref_ex = cached
                 ref_cached = cached["audio"]
+                ref_cached_dvec = cached.get("dvec")
+                # Python `id()` is stable for the lifetime of the dict,
+                # and `_target_buffer[spk]` keeps the dict alive by
+                # reference — so this id stays valid for the main
+                # thread's write-back even after list-slicing on overflow.
+                ref_entry_id = id(cached)
 
             if decode_pool is not None:
                 fut_t = decode_pool.submit(
@@ -729,6 +893,8 @@ class LibriSpeechTripletStream(IterableDataset):
                 "ref_ex": ref_ex,
                 "ref_spk": ref_spk,
                 "ref_cached": ref_cached,
+                "ref_cached_dvec": ref_cached_dvec,
+                "ref_entry_id": ref_entry_id,
                 "fut_t": fut_t,
                 "fut_i": fut_i,
                 "fut_r": fut_r,
@@ -795,6 +961,11 @@ class LibriSpeechTripletStream(IterableDataset):
                     continue
                 target_wav, interference_wav, ref_wav = decoded
                 ref_spk = job["ref_spk"]
+                # Buffer-hit dvec (None on cold ref). The fresh-target path
+                # produces ref_wav == target_wav, but `job["ref_entry_id"]`
+                # is still None there — main thread computes + writes back.
+                ref_dvec_cached = job.get("ref_cached_dvec")
+                ref_entry_id = job.get("ref_entry_id")
 
                 # ---- Interference augmentation: Musan ----
                 noise_kind = NOISE_KIND_LIBRISPEECH
@@ -818,7 +989,17 @@ class LibriSpeechTripletStream(IterableDataset):
                 # `clone()` because the in-place RIR conv / silence-zero below
                 # would otherwise mutate the cached tensor in place.
                 cached_audio = target_wav[..., :min(target_wav.shape[-1], ref_max_len)].clone()
-                tgt_buf.append({"audio": cached_audio, "spk": target_spk_for_buf})
+                tgt_buf.append({
+                    "audio": cached_audio,
+                    "spk": target_spk_for_buf,
+                    "dvec": None,    # lazily populated by main-thread write-back
+                })
+                # If this sample's ref is the just-decoded target (the
+                # "fresh ref" path), the main thread will need the entry's
+                # id to write the computed dvec back. Buffer-hit refs
+                # already carry their `ref_entry_id` from `_submit_next_decode`.
+                if ref_entry_id is None:
+                    ref_entry_id = id(tgt_buf[-1])
                 # Per-speaker FIFO: drop oldest entries beyond `max_buf`.
                 # Slicing rebinds the list to a fresh one so the dropped
                 # `cached_audio` tensors are released for GC.
@@ -851,6 +1032,36 @@ class LibriSpeechTripletStream(IterableDataset):
                 # type predictor before mutating the waveforms).
                 target_silent = rng.random() < hp.silent_target_prob
                 interference_silent = rng.random() < hp.silent_interference_prob
+
+                # ---- Per-frame activity bursts (paper §4.2 / deviation 5) ----
+                # For non-silent target/interference, gate the waveform with a
+                # sample-level 0/1 activity mask that has a single active burst
+                # of `[activity_burst_min_sec, activity_burst_max_sec]` seconds,
+                # with `activity_fade_ms` fade-in / fade-out at the edges
+                # (avoids click artefacts at burst boundaries). The noise-type
+                # predictor's per-frame label is then `+1` exactly where BOTH
+                # target and interference bursts cover the frame's centre
+                # (i.e. frame centres in the *intersection* of the two burst
+                # windows). This matches paper §4.2's frame-level "is this
+                # frame overlapped speech?" labelling — replacing the legacy
+                # single-label-per-sample broadcast.
+                if not target_silent:
+                    target_act = _sample_activity_burst(
+                        sample_len, hp, rng,
+                    )
+                    target_wav = target_wav * target_act
+                else:
+                    target_act = torch.zeros(sample_len, dtype=target_wav.dtype)
+                if not interference_silent:
+                    interference_act = _sample_activity_burst(
+                        sample_len, hp, rng,
+                    )
+                    interference_wav = interference_wav * interference_act
+                else:
+                    interference_act = torch.zeros(
+                        sample_len, dtype=interference_wav.dtype,
+                    )
+
                 if target_silent:
                     target_wav = torch.zeros_like(target_wav)
                 if interference_silent:
@@ -869,7 +1080,10 @@ class LibriSpeechTripletStream(IterableDataset):
                 #     to suppress the active interference to hit target=-13.8)
                 #   * interference silent → mixed = target (clean pass-through,
                 #     same end result as snr_mix but explicit + cheap)
-                #   * both active → snr_mix as before
+                #   * both active → snr_mix as before (using the
+                #     activity-gated waveforms; the burst window's mean
+                #     power is still used for the SNR rescale, which is a
+                #     deliberate design point — see plan deviation-5).
                 snr = rng.uniform(hp.snr_min_db, hp.snr_max_db)
                 if target_silent and interference_silent:
                     mixed_wav = torch.zeros_like(target_wav)
@@ -881,23 +1095,26 @@ class LibriSpeechTripletStream(IterableDataset):
                     mixed_wav = snr_mix(target_wav, interference_wav, snr)
 
                 # ---- Features (CPU-side) ----
-                # ECAPA used to run here too, but moved off this iterator
-                # to the main training thread (see `DVecCache`); that fixed
-                # the cross-thread MPS race that crashed the process.
+                # SpeakerEncoder lives in `train.py` and runs on the main
+                # training thread via `audio.extract_dvec(...)` — the
+                # dataset stays MPS-free so the PrefetchIterator's
+                # background thread never touches MPS.
                 mixed_logmel = wav_to_log_mel(mixed_wav, hp, self._mel)
                 target_logmel = wav_to_log_mel(target_wav, hp, self._mel)
                 stacked = frame_stack_left(mixed_logmel, hp.frame_stack)
+                T_frames = stacked.shape[0]
 
                 # ---- Noise-type predictor label (paper §4.2) ----
-                # +1 if this sample has BOTH target and interference active (real
-                # overlap), -1 otherwise (pass-through / only-one-speaker).
-                # In this mixer, target/interference are whole-sample silent or
-                # active, so every frame in `stacked` shares the same label.
-                is_overlap = (not target_silent) and (not interference_silent)
-                label_value = 1 if is_overlap else -1
-                T_frames = stacked.shape[0]
-                overlap_label = torch.full(
-                    (T_frames,), label_value, dtype=torch.long,
+                # +1 if this frame is overlapped speech (both target and
+                # interference activity masks > 0 at the frame's centre
+                # sample), -1 otherwise. Replaces the legacy whole-sample
+                # broadcast label.
+                overlap_label = _per_frame_overlap_label(
+                    target_act=target_act,
+                    interference_act=interference_act,
+                    T_frames=T_frames,
+                    sample_len=sample_len,
+                    hp=hp,
                 )
 
                 # ---- Heartbeat ----
@@ -927,9 +1144,9 @@ class LibriSpeechTripletStream(IterableDataset):
                     )
                     _last_beat = _now
 
-                # Yield the CPU-only Sample. ECAPA / dvec fill-in happens
-                # on the main thread via `DVecCache.get_dvecs` in
-                # `train.py`. Batching is done by DataLoader(batch_size=).
+                # Yield the CPU-only Sample. SpeakerEncoder / dvec extraction
+                # happens on the main thread via `audio.extract_dvec(...)`
+                # in `train.py`. Batching is done by DataLoader(batch_size=).
                 yield Sample(
                     stacked_mixed=stacked,
                     target_logmel=target_logmel,
@@ -937,6 +1154,8 @@ class LibriSpeechTripletStream(IterableDataset):
                     ref_spk_id=ref_spk,
                     noise_kind=noise_kind,
                     overlap_label=overlap_label,
+                    ref_dvec=ref_dvec_cached,
+                    ref_entry_id=ref_entry_id,
                 )
 
                 # Refill pipeline with the next decode job. This keeps
@@ -962,18 +1181,20 @@ def collate_triplets(batch: list[Sample]) -> dict:
     plain CPU tensors through its iterator / queue. This avoids pickling
     MPS tensors when the queue transfers batches across threads.
 
-    Variable-length `ref_wav` entries are zero-padded to the longest in the
-    batch and reported as relative lengths (`ref_lens`) so the ECAPA TDNN
-    in `DVecCache.get_dvecs` can mask out the padding. `ref_spk_ids`
-    parallel to rows is the cache key.
+    Variable-length `ref_wav` entries are zero-padded to the longest in
+    the batch and reported as relative lengths (`ref_lens`) so
+    `audio.extract_dvec(...)` in `train.py` can crop the padding before
+    librosa mel extraction. `ref_spk_ids` is kept parallel to rows for
+    diagnostics.
     """
     stacked = torch.stack([s.stacked_mixed for s in batch])
     target = torch.stack([s.target_logmel for s in batch])
     overlap_label = torch.stack([s.overlap_label for s in batch])
 
-    # Variable-length padded ref batch (CPU float32). The ECAPA floor
-    # (0.5 s) and 30 s cap are applied inside `DVecCache.get_dvecs`,
-    # not here, so the main loop doesn't need to know about truncation.
+    # Variable-length padded ref batch (CPU float32). `ref_max_sec` was
+    # already enforced on the raw utterance in `_await_decodes`; the
+    # batch-max pad here only adds trailing zeros for shorter refs in
+    # the same batch — `extract_dvec` then trims them via `ref_lens`.
     ref_wavs_list = [s.ref_wav for s in batch]
     max_len = max(r.shape[-1] for r in ref_wavs_list)
     ref_wavs = torch.zeros(len(batch), max_len, dtype=torch.float32)
@@ -984,6 +1205,21 @@ def collate_triplets(batch: list[Sample]) -> dict:
         ref_lens[i] = L / max_len
     ref_spk_ids = [s.ref_spk_id for s in batch]
 
+    # ---- Dvec cache (per-buffer-entry write-back) ----
+    # Stack any pre-computed d-vectors into (B, 256). Missing entries
+    # (None) keep their row as a zero placeholder — `train.py` then
+    # recomputes the full (B, 256) batch via `extract_dvec` and writes
+    # the result back into the buffer through `ref_entry_ids` so the
+    # next time the same entry is picked from the buffer, this field
+    # comes back non-None and we skip the recompute.
+    ref_dvecs_list = [s.ref_dvec for s in batch]
+    have_all_dvecs = all(d is not None for d in ref_dvecs_list)
+    if have_all_dvecs:
+        ref_dvecs = torch.stack(ref_dvecs_list)        # (B, 256)
+    else:
+        ref_dvecs = None                               # train.py will compute
+    ref_entry_ids = [s.ref_entry_id for s in batch]
+
     return {
         "stacked_mixed": stacked,
         "target_logmel": target,
@@ -992,4 +1228,6 @@ def collate_triplets(batch: list[Sample]) -> dict:
         "ref_wavs": ref_wavs,
         "ref_lens": ref_lens,
         "ref_spk_ids": ref_spk_ids,
+        "ref_dvecs": ref_dvecs,
+        "ref_entry_ids": ref_entry_ids,
     }

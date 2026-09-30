@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Verify whether ECAPA d-vectors are consistent across utterances of the same
-LibriSpeech speaker, and discriminable between different speakers.
+"""Verify whether the VoiceFilter d-vector is consistent across utterances of
+the same LibriSpeech speaker, and discriminable between different speakers.
 
 Hypothesis: if the dvec quality is fine, within-speaker cosine similarity should
 be much higher than cross-speaker. If they're similar, the dvec isn't doing its
 job — the mask predictor would have no reliable cue to pick the right speaker.
+
+Targets (paper d-vector, 256-d):
+    within-speaker mean cos sim ≥ 0.7
+    cross-speaker mean cos sim  ≤ 0.3
+    margin (within − cross) > 0.4 → GOOD
 """
 from __future__ import annotations
 
@@ -26,8 +31,8 @@ from open_voicefilter_lite.dataset import (
     _cast_audio_no_decode,
 )
 from open_voicefilter_lite.hparams import HParams
-from open_voicefilter_lite.audio import pad_or_trim
-from open_voicefilter_lite.speaker_encoder import FrozenSpeakerEncoder
+from open_voicefilter_lite.audio import extract_dvec, pad_or_trim
+from open_voicefilter_lite.speaker_encoder import SpeakerEncoder
 
 
 def decode_audio(audio_field, target_sr):
@@ -82,7 +87,15 @@ def main():
     print(f"Speakers: {speakers}\n")
 
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-    enc = FrozenSpeakerEncoder(hp).to(device).eval()
+    enc = SpeakerEncoder(hp).to(device).eval()
+    from pathlib import Path
+    if Path(hp.dvector_pt_path).is_file():
+        enc.load_pretrained(hp.dvector_pt_path)
+        print(f"[verify] SpeakerEncoder loaded from {hp.dvector_pt_path}")
+    else:
+        print(f"[verify] WARNING: {hp.dvector_pt_path} not found — encoder uses RANDOM weights.")
+        print(f"[verify] The pretrained embedder (`models/embedder.pt`) ships with this repo.")
+        enc.freeze()
 
     # Compute dvec for each utterance
     dvecs: dict[str, list[torch.Tensor]] = {}
@@ -92,10 +105,12 @@ def main():
             wav = decode_audio(ex["audio"], hp.sample_rate)
             if wav is None or wav.numel() < int(0.3 * hp.sample_rate):
                 continue
-            # Match what eval does: take first 0.5s of a 6s ref
-            wav = pad_or_trim(wav, int(0.5 * hp.sample_rate))
+            # VoiceFilter d-vector recipe expects arbitrary-length refs;
+            # cap at hp.ref_max_sec (default 6 s) to match what the
+            # training pipeline hands the encoder.
+            wav = pad_or_trim(wav, int(hp.ref_max_sec * hp.sample_rate))
             with torch.no_grad():
-                d = enc(wav.unsqueeze(0).to(device)).squeeze(0).cpu()
+                d = extract_dvec(wav, hp, enc, device=device).squeeze(0).cpu()
             dvecs[spk].append(d)
 
     print(f"Per-speaker dvec counts: {[(s, len(dvecs[s])) for s in speakers]}\n")
@@ -140,12 +155,17 @@ def main():
     print(f"Overall within-speaker cosine: {overall_within:.4f}")
     print(f"Overall cross-speaker cosine : {overall_cross:.4f}")
     print(f"Margin (within - cross)      : {margin:+.4f}")
-    if margin > 0.2:
-        print("→ dvec is GOOD: speaker identity is clearly encoded.")
-    elif margin > 0.05:
-        print("→ dvec is MARGINAL: signal is weak but present.")
+    if margin > 0.4:
+        print("→ d-vector is GOOD: speaker identity is clearly encoded.")
+    elif margin > 0.2:
+        print("→ d-vector is MARGINAL: signal is present but weaker than expected.")
     else:
-        print("→ dvec is BAD: speaker identity is NOT encoded. The model has no useful signal.")
+        print("→ d-vector is BAD: speaker identity is NOT encoded. The "
+              "model has no useful signal. Verify that "
+              "`models/embedder.pt` matches the upstream `SpeechEmbedder` "
+              "weights from "
+              "https://github.com/maum-ai/voicefilter/blob/master/model/"
+              "embedder.py (key layout: `lstm.*` and `proj.linear_layer.*`).")
 
 
 if __name__ == "__main__":

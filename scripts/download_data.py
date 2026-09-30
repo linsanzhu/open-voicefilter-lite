@@ -4,14 +4,18 @@
 By default this only pre-caches LibriSpeech (which `scripts/train.py` would
 otherwise stream on the fly). It can also pre-download:
 
-    - ecapa   : the frozen speaker encoder `speechbrain/spkrec-ecapa-voxceleb`
-    - musan   : music / noise / speech noise recordings from
-                `corypaik/musan` (~10 GB total — paper §3.4
-                augmentation source; `babble` is synthesised at training
-                time from the `speech` subset)
-    - rir     : real room impulse responses — primary loader
-                `confit/rir-noise` (pulls OpenSLR28 from openslr.org),
-                fallback `quinnlue/rirs`
+    - musan    : music / noise / speech noise recordings from
+                 `corypaik/musan` (~10 GB total — paper §3.4
+                 augmentation source; `babble` is synthesised at training
+                 time from the `speech` subset)
+    - rir      : real room impulse responses — primary loader
+                 `confit/rir-noise` (pulls OpenSLR28 from openslr.org),
+                 fallback `quinnlue/rirs`
+    - vctk     : paper §3.2 target clean-speech source (CSTR-Edinburgh/vctk)
+
+The speaker encoder (paper §3.1 d-vector) ships pretrained as
+`models/embedder.pt` in the repo root and is **not** fetched from any
+external source.
 
 Each asset is independently optional; a failure on one does not stop the others.
 All downloads land in `models/` by default (which is gitignored).
@@ -31,11 +35,11 @@ Usage
     # — note paper §3.4 uses these, not train.100):
     python scripts/download_data.py --no-train-100 --train-360 --train-500
 
-    # Everything (LibriSpeech + ECAPA + Musan + RIR):
+    # Everything (LibriSpeech + Musan + RIR + VCTK):
     python scripts/download_data.py --assets all
 
     # A specific subset:
-    python scripts/download_data.py --assets ecapa musan
+    python scripts/download_data.py --assets musan rir
 """
 
 from __future__ import annotations
@@ -44,7 +48,6 @@ import argparse
 import os
 import sys
 from pathlib import Path
-from typing import Iterable
 
 # Make the `src/` layout importable without `pip install -e .` so this
 # script can call `cli.apply_hf_endpoint` to honour HF_ENDPOINT / mirror
@@ -98,39 +101,6 @@ def download_librispeech(args) -> None:
             print(f"[download]   cached {len(ds):,} utterances")
 
 
-def download_ecapa(args) -> None:
-    """Pre-download the SpeechBrain ECAPA-TDNN weights.
-
-    Uses `EncoderClassifier.from_hparams(source=..., savedir=...)` which is
-    exactly what `FrozenSpeakerEncoder._load()` does at training time. We
-    trigger a 1-second dummy forward to force materialisation of all weight
-    files into `savedir`.
-    """
-    savedir = Path(args.ecapa_cache)
-    savedir.mkdir(parents=True, exist_ok=True)
-    print(f"[download] ecapa ({args.ecapa_source}) → {savedir}")
-
-    try:
-        from speechbrain.inference.speaker import EncoderClassifier
-    except ImportError as e:
-        print(f"[download]   FAILED: speechbrain not installed ({e})")
-        return
-
-    try:
-        enc = EncoderClassifier.from_hparams(
-            source=args.ecapa_source,
-            savedir=str(savedir),
-            run_opts={"device": "cpu"},
-        )
-        # Trigger a dummy encode to make sure all weights are present on disk.
-        import torch
-        with torch.no_grad():
-            enc.encode_batch(torch.zeros(1, 16000))
-        print(f"[download]   ok — weights in {savedir}")
-    except Exception as e:
-        print(f"[download]   FAILED: {e!r}")
-
-
 def download_musan(args) -> None:
     """Pre-download Musan music/noise/speech from `corypaik/musan`.
 
@@ -156,6 +126,30 @@ def download_musan(args) -> None:
             print(f"[download]   cached {len(ds):,} files")
         except Exception as e:
             print(f"[download]   FAILED musan/{subset}: {e!r}")
+
+
+def download_vctk(args) -> None:
+    """Pre-download VCTK (paper §3.2 target clean-speech source).
+
+    `CSTR-Edinburgh/vctk` exposes a single `train` split (with `speaker_id`
+    + `audio` per row). We download non-streaming into
+    `models/vctk/` so a paper-faithful run with `target_source: vctk` can
+    train without per-batch network fetches. Total size on disk is ~10 GB.
+    """
+    from datasets import load_dataset
+
+    root = Path(args.vctk_cache)
+    root.mkdir(parents=True, exist_ok=True)
+    print(f"[download] vctk (CSTR-Edinburgh/vctk) → {root}")
+    try:
+        ds = load_dataset(
+            args.vctk_source,
+            split="train",
+            cache_dir=str(root),
+        )
+        print(f"[download]   cached {len(ds):,} files (VCTK target clean speech)")
+    except Exception as e:
+        print(f"[download]   FAILED vctk: {e!r}")
 
 
 def download_rir(args) -> None:
@@ -209,10 +203,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--assets", nargs="+",
         default=["librispeech"],
-        choices=["librispeech", "ecapa", "musan", "rir", "all"],
+        choices=["librispeech", "musan", "rir", "vctk", "all"],
         help=(
             "Which assets to download. `all` is shorthand for "
-            "`librispeech ecapa musan rir`. Multiple allowed."
+            "`librispeech vctk musan rir`. "
+            "`vctk` is the paper-faithful target-speech source (paper §3.2: "
+            "target=VCTK, interference=LibriSpeech). The d-vector embedder "
+            "(paper §3.1) ships pretrained as `models/embedder.pt` and is "
+            "NOT fetched from any external source. Multiple allowed."
         ),
     )
 
@@ -248,13 +246,20 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
-    # ECAPA options.
-    p.add_argument("--ecapa-source", default="speechbrain/spkrec-ecapa-voxceleb")
-    p.add_argument("--ecapa-cache", default="models/spkrec-ecapa-voxceleb")
-
     # Musan options.
     p.add_argument("--musan-source", default="corypaik/musan")
     p.add_argument("--musan-cache", default="models/musan")
+
+    # VCTK options. Paper §3.2 target clean-speech source. Only used when
+    # `--assets vctk` is requested and `hp.target_source="vctk"`.
+    p.add_argument(
+        "--vctk-source", default="CSTR-Edinburgh/vctk",
+        help="HF dataset id for the VCTK target clean-speech source.",
+    )
+    p.add_argument(
+        "--vctk-cache", default="models/vctk",
+        help="Where the VCTK arrow cache is unpacked.",
+    )
 
     # RIR options.
     # Default `confit/rir-noise` is an OpenSLR28 loader — pulls the canonical
@@ -296,10 +301,10 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     if args.all_flag:
-        args.assets = ["librispeech", "ecapa", "musan", "rir"]
+        args.assets = ["librispeech", "vctk", "musan", "rir"]
 
     # Resolve HF endpoint before any `datasets.load_dataset` /
-    # `EncoderClassifier.from_hparams` call. This script doesn't have an
+    # `hf_hub_download` call. This script doesn't have an
     # HParams instance — so the config branch is skipped, but CLI flag
     # and `HF_ENDPOINT` env var are still honoured.
     apply_hf_endpoint(
@@ -310,19 +315,23 @@ def main() -> None:
 
     requested = list(args.assets)
     if "all" in requested:
-        requested = ["librispeech", "ecapa", "musan", "rir"]
+        requested = ["librispeech", "vctk", "musan", "rir"]
 
     print(f"[download] assets requested: {requested}")
     for asset in requested:
         try:
             if asset == "librispeech":
                 download_librispeech(args)
-            elif asset == "ecapa":
-                download_ecapa(args)
+            elif asset == "vctk":
+                download_vctk(args)
             elif asset == "musan":
                 download_musan(args)
             elif asset == "rir":
                 download_rir(args)
+            else:
+                # Unknown choices are rejected by argparse; this branch
+                # is unreachable unless the choices list is extended.
+                print(f"[download] unknown asset: {asset}")
         except Exception as e:
             # Each downloader already prints its own error; this is a safety net.
             print(f"[download] unexpected error downloading {asset}: {e!r}")

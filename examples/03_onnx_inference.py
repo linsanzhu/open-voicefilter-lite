@@ -2,28 +2,35 @@
 """Example 03 — Inference with the exported ONNX model.
 
 `scripts/export_onnx.py` ships a streaming-friendly ONNX graph whose inputs
-are the pre-projected 256-d d-vector (not the raw 512-d ECAPA output) plus
-the persistent LSTM (h, c). This means the deployment side has to:
+are the 256-d d-vector (from `SpeakerEncoder`) plus the persistent LSTM
+(h, c). The deployment side has to:
 
-  1. Run ECAPA on the enrollment clip → 512-d
-  2. Apply VoiceFilterLite's `dvec_proj` Linear → 256-d  (this Linear is NOT
-     inside the ONNX graph; it lives outside so ECAPA can stay a frozen
-     speechbrain model with no graph surgery)
-  3. Run ONNX frame-by-frame, feeding back the new (h, c) each call
+  1. Run SpeakerEncoder on the enrollment clip → 256-d
+  2. Run ONNX frame-by-frame, feeding back the new (h, c) each call
 
-This script demonstrates that full pipeline and also cross-checks the ONNX
-output against PyTorch (optional, but recommended for a sanity check after
+The d-vector is fed directly into the graph's `in_proj` — there is no
+in-model projection layer.
+
+This script demonstrates that pipeline and cross-checks the ONNX output
+against PyTorch (optional, but recommended for a sanity check after
 re-exporting).
 
 Usage
 -----
     python examples/03_onnx_inference.py \\
-        --onnx       voicefilter_lite.onnx \\
+        --onnx       voicefilter_lite.int8.onnx \\
         --checkpoint runs/exp1/ckpt_final.pt    \\
         --enrollment data/enroll.wav             \\
         --mixed      data/mixed.wav              \\
         --out        data/enhanced_onnx.wav       \\
         --verify                                  # also run PyTorch on the same input
+
+INT8 note: paper §3.5 quantises the deployed model. Pass the
+``voicefilter_lite.int8.onnx`` produced by ``scripts/export_onnx.py
+--quantize int8``. The default ``--max-abs-err`` is widened to ``5e-2``
+to tolerate the INT8 rounding on the Linear layers (LSTM stays FP32 —
+``onnxruntime.quantization.quantize_dynamic`` only handles MatMul-class
+ops, not LSTM). For FP32 ONNX use ``--max-abs-err 1e-3``.
 """
 
 from __future__ import annotations
@@ -31,6 +38,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from pathlib import Path
 
 import numpy as np
 import soundfile as sf
@@ -40,12 +48,15 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.abspath(os.path.join(HERE, "..", "src")))
 
 from open_voicefilter_lite.audio import (  # noqa: E402
+    extract_dvec,
     make_mel_basis,
     wav_to_log_mel,
 )
 from open_voicefilter_lite.hparams import HParams  # noqa: E402
 from open_voicefilter_lite.model import VoiceFilterLite  # noqa: E402
-from open_voicefilter_lite.speaker_encoder import FrozenSpeakerEncoder  # noqa: E402
+from open_voicefilter_lite.speaker_encoder import (  # noqa: E402
+    SpeakerEncoder,
+)
 
 
 def _select_device(requested: str) -> torch.device:
@@ -94,17 +105,18 @@ def _logmel_to_wav(log_mel: torch.Tensor, hp: HParams, n_iter: int = 16) -> torc
     return griffin(linear).squeeze(0)
 
 
-def _compute_dvec_projected(
-    encoder: FrozenSpeakerEncoder,
-    model: VoiceFilterLite,
+def _compute_dvec(
+    encoder,
     enroll_wav: torch.Tensor,
+    hp: HParams,
     device: torch.device,
 ) -> torch.Tensor:
-    """ECAPA → 512-d → dvec_proj → 256-d (the vector the ONNX graph expects)."""
+    """`audio.extract_dvec` → `hp.d_vector_dim`=256-d (the vector the ONNX
+    graph expects).
+    """
     with torch.no_grad():
-        dvec_512 = encoder(enroll_wav.unsqueeze(0).to(device)).squeeze(0)
-        dvec_proj = model.dvec_proj(dvec_512.to(device))
-    return dvec_proj.cpu()
+        dvec = extract_dvec(enroll_wav, hp, encoder, device=device).squeeze(0)
+    return dvec.cpu()
 
 
 class ONNXStreamingVoiceFilter:
@@ -112,7 +124,7 @@ class ONNXStreamingVoiceFilter:
 
     The ONNX graph expects:
         stacked_logmel: (1, T, n_mels * frame_stack)
-        dvec_proj:      (1, d_vector_dim)
+        dvec:           (1, d_vector_dim)
         h0, c0:         (num_lstm_layers, 1, hidden_dim)
     and produces the next hidden state as well. We feed T=1 each call so
     inference cost is independent of stream length.
@@ -121,13 +133,13 @@ class ONNXStreamingVoiceFilter:
     def __init__(self, session, hp: HParams):
         self.session = session
         self.hp = hp
-        self._dvec_proj: torch.Tensor | None = None
+        self._dvec: torch.Tensor | None = None
         self._h = np.zeros((hp.num_lstm_layers, 1, hp.hidden_dim), dtype=np.float32)
         self._c = np.zeros((hp.num_lstm_layers, 1, hp.hidden_dim), dtype=np.float32)
         self._ctx: list[np.ndarray] = []
 
-    def set_dvector(self, dvec_proj: torch.Tensor) -> None:
-        self._dvec_proj = dvec_proj.unsqueeze(0).numpy().astype(np.float32)  # (1, d_vector_dim)
+    def set_dvector(self, dvec: torch.Tensor) -> None:
+        self._dvec = dvec.unsqueeze(0).numpy().astype(np.float32)  # (1, d_vector_dim)
         self.reset_state()
 
     def reset_state(self) -> None:
@@ -136,7 +148,7 @@ class ONNXStreamingVoiceFilter:
         self._ctx = []
 
     def step(self, frame_logmel: torch.Tensor) -> torch.Tensor:
-        if self._dvec_proj is None:
+        if self._dvec is None:
             raise RuntimeError("Call set_dvector() before step().")
 
         f = frame_logmel.numpy().astype(np.float32).reshape(-1)        # (n_mels,)
@@ -154,7 +166,7 @@ class ONNXStreamingVoiceFilter:
             None,
             {
                 "stacked_logmel": stacked,
-                "dvec_proj": self._dvec_proj,
+                "dvec": self._dvec,
                 "h0": self._h,
                 "c0": self._c,
             },
@@ -166,7 +178,7 @@ class ONNXStreamingVoiceFilter:
 def run_onnx(
     session,
     hp: HParams,
-    dvec_proj: torch.Tensor,
+    dvec: torch.Tensor,
     mixed_path: str,
     out_path: str,
     gl_iter: int,
@@ -176,7 +188,7 @@ def run_onnx(
     log_mel = wav_to_log_mel(mixed, hp, mel_fn)                       # (T, 80)
 
     onnx_sf = ONNXStreamingVoiceFilter(session, hp)
-    onnx_sf.set_dvector(dvec_proj)
+    onnx_sf.set_dvector(dvec)
 
     enhanced_frames = []
     for t in range(log_mel.shape[0]):
@@ -194,7 +206,7 @@ def run_onnx(
 def verify_against_pytorch(
     hp: HParams,
     model: VoiceFilterLite,
-    dvec_512: torch.Tensor,
+    dvec: torch.Tensor,
     mixed_logmel: torch.Tensor,
     max_abs_err: float,
 ) -> bool:
@@ -207,11 +219,11 @@ def verify_against_pytorch(
 
     device = next(model.parameters()).device
     pyt_sf = StreamingVoiceFilter(model, hp)
-    pyt_sf.set_dvector(dvec_512.to(device))
+    pyt_sf.set_dvector(dvec.to(device))
 
     onnx_sess = _load_onnx_from_model(hp, model)
     onnx_sf = ONNXStreamingVoiceFilter(onnx_sess, hp)
-    onnx_sf.set_dvector(model.dvec_proj(dvec_512.to(device)).cpu())
+    onnx_sf.set_dvector(dvec.to(device).cpu())
 
     n_check = min(64, mixed_logmel.shape[0])
     pyt_frames, onnx_frames = [], []
@@ -235,7 +247,7 @@ def _load_onnx_from_model(hp: HParams, model: VoiceFilterLite):
 
     B, T = 1, 4
     stacked = torch.randn(B, T, hp.n_mels * hp.frame_stack)
-    dvec_proj = torch.randn(B, hp.d_vector_dim)
+    dvec = torch.randn(B, hp.d_vector_dim)
     h0 = torch.zeros(hp.num_lstm_layers, B, hp.hidden_dim)
     c0 = torch.zeros(hp.num_lstm_layers, B, hp.hidden_dim)
 
@@ -245,49 +257,57 @@ def _load_onnx_from_model(hp: HParams, model: VoiceFilterLite):
             super().__init__()
             self.model = m
 
-        def forward(self, slm, dp, h0, c0):
+        def forward(self, slm, dv, h0, c0):
             B_, T_, _ = slm.shape
-            dt = dp.unsqueeze(1).expand(-1, T_, -1)
+            dt = dv.unsqueeze(1).expand(-1, T_, -1)
             x = torch.cat([slm, dt], dim=-1)
             x = self.model.in_proj(x)
             x = self.model.in_norm(x)
+            # Optional 1D CNN (paper §3.2, frequency-axis). When
+            # `hp.use_cnn=False` this branch is a no-op and the wrapper
+            # matches the LSTM-only export.
+            if self.model.cnn is not None:
+                x_per = x.reshape(-1, 1, x.shape[-1])              # (B*T, 1, H)
+                x_conv = self.model.cnn(x_per)                     # (B*T, cnn_channels, H)
+                x = x_conv.mean(dim=-1).reshape(x.shape[0], x.shape[1], -1)
             x, (hN, cN) = self.model.lstm(x, (h0, c0))
             mask = torch.sigmoid(self.model.out_proj(x))
             cur_idx = self.model.hp.frame_stack - 1
             cur = slm[..., cur_idx * self.model.hp.n_mels:(cur_idx + 1) * self.model.hp.n_mels]
-            return mask * cur, hN, cN
+            # Paper §3.2 literal mask application (Y_enh = M · Y in log-mel).
+            return self.model._apply_mask(mask, cur), hN, cN
 
     wrap = _Wrap(model).eval()
     buf = io.BytesIO()
     try:
         torch.onnx.export(
-            wrap, (stacked, dvec_proj, h0, c0), buf,
+            wrap, (stacked, dvec, h0, c0), buf,
             opset_version=17, do_constant_folding=True,
-            input_names=["stacked_logmel", "dvec_proj", "h0", "c0"],
+            input_names=["stacked_logmel", "dvec", "h0", "c0"],
             output_names=["enhanced", "hN", "cN"],
             dynamic_shapes={
                 "stacked_logmel": {0: "batch", 1: "time"},
-                "dvec_proj": {0: "batch"},
-                "h0": {1: "batch"},
-                "c0": {1: "batch"},
+                "dvec":           {0: "batch"},
+                "h0":             {1: "batch"},
+                "c0":             {1: "batch"},
             },
         )
     except TypeError:
         # Fall back: rewrite buf and re-export with dynamic_axes
         buf = io.BytesIO()
         torch.onnx.export(
-            wrap, (stacked, dvec_proj, h0, c0), buf,
+            wrap, (stacked, dvec, h0, c0), buf,
             opset_version=17, do_constant_folding=True,
-            input_names=["stacked_logmel", "dvec_proj", "h0", "c0"],
+            input_names=["stacked_logmel", "dvec", "h0", "c0"],
             output_names=["enhanced", "hN", "cN"],
             dynamic_axes={
                 "stacked_logmel": {0: "batch", 1: "time"},
-                "dvec_proj": {0: "batch"},
-                "h0": {1: "batch"},
-                "c0": {1: "batch"},
-                "enhanced": {0: "batch", 1: "time"},
-                "hN": {1: "batch"},
-                "cN": {1: "batch"},
+                "dvec":           {0: "batch"},
+                "h0":             {1: "batch"},
+                "c0":             {1: "batch"},
+                "enhanced":       {0: "batch", 1: "time"},
+                "hN":             {1: "batch"},
+                "cN":             {1: "batch"},
             },
         )
     buf.seek(0)
@@ -297,14 +317,17 @@ def _load_onnx_from_model(hp: HParams, model: VoiceFilterLite):
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--onnx", required=True, help="Path to voicefilter_lite.onnx")
-    p.add_argument("--checkpoint", required=True, help="Path to ckpt_*.pt (for dvec_proj + verify)")
+    p.add_argument("--checkpoint", required=True, help="Path to ckpt_*.pt (for d-vector source + verify)")
     p.add_argument("--enrollment", required=True, help="16 kHz mono WAV of the target speaker")
     p.add_argument("--mixed", required=True, help="16 kHz mono WAV to separate")
     p.add_argument("--out", required=True, help="Where to write the enhanced WAV")
     p.add_argument("--verify", action="store_true", help="Cross-check ONNX against PyTorch")
     p.add_argument("--device", default="auto")
     p.add_argument("--gl-iter", type=int, default=16)
-    p.add_argument("--max-abs-err", type=float, default=1e-3)
+    p.add_argument("--max-abs-err", type=float, default=5e-2,
+                   help="Max allowed |PyTorch - ONNX| over the verify prefix. "
+                        "Use 1e-3 for FP32 ONNX; 5e-2 for INT8 ONNX "
+                        "(default accommodates either).")
     args = p.parse_args()
 
     device = _select_device(args.device)
@@ -315,31 +338,53 @@ def main() -> None:
     sess = ort.InferenceSession(args.onnx, providers=["CPUExecutionProvider"])
     print(f"[onnx] loaded {args.onnx}")
 
-    # ---- Restore model (for dvec_proj weights + optional verify) ----
+    # ---- Restore model (for d-vector source + optional verify) ----
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     hp = HParams.from_dict(ckpt["hparams"])
     hp.device = str(device)
 
     model = VoiceFilterLite(hp).to(device).eval()
-    model.load_state_dict(ckpt["model_state"])
+    sd = ckpt["model_state"]
+    # Backward compat: drop legacy `dvec_proj.*` (pre-refactor 192→256
+    # projection Linear) and any `alpha_head.*` keys that don't fit the
+    # current paper-faithful 2-Linear head (paper §4.2). Strict shape
+    # filter: keep only keys that exist in the model with the matching
+    # shape. See the matching block in `scripts/export_onnx.py`.
+    model_sd = model.state_dict()
+    kept = {k: v for k, v in sd.items()
+            if k in model_sd and tuple(v.shape) == tuple(model_sd[k].shape)}
+    _, unexpected = model.load_state_dict(kept, strict=False)
+    if unexpected:
+        raise RuntimeError(f"[onnx] unexpected keys beyond compat drop: {unexpected[:5]}…")
 
-    encoder = FrozenSpeakerEncoder(hp).to(device)
+    encoder = SpeakerEncoder(hp).to(device)
+    if Path(hp.dvector_pt_path).is_file():
+        encoder.load_pretrained(hp.dvector_pt_path)
+        print(f"[onnx] SpeakerEncoder loaded from {hp.dvector_pt_path}")
+    else:
+        print(
+            f"[onnx] WARNING: dvector weights not found at {hp.dvector_pt_path}; "
+            f"encoder will use RANDOM init. The pretrained embedder "
+            f"(`models/embedder.pt`) ships with this repo (from "
+            f"https://github.com/maum-ai/voicefilter)."
+        )
+        encoder.freeze()
+    print(f"[onnx] d_vector_dim={hp.d_vector_dim}")
 
     enroll_wav = _load_audio_mono_16k(args.enrollment, hp.sample_rate)
     with torch.no_grad():
-        dvec_512 = encoder(enroll_wav.unsqueeze(0).to(device)).squeeze(0).cpu()
-    dvec_proj = model.dvec_proj(dvec_512.to(device)).cpu()
-    print(f"[onnx] d-vector projected to {dvec_proj.shape[-1]} dims")
+        dvec = extract_dvec(enroll_wav, hp, encoder, device=device).squeeze(0).cpu()
+    print(f"[onnx] d-vector dim {dvec.shape[-1]} (from speaker encoder)")
 
     if args.verify:
         mixed = _load_audio_mono_16k(args.mixed, hp.sample_rate)
         mel_fn = make_mel_basis(hp, device=torch.device("cpu"))
         log_mel = wav_to_log_mel(mixed, hp, mel_fn)
-        ok = verify_against_pytorch(hp, model, dvec_512, log_mel, args.max_abs_err)
+        ok = verify_against_pytorch(hp, model, dvec, log_mel, args.max_abs_err)
         if not ok:
             raise SystemExit(2)
 
-    run_onnx(sess, hp, dvec_proj, args.mixed, args.out, args.gl_iter)
+    run_onnx(sess, hp, dvec, args.mixed, args.out, args.gl_iter)
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 
 `StreamingVoiceFilter` is the stateful frame-by-frame inference entry point.
 It owns:
-  * the ECAPA d-vector projection (precomputed in `set_dvector`)
+  * the registered target-speaker d-vector (set once in `set_dvector`)
   * the LSTM hidden state (`(h, c)`)
   * the left-context frame stack (rolling buffer of `frame_stack - 1` frames)
   * the adaptive-suppression smoother (`AdaptiveSuppression`)
@@ -10,6 +10,9 @@ It owns:
 `step(frame_logmel)` does **one** new frame and returns the enhanced
 log-mel. The caller never sees intermediate tensors; device/dim plumbing is
 contained here.
+
+The d-vector comes in already at `hp.d_vector_dim` (256) directly from
+`SpeakerEncoder` — no in-model projection.
 """
 
 from __future__ import annotations
@@ -59,7 +62,7 @@ class StreamingVoiceFilter:
 
     Usage:
         sf = StreamingVoiceFilter(model, hp)
-        sf.set_dvector(dvec_raw)             # registration step (raw ECAPA output)
+        sf.set_dvector(dvec)                 # registration step (256-d from SpeakerEncoder)
         for chunk_logmel_frame in stream:    # (n_mels,) each iteration
             enhanced_frame = sf.step(chunk_logmel_frame)
     """
@@ -67,8 +70,9 @@ class StreamingVoiceFilter:
     def __init__(self, model: VoiceFilterLite, hp: HParams):
         self.model = model.eval()
         self.hp = hp
+        # Registered d-vector (already 256-d from SpeakerEncoder; no in-model
+        # projection).
         self._dvec: Optional[torch.Tensor] = None
-        self._dvec_proj: Optional[torch.Tensor] = None
         self._hidden: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self._context: List[torch.Tensor] = []   # most recent frame_stack - 1 frames
         # Initialised lazily so it inherits dtype/device from the model.
@@ -76,18 +80,21 @@ class StreamingVoiceFilter:
 
     # ------------------------------------------------------------------ setup
     @torch.no_grad()
-    def set_dvector(self, dvec_raw: torch.Tensor) -> None:
-        """Register the target speaker embedding (raw ECAPA output).
+    def set_dvector(self, dvec: torch.Tensor) -> None:
+        """Register the target speaker embedding.
 
         Args:
-            dvec_raw: (hp.speaker_encoder_raw_dim,) or (1, hp.speaker_encoder_raw_dim)
-                L2-normalised ECAPA embedding.
+            dvec: (hp.d_vector_dim,) or (1, hp.d_vector_dim) L2-normalised
+                speaker embedding produced by `SpeakerEncoder`.
         """
-        if dvec_raw.dim() == 1:
-            dvec_raw = dvec_raw.unsqueeze(0)
-        self._dvec = dvec_raw
-        # Pre-project so step() never has to touch dvec_proj for each frame.
-        self._dvec_proj = self.model.dvec_proj(dvec_raw)
+        if dvec.dim() == 1:
+            dvec = dvec.unsqueeze(0)
+        assert dvec.shape[-1] == self.hp.d_vector_dim, (
+            f"[streaming.set_dvector] dvec dim {dvec.shape[-1]} != "
+            f"hp.d_vector_dim ({self.hp.d_vector_dim}); encoder and model "
+            f"dims must match."
+        )
+        self._dvec = dvec
         self.reset_state()
 
     @torch.no_grad()
@@ -119,7 +126,7 @@ class StreamingVoiceFilter:
         Returns:
             (n_mels,) enhanced log-mel for this frame, on the caller's device.
         """
-        if self._dvec_proj is None:
+        if self._dvec is None:
             raise RuntimeError("Call set_dvector() before step().")
 
         squeeze = frame_logmel.dim() == 1
@@ -129,7 +136,14 @@ class StreamingVoiceFilter:
 
         stacked = self._build_stacked_input(frame_logmel)
         mask, x, last_frame = self._run_model(stacked)
-        f_adapt = self._predict_f_adapt(x) if self.hp.use_noise_type_predictor else 0.0
+        # Paper §3.4: `f_adapt(S_in^(t))` — the noise-type predictor's
+        # primary input is the current frame's noisy filterbank, not the
+        # LSTM hidden state. `last_frame` is the right-most slot of the
+        # right-aligned stack, i.e. S_in^(t). When
+        # `hp.alpha_head_use_current_frame=False` we fall back to the
+        # LSTM output `x` (paper §4.2 alternative).
+        head_in = last_frame if self.hp.alpha_head_use_current_frame else x
+        f_adapt = self._predict_f_adapt(head_in) if self.hp.use_noise_type_predictor else 0.0
 
         enhanced = self._apply_suppression(mask, last_frame, f_adapt, caller_device)
         return enhanced.squeeze(0) if squeeze else enhanced
@@ -164,16 +178,24 @@ class StreamingVoiceFilter:
         caller's device before returning.
         """
         stacked_flat = stacked.reshape(1, 1, -1)
-        dvec_proj = self._dvec_proj
-        if dvec_proj.dim() == 2:
-            dvec_proj = dvec_proj.unsqueeze(1)        # (1, 1, d_vector_dim)
+        dvec = self._dvec.unsqueeze(1)                # (1, 1, d_vector_dim)
 
-        model_device = dvec_proj.device
+        model_device = dvec.device
         if stacked_flat.device != model_device:
             stacked_flat = stacked_flat.to(model_device)
 
-        x = self.model.in_proj(torch.cat([stacked_flat, dvec_proj], dim=-1))
+        x = self.model.in_proj(torch.cat([stacked_flat, dvec], dim=-1))
         x = self.model.in_norm(x)
+        # Optional 1D CNN (paper §3.2). Mirrors `VoiceFilterLite.forward` —
+        # frequency-axis conv (kernel along the last dim, no time mixing).
+        # `self.model.cnn` is None when `hp.use_cnn=False`, in which case
+        # this is a no-op and the streaming path matches the legacy
+        # LSTM-only behaviour.
+        if self.model.cnn is not None:
+            B, T, H = x.shape
+            x = x.reshape(B * T, 1, H)
+            x = self.model.cnn(x)            # (B*T, cnn_channels, H) — H preserved
+            x = x.mean(dim=-1).reshape(B, T, -1)
         x, self._hidden = self.model.lstm(x, self._hidden)
         mask = torch.sigmoid(self.model.out_proj(x))   # (1, 1, n_mels)
 
@@ -182,9 +204,15 @@ class StreamingVoiceFilter:
             last_frame = last_frame.to(mask.device)
         return mask, x, last_frame
 
-    def _predict_f_adapt(self, x: torch.Tensor) -> float:
-        """Run the noise-type head on the last LSTM hidden state → scalar."""
-        logit = self.model.alpha_head(x)               # (1, 1, 1)
+    def _predict_f_adapt(self, head_in: torch.Tensor) -> float:
+        """Run the noise-type head on `head_in` (current frame or LSTM output) → scalar.
+
+        Paper §3.4: `f_adapt(S_in^(t))` — primary input is the current frame's
+        noisy filterbank (80-d). Paper §4.2 alternative: feed the LSTM output
+        features (`x`). The `step` caller picks which one based on
+        `hp.alpha_head_use_current_frame`.
+        """
+        logit = self.model.alpha_head(head_in)               # (1, 1, 1)
         return float(torch.sigmoid(logit).item())
 
     def _apply_suppression(
@@ -196,17 +224,21 @@ class StreamingVoiceFilter:
     ) -> torch.Tensor:
         """Blend the filtered output with the raw input using w^(t).
 
-        Both filtering and blending happen in **linear-mel** space
-        (paper §3.2); the result is converted back to log-mel before return.
+        Filtering delegates to `VoiceFilterLite._apply_mask` (paper §3.2's
+        literal `Y_enh = M · Y` in log-mel). Blending with the raw input
+        then happens in **linear-mel** space (paper §3.4), since the
+        adaptive smoother operates on magnitudes. The result is
+        converted back to log-mel before return.
         """
         w = self._adaptive.update(f_adapt) if self._adaptive is not None else 1.0
 
+        enhanced_logmel = self.model._apply_mask(mask[0, 0], last_frame)
+        # Convert to linear-mel, blend with raw input at strength w^(t),
+        # then convert back. The floor keeps the log from blowing up at the
+        # raw-input silence edge.
         floor = self.hp.log_mel_floor
+        filtered_mel = (torch.exp(enhanced_logmel) - floor).clamp(min=0.0)
         mix_mel = (torch.exp(last_frame) - floor).clamp(min=0.0)
-        # Equivalently `exp(model._apply_mask(mask[0,0], last_frame)) - floor`,
-        # but we already have `mask * mix_mel` in hand and skip a log/exp round-trip.
-        filtered_mel = mask[0, 0] * mix_mel
-
         enhanced_mel = w * filtered_mel + (1.0 - w) * mix_mel
         enhanced = torch.log(enhanced_mel + floor)
         if enhanced.device != caller_device:

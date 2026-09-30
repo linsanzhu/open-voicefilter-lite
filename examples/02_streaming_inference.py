@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from pathlib import Path
 
 import soundfile as sf
 import torch
@@ -46,6 +47,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.abspath(os.path.join(HERE, "..", "src")))
 
 from open_voicefilter_lite.audio import (  # noqa: E402
+    extract_dvec,
     make_mel_basis,
     wav_to_log_mel,
 )
@@ -54,9 +56,7 @@ from open_voicefilter_lite.model import (  # noqa: E402
     StreamingVoiceFilter,
     VoiceFilterLite,
 )
-from open_voicefilter_lite.speaker_encoder import (  # noqa: E402
-    FrozenSpeakerEncoder,
-)
+from open_voicefilter_lite.speaker_encoder import SpeakerEncoder  # noqa: E402
 
 
 def _select_device(requested: str) -> torch.device:
@@ -108,14 +108,14 @@ def _logmel_to_wav(log_mel: torch.Tensor, hp: HParams, n_iter: int = 16) -> torc
 
 
 def _register_speaker(
-    encoder: FrozenSpeakerEncoder,
+    encoder,
     enroll_path: str,
     hp: HParams,
     device: torch.device,
 ) -> torch.Tensor:
     wav = _load_audio_mono_16k(enroll_path, hp.sample_rate)
     with torch.no_grad():
-        return encoder(wav.unsqueeze(0).to(device)).squeeze(0).cpu()
+        return extract_dvec(wav, hp, encoder, device=device).squeeze(0).cpu()
 
 
 # ---- File mode: simulate streaming over a WAV ----
@@ -232,7 +232,19 @@ def main() -> None:
     model.load_state_dict(ckpt["model_state"])
     print(f"[streaming] loaded {args.checkpoint} (step={ckpt.get('step')})")
 
-    encoder = FrozenSpeakerEncoder(hp).to(device)
+    encoder = SpeakerEncoder(hp).to(device)
+    if Path(hp.dvector_pt_path).is_file():
+        encoder.load_pretrained(hp.dvector_pt_path)
+        print(f"[streaming] SpeakerEncoder loaded from {hp.dvector_pt_path}")
+    else:
+        print(
+            f"[streaming] WARNING: dvector weights not found at {hp.dvector_pt_path}; "
+            f"encoder will use RANDOM init. The pretrained embedder "
+            f"(`models/embedder.pt`) ships with this repo (from "
+            f"https://github.com/maum-ai/voicefilter)."
+        )
+        encoder.freeze()
+    print(f"[streaming] d_vector_dim={hp.d_vector_dim}")
     mel_fn = make_mel_basis(hp, device=torch.device("cpu"))
 
     dvec = _register_speaker(encoder, args.enrollment, hp, device)

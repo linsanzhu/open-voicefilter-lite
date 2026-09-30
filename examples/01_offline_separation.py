@@ -28,8 +28,8 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from pathlib import Path
 
-import numpy as np
 import soundfile as sf
 import torch
 
@@ -39,6 +39,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.abspath(os.path.join(HERE, "..", "src")))
 
 from open_voicefilter_lite.audio import (  # noqa: E402
+    extract_dvec,
     make_mel_basis,
     wav_to_log_mel,
 )
@@ -47,9 +48,7 @@ from open_voicefilter_lite.model import (  # noqa: E402
     StreamingVoiceFilter,
     VoiceFilterLite,
 )
-from open_voicefilter_lite.speaker_encoder import (  # noqa: E402
-    FrozenSpeakerEncoder,
-)
+from open_voicefilter_lite.speaker_encoder import SpeakerEncoder  # noqa: E402
 
 
 def _select_device(requested: str) -> torch.device:
@@ -63,13 +62,15 @@ def _select_device(requested: str) -> torch.device:
 
 
 def _load_enrollment_dvec(
-    encoder: FrozenSpeakerEncoder,
+    encoder,
     wav: torch.Tensor,
+    hp: HParams,
     device: torch.device,
 ) -> torch.Tensor:
-    """ECAPA returns (1, 512); squeeze to (512,) for StreamingVoiceFilter."""
+    """`audio.extract_dvec` returns (1, d_vector_dim=256); squeeze to
+    (d_vector_dim,) for StreamingVoiceFilter."""
     with torch.no_grad():
-        return encoder(wav.unsqueeze(0).to(device)).squeeze(0).cpu()
+        return extract_dvec(wav, hp, encoder, device=device).squeeze(0).cpu()
 
 
 def _logmel_to_wav(log_mel: torch.Tensor, hp: HParams, n_iter: int = 16) -> torch.Tensor:
@@ -91,12 +92,28 @@ def _logmel_to_wav(log_mel: torch.Tensor, hp: HParams, n_iter: int = 16) -> torc
     )
     linear = inv_mel(mel)                              # (1, n_freq, T)
 
+    # torchaudio's GriffinLim rebuilds via STFT(center=True), which expects
+    # T_frames = target_len // hop + 1 (e.g. 48000/160 + 1 = 301) for the
+    # target output length. Our STFT was center=False and yields 298 frames
+    # for 48000 samples — the trailing half-window is dropped. Right-pad
+    # with silence so the internal `specgram * angles` matmul shape matches
+    # and the wav round-trips to the full `target_len`.
+    target_len = int(hp.sample_length_sec * hp.sample_rate)
+    needed_frames = target_len // hp.hop_length + 1
+    if linear.shape[-1] < needed_frames:
+        pad = torch.zeros(
+            1, linear.shape[1], needed_frames - linear.shape[-1],
+            dtype=linear.dtype, device=linear.device,
+        )
+        linear = torch.cat([linear, pad], dim=-1)
+
     griffin = torchaudio.transforms.GriffinLim(
         n_fft=hp.n_fft,
         hop_length=hp.hop_length,
         win_length=hp.win_length,
         power=1.0,
         n_iter=n_iter,
+        length=target_len,
     )
     return griffin(linear).squeeze(0)
 
@@ -123,8 +140,19 @@ def main() -> None:
     model.load_state_dict(ckpt["model_state"])
     print(f"[offline] loaded {args.checkpoint} (step={ckpt.get('step')})")
 
-    # ---- Speaker encoder (lazy-loads ECAPA weights on first call) ----
-    encoder = FrozenSpeakerEncoder(hp).to(device)
+    # ---- Speaker encoder (lazy-loads d-vector weights on first call) ----
+    encoder = SpeakerEncoder(hp).to(device)
+    if Path(hp.dvector_pt_path).is_file():
+        encoder.load_pretrained(hp.dvector_pt_path)
+        print(f"[offline] SpeakerEncoder loaded from {hp.dvector_pt_path} (d_vector_dim={hp.d_vector_dim})")
+    else:
+        print(
+            f"[offline] WARNING: dvector weights not found at {hp.dvector_pt_path}; "
+            f"encoder will use RANDOM init. The pretrained embedder "
+            f"(`models/embedder.pt`) ships with this repo (from "
+            f"https://github.com/maum-ai/voicefilter)."
+        )
+        encoder.freeze()
 
     # ---- Audio IO ----
     enroll_wav, sr_enroll = sf.read(args.enrollment, dtype="float32")
@@ -149,7 +177,7 @@ def main() -> None:
     print(f"[offline] mixed={mixed_wav_t.shape[-1] / hp.sample_rate:.2f}s")
 
     # ---- Register speaker ----
-    dvec = _load_enrollment_dvec(encoder, enroll_wav_t, device)
+    dvec = _load_enrollment_dvec(encoder, enroll_wav_t, hp, device)
     sf_model = StreamingVoiceFilter(model, hp)
     sf_model.set_dvector(dvec)
 

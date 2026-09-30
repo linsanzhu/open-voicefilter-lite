@@ -2,7 +2,7 @@
 """Run a trained VoiceFilter-Lite ckpt on a directory of mix_dump samples.
 
 For each `sample_XX_*/` directory in the mix dump:
-  - 03_ref.wav      → d-vector via frozen ECAPA
+  - 03_ref.wav      → d-vector via frozen SpeakerEncoder
   - 02_mixed.wav    → STFT → magnitude + phase
   - magnitude       → mel → log-mel → streaming model → mask per frame
   - apply mask in mel domain → pseudo-inverse back to linear magnitude
@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -39,12 +38,13 @@ HERE = Path(__file__).parent.resolve()
 sys.path.insert(0, str(HERE.parent / "src"))
 
 from open_voicefilter_lite.audio import (
+    extract_dvec,
     make_mel_basis,
     pad_or_trim,
 )
 from open_voicefilter_lite.hparams import HParams
 from open_voicefilter_lite.model import VoiceFilterLite
-from open_voicefilter_lite.speaker_encoder import FrozenSpeakerEncoder
+from open_voicefilter_lite.speaker_encoder import SpeakerEncoder
 
 
 def compute_si_sdr(estimate: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> float:
@@ -64,7 +64,7 @@ def enhance_sample(
     target_wav: torch.Tensor,
     ref_wav: torch.Tensor,
     model: VoiceFilterLite,
-    speaker_encoder: FrozenSpeakerEncoder,
+    speaker_encoder: SpeakerEncoder,
     hp: HParams,
     fb: torch.Tensor,
     pinv_fb: torch.Tensor,
@@ -74,10 +74,10 @@ def enhance_sample(
     """Enhance `mixed_wav` using the model. Returns (enhanced_wav, si_sdr_in, si_sdr_out)."""
     T_samples = mixed_wav.shape[0]
 
-    # ---- D-vector from reference ----
-    ref_for_dvec = pad_or_trim(ref_wav, int(0.5 * hp.sample_rate))
+    # ---- D-vector from reference (full ref, capped at ref_max_sec) ----
+    ref_for_dvec = pad_or_trim(ref_wav, int(hp.ref_max_sec * hp.sample_rate))
     with torch.no_grad():
-        dvec = speaker_encoder(ref_for_dvec.unsqueeze(0).to(device)).squeeze(0)
+        dvec = extract_dvec(ref_for_dvec, hp, speaker_encoder, device=device).squeeze(0)
 
     # ---- STFT of mixed ----
     mixed_stft = torch.stft(
@@ -98,7 +98,9 @@ def enhance_sample(
     # Re-implement the streaming forward so we can grab the raw mask (the
     # StreamingVoiceFilter wrapper swallows it inside the adaptive blend).
     # Math is identical to streaming._run_model — same layers, same order.
-    dvec_proj = model.dvec_proj(dvec).view(1, 1, -1)              # (1, 1, d_vector_dim)
+    # The d-vector from the speaker encoder is already 256-d and is fed
+    # directly into `in_proj`.
+    dvec_tiled = dvec.view(1, 1, -1).to(device)                  # (1, 1, d_vector_dim)
     h0 = torch.zeros(hp.num_lstm_layers, 1, hp.hidden_dim, device=device)
     c0 = torch.zeros(hp.num_lstm_layers, 1, hp.hidden_dim, device=device)
     hidden = (h0, c0)
@@ -116,7 +118,7 @@ def enhance_sample(
             for i, f in enumerate(context):
                 stacked[offset + i] = f
             stacked_flat = stacked.reshape(1, 1, -1)
-            x = model.in_proj(torch.cat([stacked_flat, dvec_proj], dim=-1))
+            x = model.in_proj(torch.cat([stacked_flat, dvec_tiled], dim=-1))
             x = model.in_norm(x)
             x, hidden = model.lstm(x, hidden)
             mask = torch.sigmoid(model.out_proj(x))              # (1, 1, n_mels)
@@ -170,7 +172,19 @@ def main() -> None:
     model.load_state_dict(ckpt["model_state"])
     print(f"[enhance] loaded {args.checkpoint} (step={ckpt.get('step')}) on {device}")
 
-    speaker_encoder = FrozenSpeakerEncoder(hp).to(device)
+    speaker_encoder = SpeakerEncoder(hp).to(device)
+    if Path(hp.dvector_pt_path).is_file():
+        speaker_encoder.load_pretrained(hp.dvector_pt_path)
+        print(f"[enhance] SpeakerEncoder loaded from {hp.dvector_pt_path}")
+    else:
+        print(
+            f"[enhance] WARNING: dvector weights not found at {hp.dvector_pt_path}; "
+            f"encoder will use RANDOM init. The pretrained embedder "
+            f"(`models/embedder.pt`) ships with this repo (from "
+            f"https://github.com/maum-ai/voicefilter)."
+        )
+        speaker_encoder.freeze()
+    print(f"[enhance] d_vector_dim={hp.d_vector_dim}")
     mel_transform = make_mel_basis(hp, device=torch.device("cpu"))
     fb = mel_transform.mel_scale.fb                              # (n_freq, n_mels)
     pinv_fb = la.pinv(fb, rcond=1e-4)                            # (n_mels, n_freq)

@@ -27,7 +27,7 @@ frame_stack: 4
 
 # ---- Data / mixture ----
 sample_length_sec: 3.0 # paper Fig 2: "segment of 3 seconds during training"
-snr_min_db: -1.0 # paper §3.2: "random within -1dB to 10dB"
+snr_min_db: 1.0 # paper §3.2 / slides p.29: "SNR 1dB~10dB" (×3)
 snr_max_db: 10.0
 silent_target_prob: 0.10 # train the "do nothing" mode
 silent_interference_prob: 0.10
@@ -90,9 +90,21 @@ ema_decay: 0.999
 ema_warmup_steps: 100
 
 # ---- Loss (paper §3.3 — asymmetric L2, α = 10) ----
-# g_asym(x, α) = α·x if x > 0 else x; loss = mean(g_asym(target - pred, α)²)
-# Over-suppression errors (S_enh < S_cln) are amplified by α² = 100.
+# g_asym(x, α) = α·x if x > 0 else x; loss = Σ_t Σ_f g_asym(...)² (paper §3.3
+# Eq. 3 — literal sum, NOT per-element mean). Over-suppression errors
+# (S_enh < S_cln) are amplified by α² = 100. Magnitude of L_asym is now
+# ~T·F larger than the legacy mean() variant, so `hinge_loss_weight` is
+# calibrated down to ~1/(T·F) of the old default.
 loss_alpha: 10.0
+
+# ---- Optional paper-aligned toggles (paper §3.2) ----
+# paper-faithful defaults set here so a fresh run on MPS already matches
+# the original paper's mask formula and topology. All three default ON
+# in HParams; we still expose them so this config can flip OFF for
+# backwards compatibility with already-trained checkpoints.
+use_cnn: false
+num_cnn_layers: 2
+cnn_kernel_size: 3
 
 # ---- Noise-type predictor (paper §4.2 / §3.4) ----
 # Trained with hinge loss for per-frame binary classification
@@ -100,12 +112,25 @@ loss_alpha: 10.0
 # the adaptive suppression `w^(t)` per §3.4 — this is what gives the paper
 # its "always harmless and sometimes helpful" production behaviour.
 use_noise_type_predictor: true
-hinge_loss_weight:
-  0.1 # paper doesn't specify; 0.1 keeps hinge in the same
-  # magnitude band as L_asym so neither term is starved.
+# Paper §3.4: f_adapt(S_in^(t)) — the noise-type predictor's primary
+# input is the **current frame's noisy filterbank** (80-d). Paper §4.2
+# also allows the LSTM-output variant; we keep that as a fallback via
+# `alpha_head_use_current_frame=False` for backward compatibility.
+alpha_head_use_current_frame: true
+# L_asym now summed (paper §3.3 Σ_t Σ_f) → ~T·F larger; calibrate the
+# hinge weight accordingly. sample_length=3s, hop=10ms, n_mels=80 →
+# ~1/(T·F) ≈ 4e-5; 1e-5 is slightly hinge-favouring.
+hinge_loss_weight: 1.0e-5
 adaptive_w_beta: 0.8 # paper §4.4 "moving average coefficient β = 0.8"
 adaptive_w_a: 1.0 # paper §3.4 linear transform "a > 0"
 adaptive_w_b: 0.0 # paper §3.4 linear transform "b ≥ 0"
+
+# ---- Per-frame activity bursts (paper §4.2 / deviation 5) ----
+# The noise-type predictor's per-frame label is +1 where BOTH target and
+# interference burst windows cover the frame centre, -1 elsewhere.
+activity_burst_min_sec: 0.5
+activity_burst_max_sec: 3.0
+activity_fade_ms: 50.0
 
 # ---- Misc ----
 seed: 1234
@@ -113,7 +138,7 @@ device: mps # use "mps" on Apple Silicon
 
 # ---- HF Hub endpoint (network mirror) ----
 # Default behaviour: every HF pull (`openslr/librispeech_asr`,
-# `corypaik/musan`, `quinnlue/rirs`, `speechbrain/spkrec-ecapa-voxceleb`)
+# `corypaik/musan`, `quinnlue/rirs`)
 # goes to `https://huggingface.co`. That host is unreachable from some
 # networks (e.g. mainland China without a VPN) — set `hf_endpoint` to a
 # mirror so all HF traffic is redirected. Precedence is
@@ -133,31 +158,32 @@ device: mps # use "mps" on Apple Silicon
 
 # ---- Data-loading parallelism (kills the "GPU-idle-between-batches" stall) ----
 # Single-threaded audio decode was the bottleneck on M-series: GPU compute
-# is sub-second but each batch took ~50 s of soundfile + ECAPA. Three
+# is sub-second but each batch took ~50 s of soundfile + mel. Two
 # independent knobs fix it (see `dataset.py` for details):
 #   - `decode_workers`: thread pool size for parallel audio decode
 #     (soundfile/torchcodec both release the GIL during C-side decode).
 #   - `decode_prefetch`: how many decode jobs to pipeline ahead of the
 #     consumer, so the main thread rarely blocks on `fut.result()`.
-#   - `dvec_cache_dir`: where to persist speaker d-vectors across runs;
-#     ECAPA-TDNN is the slowest per-batch step, and the d-vector is a
-#     function of the *speaker*, not the utterance, so caching it
-#     eliminates ECAPA cost after ~1000 samples (LibriSpeech has ~1172 spk).
+#
+# SpeakerEncoder itself is NOT cached — `audio.extract_dvec` recomputes
+# the d-vector for each batch (librosa STFT + per-window encoder forward,
+# ~6 ms per batch on M-series, negligible vs GPU compute). Audio
+# preprocessing lives in `audio.py`; the encoder stays a pure model.
 #
 # Memory-conscious defaults for 16 GB Apple Silicon (the previous 4×4
-# combination OOM'd during the first batch because ECAPA's JIT-compiled
-# kernels plus a deep prefetch queue blew past the jetsam threshold).
+# combination OOM'd during the first batch because mel extraction plus a
+# deep prefetch queue blew past the jetsam threshold).
 # On M2 Pro / M3 Pro with 18+ GB you can bump these back up to 4.
 decode_workers: 2
 decode_prefetch: 2
 prefetch_batches_max: 2
-dvec_cache_dir: models/dvec_cache
 
 # ---- Reference-waveform cap (memory win on MPS) ----
-# ECAPA only needs ~3-6 s of audio for a stable speaker embedding. The
-# dataset caps `ref_wav` to this length so `collate_triplets` pads to at
-# most `int(ref_max_sec * sample_rate)` samples instead of the longest
-# utterance in the batch (some LibriSpeech speakers are ~30 s). Without
-# this, a 16-element batch's `ref_wavs` tensor was 30 MB CPU/MPS each,
-# multiplied by `prefetch_batches_max` queued copies. See HParams doc.
+# SpeakerEncoder only needs ~3-6 s of audio for a stable speaker
+# embedding. The dataset caps `ref_wav` to this length so
+# `collate_triplets` pads to at most `int(ref_max_sec * sample_rate)`
+# samples instead of the longest utterance in the batch (some LibriSpeech
+# speakers are ~30 s). Without this, a 16-element batch's `ref_wavs`
+# tensor was 30 MB CPU/MPS each, multiplied by `prefetch_batches_max`
+# queued copies. See HParams doc.
 ref_max_sec: 6.0

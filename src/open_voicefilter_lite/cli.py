@@ -1,7 +1,7 @@
 """CLI helpers — top-level `open-voicefilter-lite` entry + YAML config loader.
 
 This module is intentionally tiny and side-effect free so it can be
-imported by tests without touching the heavy HF / torch / speechbrain
+imported by tests without touching the heavy HF / torch / tensorflow
 dependencies.
 """
 
@@ -63,6 +63,15 @@ def apply_overrides(
     Only keys that exist in `HParams.__dataclass_fields__` are applied.
     Returns the list of keys that were applied. In strict mode (default),
     unknown keys raise a ValueError; otherwise they are silently ignored.
+
+    After all assignments, `hp.__post_init__()` is called so derived
+    fields (notably `d_vector_dim`, which depends on `speaker_encoder`)
+    stay consistent with the new value. Dataclasses' built-in
+    `__post_init__` only fires from `__init__`; `setattr` skips it, so
+    callers that mutate `hp` after construction must trigger it
+    themselves — `apply_overrides` does this for the YAML-overlay path.
+    CLI flag overrides that happen after `apply_overrides` (e.g. in
+    `train.main`) must call `hp.__post_init__()` themselves.
     """
     valid_keys = set(HParams.__dataclass_fields__.keys())
     applied: list[str] = []
@@ -77,6 +86,11 @@ def apply_overrides(
             value = tuple(value)
         setattr(hp, key, value)
         applied.append(key)
+
+    # Re-run __post_init__ so `d_vector_dim` stays consistent with
+    # `speaker_encoder` after a YAML override (e.g. switching from
+    # `dvector` → `voxceleb_ecapa` should auto-set dim 256 → 192).
+    hp.__post_init__()
 
     if unknown:
         msg = f"[cli] unknown hparam(s) in config: {', '.join(sorted(unknown))}"
@@ -112,7 +126,7 @@ def apply_hf_endpoint(
       1. ``cli_override`` — typically the ``--hf-endpoint`` flag on each
          entry-point script (train / evaluate / download_data).
       2. ``HF_ENDPOINT`` env var — the convention understood by
-         ``huggingface_hub`` / ``datasets`` / speechbrain.
+         ``huggingface_hub`` / ``datasets``.
       3. ``hp.hf_endpoint`` — the YAML config field (or its CLI override
          applied via ``apply_overrides``).
       4. ``None`` → leave the default ``https://huggingface.co`` in place.

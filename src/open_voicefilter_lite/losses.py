@@ -1,23 +1,14 @@
 """Losses for VoiceFilter-Lite.
 
-Two backends (paper §3.3, §3.4), both combined with the per-frame hinge loss
-for the noise-type predictor (paper §4.2):
+The combined objective is paper §3.3 (asymmetric L2) + §4.2 (per-frame hinge
+for the noise-type predictor):
 
-  A. `asymmetric_l2_loss` — the paper's sign-based asymmetric L2, which
-     amplifies the penalty on *over-suppression* errors (model dropped
-     target energy) by α² (paper Tables 1 & 2 use α = 10). The asymmetry
-     is on the **sign of the residual** `target − pred`, not on the
-     target's energy.
+    L_total = L_asym + hp.hinge_loss_weight · L_hinge
 
-  B. `sisdr_loss_on_logmel` — SI-SDR computed in the linear-mel domain
-     (after `exp` of the model's log-mel output). Scale-invariant and
-     symmetric (no 100× over-suppression penalty), so the gradient at
-     mask ≈ 1 is non-zero. That breaks the `AsymmetricL2Loss` local
-     minimum where the mask collapses to pass-through (mask ≈ 1, loss
-     stuck at ≈ 5) — the failure mode this loss is designed to escape.
-
-The combined objective is:
-    L_total = L_main + hinge_loss_weight · L_hinge
+`L_asym` is `mean( g_asym(target − pred, α)² )` with
+`g_asym(x, α) = α·x if x > 0 else x` and α = 10 (paper Tables 1 & 2).
+`L_hinge` is the binary hinge `mean(max(0, margin − y·logits))` over the
+per-frame "overlapped speech?" logits, with `y ∈ {−1, +1}`.
 """
 
 from __future__ import annotations
@@ -37,20 +28,31 @@ def asymmetric_l2_loss(
 ) -> torch.Tensor:
     """Asymmetric L2 loss penalising over-suppression (paper §3.3).
 
-    Residual: ``x = S_cln − S_enh = target − pred``.
+    Paper §3.3 (Wang et al., 2020) defines the loss as
+    ``L = Σ_t Σ_f ( g_asym(S_cln − S_enh, α) )²`` (Eq. 3 — literal sum
+    over time and frequency bins, NOT a per-element mean). We honour that
+    literally:
 
       - ``x > 0``  (over-suppression: model dropped target energy):
         penalty = ``α·x``  → contribution ``α²·x²``
       - ``x ≤ 0``  (under-suppression: residual interference):
         penalty = ``x``    → contribution ``x²``
 
-    So ``L_asym = mean( g_asym(x, α)² ) = mean( α²·x²  if x>0  else  x² )``.
+    So ``L_asym = sum( g_asym(x, α)² ) = sum( α²·x²  if x>0  else  x² )``.
 
     The α² amplification on over-suppression errors is the central trick:
     ASR hates dropped speech far more than residual noise, so the model is
     trained to err on the side of *passing through* the input when it is
     uncertain. Paper Tables 1 & 2 use α = 10 (→ 100× amplification on
     over-suppression).
+
+    NB on the hinge companion: the paper's L_asym is summed over all
+    frames × bins, but the hinge loss is per-frame (one label per frame).
+    The codebase keeps the hinge as a per-frame mean (so it sits in the
+    same [0, margin] band as before). The asymmetry in reduction
+    (`sum` vs `mean`) is absorbed by `hp.hinge_loss_weight` — see
+    `hparams.py` for the calibrated default (`1e-5` after the switch to
+    sum, vs the legacy `0.1` with mean).
 
     Args:
         pred:   (B, T, F) predicted enhanced log-mel.
@@ -59,7 +61,7 @@ def asymmetric_l2_loss(
     """
     diff = target - pred                                # (B, T, F)  > 0 ⟹ over-suppression
     g = torch.where(diff > 0, alpha * diff, diff)       # (B, T, F)  g_asym
-    return (g ** 2).mean()
+    return (g ** 2).sum()
 
 
 def hinge_loss(
@@ -67,7 +69,7 @@ def hinge_loss(
     labels: torch.Tensor,
     margin: float = 1.0,
 ) -> torch.Tensor:
-    """Binary hinge loss for the per-frame noise-type predictor (§4.2).
+    """Binary hinge loss for the per-frame noise-type predictor (paper §4.2).
 
     Args:
         logits: (B, T) raw scores from `alpha_head`. Hinge operates on
@@ -90,96 +92,27 @@ def hinge_loss(
     return elementwise.mean()
 
 
-# ---- SI-SDR on linear-mel (alternative to asymmetric L2) ----
-
-
-def sisdr_loss_on_logmel(
-    enhanced_logmel: torch.Tensor,
-    target_logmel: torch.Tensor,
-    eps: float = 1e-7,
-) -> torch.Tensor:
-    """Scale-invariant SDR computed in the linear-mel domain.
-
-    Converts log-mel → linear-mel via `exp`, then per-sample:
-
-        target_v   = target - mean(target)        # per-sample mean removal
-        est_v      = est    - mean(est)
-        alpha      = <est_v, target_v> / <target_v, target_v>
-        proj       = alpha * target_v             # signal projection
-        noise      = est_v - proj                 # distortion residual
-        SDR        = 10·log10( ||proj||² / ||noise||² )
-
-    Returns −mean(SDR) so smaller = better (matches the train-loop's
-    "loss goes down" convention).
-
-    Why linear-mel and not log-mel? `exp(log_mel)` is positive and gives
-    a true energy/power quantity; mean-removal then centres it. SI-SDR on
-    raw log-mel has an unbounded negative tail (silence frames log(0+eps)
-    dominate the projection) and gives unstable gradients on the floor
-    region. Linear-mel avoids both.
-
-    Why this beats asymmetric L2 here: the α²=100 over-suppression penalty
-    in `asymmetric_l2_loss` makes `mask=1` a strong attractor (loss ≈ 5
-    flat regardless of speech content). SI-SDR is symmetric: any non-zero
-    mask < 1 immediately reduces loss, so the gradient at mask ≈ 1 is no
-    longer zero. That's what allows the mask to actually move off 1.
-
-    Args:
-        enhanced_logmel, target_logmel: (B, T, F) log-mel. Both must be
-            on the same device/dtype.
-        eps: numerical floor for divisions (default 1e-7).
-
-    Returns:
-        Scalar loss (higher = worse; lower = better).
-    """
-    if enhanced_logmel.shape != target_logmel.shape:
-        raise ValueError(
-            f"[sisdr_loss_on_logmel] shape mismatch: "
-            f"{tuple(enhanced_logmel.shape)} vs {tuple(target_logmel.shape)}"
-        )
-
-    # exp(log_mel) is always > 0; the "mean removal" below then centres it.
-    enhanced = torch.exp(enhanced_logmel)
-    target = torch.exp(target_logmel)
-
-    # Flatten spectral+time so each (B,) sample has a single vector.
-    target_v = target.flatten(1)                 # (B, T*F)
-    enhanced_v = enhanced.flatten(1)             # (B, T*F)
-
-    target_v = target_v - target_v.mean(dim=-1, keepdim=True)
-    enhanced_v = enhanced_v - enhanced_v.mean(dim=-1, keepdim=True)
-
-    target_energy = target_v.pow(2).sum(dim=-1, keepdim=True) + eps
-    alpha = (enhanced_v * target_v).sum(dim=-1, keepdim=True) / target_energy
-    proj = alpha * target_v
-    noise = enhanced_v - proj
-
-    proj_energy = proj.pow(2).sum(dim=-1)
-    noise_energy = noise.pow(2).sum(dim=-1)
-    sdr = 10.0 * torch.log10((proj_energy + eps) / (noise_energy + eps))
-    return -sdr.mean()
-
-
 class AsymmetricL2Loss(nn.Module):
-    """Combined objective: asymmetric L2 + per-frame hinge (§3.3 + §3.4)
-    + optional mask-entropy regulariser.
+    """Paper §3.3 asymmetric L2 + per-frame hinge (§4.2) + mask-saturation
+    regulariser.
 
-    Total loss = L_asym
-                 + hp.hinge_loss_weight · L_hinge
-                 + hp.mask_binary_reg_weight · H(mask)
+    Total loss = L_asym + hp.hinge_loss_weight · L_hinge + mask_sat_term
 
-    `H(mask)` is the per-bin Bernoulli entropy of the (optional) `mask`
-    argument, in nats — see `SISDRMelLoss._mask_entropy` for the full
-    formula and rationale. The default paper `loss_alpha=10` produces a
-    strong attractor at `mask=1` (the 100× over-suppression penalty makes
-    any mask < 1 cost 100× more loss); with `mask_binary_reg_weight=0`
-    (default) you get the paper's behaviour, and setting a positive
-    value pushes the mask away from 0.5 — combined with `loss_alpha=1`
-    (symmetric L2) this is the cheapest way to break the attractor
-    without leaving the paper's loss family.
+    `L_asym` amplifies over-suppression errors (model's enhanced < target)
+    by `α²` so the model errs on the side of passing input through when
+    uncertain — see `asymmetric_l2_loss` docstring for the full derivation.
+    `L_hinge` trains the noise-type predictor (§4.2): binary classification
+    per frame of "is this frame overlapped speech?", `y ∈ {−1, +1}`.
+
+    The optional `mask_sat_term` is a one-sided quadratic penalty activated
+    element-wise when mask > `hp.mask_sat_target`. It prevents the
+    "mask-collapse to 1" local minimum that the asymmetric L2 has at
+    α ≥ 2 — see `hp.mask_sat_*` and `model.py` `out_proj.bias` init for
+    the design notes.
 
     When `hp.use_noise_type_predictor=False`, the hinge term is skipped
-    (the predictor is not trained) and the loss is pure L_asym.
+    (the predictor is not trained) and the loss reduces to `L_asym +
+    mask_sat_term`.
     """
 
     def __init__(self, hp: HParams):
@@ -187,17 +120,22 @@ class AsymmetricL2Loss(nn.Module):
         self.alpha = hp.loss_alpha
         self.use_noise_type_predictor = hp.use_noise_type_predictor
         self.hinge_loss_weight = hp.hinge_loss_weight
-        self.mask_binary_reg_weight = hp.mask_binary_reg_weight
-        self.bimodal_eps = 1e-7
+        # Mask-saturation regulariser. Element-wise one-sided quadratic:
+        # `weight · Σ max(0, mask − target)²`. See `HParams` for the
+        # weight/target rationale.
+        self.mask_sat_target = hp.mask_sat_target
+        self.mask_sat_weight = hp.mask_sat_weight
 
-    @staticmethod
-    def _mask_entropy(mask: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
-        """Per-bin Bernoulli entropy of `mask` (mirror of
-        `SISDRMelLoss._mask_entropy`). Returns a non-negative scalar:
-        0 iff every bin ∈ {0, 1}, ln 2 ≈ 0.693 iff every bin = 0.5.
+    def _mask_sat(self, mask: torch.Tensor) -> torch.Tensor:
+        """One-sided quadratic penalty for mask values above `mask_sat_target`.
+
+        Element-wise so the per-element gradient (`weight · 2 · (mask −
+        target)`) is directly comparable to L_asym's per-element gradient;
+        `mean()`-based regularisers would be ~numel× too weak under the
+        sum-loss regime.
         """
-        m = mask.clamp(min=eps, max=1.0 - eps)
-        return -(m * torch.log(m) + (1.0 - m) * torch.log(1.0 - m)).mean()
+        over = torch.clamp(mask - self.mask_sat_target, min=0.0)
+        return self.mask_sat_weight * over.pow(2).sum()
 
     def forward(
         self,
@@ -210,10 +148,6 @@ class AsymmetricL2Loss(nn.Module):
         """Compute total loss."""
         loss_asym = asymmetric_l2_loss(pred, target, alpha=self.alpha)
 
-        loss_bimodal = pred.new_zeros(())
-        if mask is not None and self.mask_binary_reg_weight > 0.0:
-            loss_bimodal = self._mask_entropy(mask, eps=self.bimodal_eps)
-
         loss_hinge = pred.new_zeros(())
         if (
             self.use_noise_type_predictor
@@ -222,10 +156,14 @@ class AsymmetricL2Loss(nn.Module):
         ):
             loss_hinge = hinge_loss(frame_logits, frame_labels)
 
+        loss_mask_sat = pred.new_zeros(())
+        if mask is not None:
+            loss_mask_sat = self._mask_sat(mask)
+
         return (
             loss_asym
             + self.hinge_loss_weight * loss_hinge
-            + self.mask_binary_reg_weight * loss_bimodal
+            + loss_mask_sat
         )
 
     def forward_with_components(
@@ -239,10 +177,6 @@ class AsymmetricL2Loss(nn.Module):
         """Like `forward` but returns each component for logging."""
         loss_asym = asymmetric_l2_loss(pred, target, alpha=self.alpha)
 
-        loss_bimodal = pred.new_zeros(())
-        if mask is not None and self.mask_binary_reg_weight > 0.0:
-            loss_bimodal = self._mask_entropy(mask, eps=self.bimodal_eps)
-
         loss_hinge = pred.new_zeros(())
         if (
             self.use_noise_type_predictor
@@ -250,147 +184,28 @@ class AsymmetricL2Loss(nn.Module):
                 and frame_labels is not None
         ):
             loss_hinge = hinge_loss(frame_logits, frame_labels)
+
+        loss_mask_sat = pred.new_zeros(())
+        if mask is not None:
+            loss_mask_sat = self._mask_sat(mask)
 
         total = (
             loss_asym
             + self.hinge_loss_weight * loss_hinge
-            + self.mask_binary_reg_weight * loss_bimodal
+            + loss_mask_sat
         )
         return {
             "loss": total,
             "loss_asym": loss_asym.detach(),
-            "loss_bimodal": loss_bimodal.detach(),
             "loss_hinge": loss_hinge.detach(),
-        }
-
-
-class SISDRMelLoss(nn.Module):
-    """Combined objective: SI-SDR on linear-mel + per-frame hinge (§3.4)
-    + optional mask-entropy regulariser.
-
-    Total loss = L_sisdr
-                 + hp.hinge_loss_weight · L_hinge
-                 + hp.mask_binary_reg_weight · H(mask)
-
-    `H(mask)` is the per-bin Bernoulli entropy of the (optional) `mask`
-    argument, in nats:
-
-        H(mask) = -E[ mask·log(mask) + (1-mask)·log(1-mask) ]
-
-    H is in [0, ln 2]. H = 0 iff every bin is exactly 0 or 1 (bimodal);
-    H = ln 2 ≈ 0.693 iff every bin is 0.5. Adding `H` to the loss
-    (with a positive weight) means: bimodal masks REDUCE the loss while
-    masks stuck at 0.5 are penalised. Without this term, SI-SDR alone
-    lets the model collapse to mask ≈ 0.5 — the alpha-projection at
-    mask=0.5 and mask=1 give nearly the same SI-SDR when target and
-    interference are similarly shaped, so 0.5 is a saddle point the
-    optimiser happily sits in.
-
-    Note: this regulariser doesn't tell the model which direction to go
-    (towards 0 or 1); that's the SI-SDR's job. It only forbids sitting at
-    0.5 — combined with SI-SDR, the model has to commit to either passing
-    target through (mask=1 on active frames) or suppressing interference
-    (mask=0 elsewhere), and the gradient picks the right direction.
-
-    Replaces `AsymmetricL2Loss` to escape the `mask ≈ 1` collapse. See
-    `sisdr_loss_on_logmel` docstring for why this works where L2 fails.
-    """
-
-    def __init__(self, hp: HParams):
-        super().__init__()
-        self.sisdr_eps = hp.sisdr_eps
-        self.mask_binary_reg_weight = hp.mask_binary_reg_weight
-        self.use_noise_type_predictor = hp.use_noise_type_predictor
-        self.hinge_loss_weight = hp.hinge_loss_weight
-
-    @staticmethod
-    def _mask_entropy(mask: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
-        """Per-bin Bernoulli entropy of `mask`, in nats.
-
-            H(mask) = -E[ mask·log(mask) + (1-mask)·log(1-mask) ]
-
-        Range: [0, ln 2]. H = 0 iff every bin is exactly 0 or 1 (bimodal);
-        H = ln 2 ≈ 0.693 iff every bin is 0.5 (the maximum-uncertainty point).
-        """
-        m = mask.clamp(min=eps, max=1.0 - eps)
-        return -(m * torch.log(m) + (1.0 - m) * torch.log(1.0 - m)).mean()
-
-    def forward(
-        self,
-        pred: torch.Tensor,
-        target: torch.Tensor,
-        frame_logits: Optional[torch.Tensor] = None,
-        frame_labels: Optional[torch.Tensor] = None,
-        mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        loss_sisdr = sisdr_loss_on_logmel(pred, target, eps=self.sisdr_eps)
-
-        loss_bimodal = pred.new_zeros(())
-        if mask is not None and self.mask_binary_reg_weight > 0.0:
-            loss_bimodal = self._mask_entropy(mask, eps=self.sisdr_eps)
-
-        loss_hinge = pred.new_zeros(())
-        if (
-            self.use_noise_type_predictor
-                and frame_logits is not None
-                and frame_labels is not None
-        ):
-            loss_hinge = hinge_loss(frame_logits, frame_labels)
-
-        return (
-            loss_sisdr
-            + self.hinge_loss_weight * loss_hinge
-            + self.mask_binary_reg_weight * loss_bimodal
-        )
-
-    def forward_with_components(
-        self,
-        pred: torch.Tensor,
-        target: torch.Tensor,
-        frame_logits: Optional[torch.Tensor] = None,
-        frame_labels: Optional[torch.Tensor] = None,
-        mask: Optional[torch.Tensor] = None,
-    ) -> dict[str, torch.Tensor]:
-        loss_sisdr = sisdr_loss_on_logmel(pred, target, eps=self.sisdr_eps)
-
-        loss_bimodal = pred.new_zeros(())
-        if mask is not None and self.mask_binary_reg_weight > 0.0:
-            loss_bimodal = self._mask_entropy(mask, eps=self.sisdr_eps)
-
-        loss_hinge = pred.new_zeros(())
-        if (
-            self.use_noise_type_predictor
-                and frame_logits is not None
-                and frame_labels is not None
-        ):
-            loss_hinge = hinge_loss(frame_logits, frame_labels)
-
-        total = (
-            loss_sisdr
-            + self.hinge_loss_weight * loss_hinge
-            + self.mask_binary_reg_weight * loss_bimodal
-        )
-        return {
-            "loss": total,
-            "loss_sisdr": loss_sisdr.detach(),
-            "loss_bimodal": loss_bimodal.detach(),
-            "loss_hinge": loss_hinge.detach(),
+            "loss_mask_sat": loss_mask_sat.detach(),
         }
 
 
 def build_loss(hp: HParams) -> nn.Module:
-    """Pick the loss module based on `hp.loss_type`.
+    """Return the paper-faithful `AsymmetricL2Loss` (paper §3.3 + §4.2).
 
-    `"asym_l2"`     → `AsymmetricL2Loss` (paper-faithful, but vulnerable to
-                      the mask=1 collapse that motivated this branch).
-    `"sisdr_mel"`   → `SISDRMelLoss` (linear-mel SI-SDR; escape hatch for
-                      when asymmetric L2 can't escape the attractor).
+    The loss family is fixed to the asymmetric L2 the paper uses; we no
+    longer carry alternative backends.
     """
-    if hp.loss_type == "asym_l2":
-        return AsymmetricL2Loss(hp)
-    if hp.loss_type == "sisdr_mel":
-        return SISDRMelLoss(hp)
-    raise ValueError(
-        f"[losses] unknown loss_type={hp.loss_type!r}; "
-        "expected 'asym_l2' or 'sisdr_mel'."
-    )
+    return AsymmetricL2Loss(hp)

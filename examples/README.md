@@ -18,7 +18,7 @@ mixed audio file you want to separate. All three are 16 kHz mono WAVs.
 |---|------|---------------|
 | 01 | [`01_offline_separation.py`](01_offline_separation.py) | Load a checkpoint, separate a mixed WAV file, write the enhanced WAV. The simplest end-to-end path; matches the README's snippet but as a proper script. |
 | 02 | [`02_streaming_inference.py`](02_streaming_inference.py) | Frame-by-frame inference over a file or live microphone. The `StreamingVoiceFilter` wrapper keeps LSTM hidden state across calls. |
-| 03 | [`03_onnx_inference.py`](03_onnx_inference.py) | Run the exported ONNX model with `onnxruntime`, including the ECAPA → `dvec_proj` projection that lives outside the graph. Optional `--verify` flag cross-checks ONNX against PyTorch. |
+| 03 | [`03_onnx_inference.py`](03_onnx_inference.py) | Run the exported ONNX model with `onnxruntime`. The SpeakerEncoder produces the 256-d d-vector directly; the graph consumes it as-is (no in-graph projection). Optional `--verify` flag cross-checks ONNX against PyTorch. |
 | 04 | [`04_integration_mix_and_enhance.py`](04_integration_mix_and_enhance.py) | Integration test: synthesize N mixed clips from the actual training sources (LibriSpeech target + LibriSpeech / Musan interference, with RIR augmentation), run the model, and dump per-sample `target / enrollment / interference / mixed / enhanced` WAVs you can audition directly. |
 
 ## Common prerequisites
@@ -87,11 +87,12 @@ python examples/03_onnx_inference.py \
     --out        data/enhanced_onnx.wav
 ```
 
-The ONNX graph (built by `scripts/export_onnx.py`) takes the **already
-projected** 256-d d-vector plus the persistent LSTM (h, c). The script runs
-ECAPA on the enrollment clip and then `model.dvec_proj` to produce that vector.
-Pass `--verify` to also run PyTorch on the same prefix and assert the
-parity is below `--max-abs-err` (default 1e-3) — useful right after re-exporting.
+The ONNX graph (built by `scripts/export_onnx.py`) takes the 256-d
+d-vector produced directly by `SpeakerEncoder` plus the persistent LSTM
+(h, c). The graph input is named `"dvec"` (the speaker encoder's raw
+output). Pass `--verify` to also run PyTorch on the same prefix
+and assert the parity is below `--max-abs-err` (default 1e-3) — useful
+right after re-exporting.
 
 ## Notes on waveform reconstruction
 
@@ -114,8 +115,8 @@ This is the closest thing to a "press play and judge the model" workflow
 in the repo. For each of N samples the script:
 
 1. Samples a random target speaker from LibriSpeech (`config=clean`) and a
-   separate same-speaker utterance as the enrollment clip (ECAPA d-vector
-   source).
+   separate same-speaker utterance as the enrollment clip (d-vector
+   source via `SpeakerEncoder`).
 2. Samples interference from one of: LibriSpeech `other` split, Musan
    music, Musan noise, or Musan speech overlaid as babble (paper §3.4).
 3. Optionally convolves the target with a real (or procedural fallback)

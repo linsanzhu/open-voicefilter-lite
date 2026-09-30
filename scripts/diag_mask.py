@@ -40,6 +40,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.abspath(os.path.join(HERE, "..", "src")))
 
 from open_voicefilter_lite.audio import (
+    extract_dvec,
     make_mel_basis,
     pad_or_trim,
     random_crop,
@@ -53,7 +54,7 @@ from open_voicefilter_lite.dataset import (
 )
 from open_voicefilter_lite.hparams import HParams
 from open_voicefilter_lite.model import VoiceFilterLite
-from open_voicefilter_lite.speaker_encoder import FrozenSpeakerEncoder
+from open_voicefilter_lite.speaker_encoder import SpeakerEncoder
 
 
 # Threshold for input frame energy buckets (log-mel mean across bins).
@@ -356,7 +357,19 @@ def main() -> None:
     model = VoiceFilterLite(hp).to(device).eval()
     model.load_state_dict(ckpt["model_state"])
 
-    speaker_encoder = FrozenSpeakerEncoder(hp).to(device)
+    speaker_encoder = SpeakerEncoder(hp).to(device)
+    if Path(hp.dvector_pt_path).is_file():
+        speaker_encoder.load_pretrained(hp.dvector_pt_path)
+        print(f"[diag] SpeakerEncoder loaded from {hp.dvector_pt_path}")
+    else:
+        print(
+            f"[diag] WARNING: dvector weights not found at {hp.dvector_pt_path}; "
+            f"encoder will use RANDOM init. The pretrained embedder "
+            f"(`models/embedder.pt`) ships with this repo (from "
+            f"https://github.com/maum-ai/voicefilter)."
+        )
+        speaker_encoder.freeze()
+    print(f"[diag] d_vector_dim={hp.d_vector_dim}")
     mel_transform = make_mel_basis(hp, device=torch.device("cpu"))
 
     # ---- Collect masks & input energies ----
@@ -377,10 +390,11 @@ def main() -> None:
     for sample_i, (mixed, target, ref, _interference) in enumerate(
         build_eval_pairs(hp, args.num_samples, hp.seed)
     ):
-        # Compute d-vector.
-        ref_for_dvec = pad_or_trim(ref, int(0.5 * hp.sample_rate))
+        # Compute d-vector (full ref, capped at ref_max_sec; the VoiceFilter
+        # d-vector recipe expects arbitrary-length refs).
+        ref_for_dvec = pad_or_trim(ref, int(hp.ref_max_sec * hp.sample_rate))
         with torch.no_grad():
-            dvec = speaker_encoder(ref_for_dvec.unsqueeze(0).to(device)).squeeze(0)
+            dvec = extract_dvec(ref_for_dvec, hp, speaker_encoder, device=device).squeeze(0)
 
         # Install the mask-capture hook on `out_proj`. The streaming
         # pipeline calls `model.out_proj(x)` once per frame inside

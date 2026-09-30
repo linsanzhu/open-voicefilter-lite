@@ -31,7 +31,7 @@ frame_stack: 4
 
 # ---- Data / mixture ----
 sample_length_sec: 3.0 # paper Fig 2: "segment of 3 seconds during training"
-snr_min_db: -1.0 # paper §3.2: "random within -1dB to 10dB"
+snr_min_db: 1.0 # paper §3.2 / slides p.29: "SNR 1dB~10dB" (×3)
 snr_max_db: 10.0
 silent_target_prob: 0.10 # train the "do nothing" mode
 silent_interference_prob: 0.10
@@ -92,9 +92,29 @@ ema_decay: 0.999
 ema_warmup_steps: 100
 
 # ---- Loss (paper §3.3 — asymmetric L2, α = 10) ----
-# g_asym(x, α) = α·x if x > 0 else x; loss = mean(g_asym(target - pred, α)²)
-# Over-suppression errors (S_enh < S_cln) are amplified by α² = 100.
+# g_asym(x, α) = α·x if x > 0 else x; loss = Σ_t Σ_f g_asym(...)² (paper §3.3
+# Eq. 3 — literal sum, NOT per-element mean). Over-suppression errors
+# (S_enh < S_cln) are amplified by α² = 100. Magnitude of L_asym is now
+# ~T·F larger than the legacy mean() variant, so `hinge_loss_weight` is
+# calibrated down to ~1/(T·F) of the old default.
 loss_alpha: 10.0
+
+# ---- Optional paper-aligned toggles (paper §3.2) ----
+# These knobs opt into the paper's literal topology and mask formula.
+# All three default ON in HParams (paper-faithful); we still expose them
+# here so a paper-faithful config can flip them OFF for backwards
+# compatibility with already-trained checkpoints.
+#
+# `use_cnn`: when true, inserts `num_cnn_layers` stacked Conv1d (kernel
+# `cnn_kernel_size`, intermediate channels `cnn_channels_first`, last
+# layer outputs `hidden_dim` to feed the LSTM directly) between `in_norm`
+# and the LSTM stack. Paper §3.2 lists 1D conv layers as part of the
+# topology; §4.4 notes "most of our models actually remove these CNN
+# layers". Default OFF in HParams matches the 2.2 MB production variant.
+# Flip ON here for paper §3.2 literal (2 stacked Conv1d, paper Figure 2).
+use_cnn: true
+num_cnn_layers: 2
+cnn_kernel_size: 3
 
 # ---- Noise-type predictor (paper §4.2 / §3.4) ----
 # Trained with hinge loss for per-frame binary classification
@@ -102,12 +122,37 @@ loss_alpha: 10.0
 # the adaptive suppression `w^(t)` per §3.4 — this is what gives the paper
 # its "always harmless and sometimes helpful" production behaviour.
 use_noise_type_predictor: true
-hinge_loss_weight:
-  0.1 # paper doesn't specify; 0.1 keeps hinge in the same
-  # magnitude band as L_asym so neither term is starved.
+# Paper §3.4: f_adapt(S_in^(t)) — the noise-type predictor's primary
+# input is the **current frame's noisy filterbank** (80-d). Paper §4.2
+# also allows the LSTM-output variant; we keep that as a fallback via
+# `alpha_head_use_current_frame=False` for backward compatibility with
+# already-trained checkpoints that fed the LSTM hidden state.
+alpha_head_use_current_frame: true
+# With L_asym now summed (paper §3.3 Σ_t Σ_f, see losses.py) the
+# asym term is ~T·F larger than the legacy mean() — calibrate the
+# hinge weight accordingly. sample_length=3s, hop=10ms, n_mels=80 →
+# ~1/(T·F) ≈ 4e-5. 1e-5 is a slightly hinge-favouring starting point.
+hinge_loss_weight: 1.0e-5
 adaptive_w_beta: 0.8 # paper §4.4 "moving average coefficient β = 0.8"
 adaptive_w_a: 1.0 # paper §3.4 linear transform "a > 0"
 adaptive_w_b: 0.0 # paper §3.4 linear transform "b ≥ 0"
+
+# ---- Per-frame activity bursts (paper §4.2 / deviation 5) ----
+# The noise-type predictor's per-frame label is +1 where BOTH target and
+# interference burst windows cover the frame centre, -1 elsewhere.
+# Bursts are drawn uniformly within [burst_min, burst_max] seconds and
+# gated by a soft 0/1 mask with `activity_fade_ms` fade in/out (avoids
+# click artefacts).
+activity_burst_min_sec: 0.5
+activity_burst_max_sec: 3.0
+activity_fade_ms: 50.0
+
+# ---- Data source (paper §3.2 — VCTK for clean speech) ----
+# Paper uses VCTK as the target clean-speech source and LibriSpeech as
+# the interference source. Set `target_source: vctk` for paper fidelity
+# (`scripts/download_data.py --assets vctk` pre-populates the cache).
+target_source: vctk
+vctk_repo: CSTR-Edinburgh/vctk
 
 # ---- Misc ----
 seed: 1234
@@ -115,7 +160,7 @@ device: cuda # use "mps" on Apple Silicon
 
 # ---- HF Hub endpoint (network mirror) ----
 # Default behaviour: every HF pull (`openslr/librispeech_asr`,
-# `corypaik/musan`, `quinnlue/rirs`, `speechbrain/spkrec-ecapa-voxceleb`)
+# `corypaik/musan`, `quinnlue/rirs`)
 # goes to `https://huggingface.co`. If your network can't reach that
 # host (common in mainland China without a VPN), point `hf_endpoint` at
 # a mirror so all HF traffic is redirected. Precedence is
@@ -134,9 +179,11 @@ device: cuda # use "mps" on Apple Silicon
 
 # ---- DataLoader parallelism (CUDA-only; keep 0 on MPS) ----
 # 4 background prefetcher processes. Each runs its own dataset instance
-# (its own HF stream, its own dvec cache, its own RNG seeded by worker_id),
-# collates batches on CPU, and pushes onto a shared queue. The main train
-# thread consumes from the queue without ever blocking on audio decode.
+# (its own HF stream, its own RNG seeded by worker_id), collates batches
+# on CPU, and pushes onto a shared queue. The main train thread consumes
+# from the queue without ever blocking on audio decode. SpeakerEncoder
+# itself runs on the main thread via `audio.extract_dvec(...)` so it
+# stays MPS-safe (no cross-thread MPS).
 # Caveat: `streaming=True` × 4 workers = 4× HF egress bandwidth; switch
 # `streaming` to `false` if your link can't keep up.
 dataloader_workers: 4
