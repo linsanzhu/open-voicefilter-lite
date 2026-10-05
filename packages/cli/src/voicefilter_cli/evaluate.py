@@ -9,29 +9,27 @@ Metrics
 
 Usage
 -----
-    python scripts/evaluate.py --checkpoint runs/exp1/ckpt_step050000.pt
-    python scripts/evaluate.py --checkpoint runs/exp1/ckpt_final.pt --num-samples 50
+    `voicefilter-cli evaluate` --checkpoint runs/exp1/ckpt_step050000.pt
+    `voicefilter-cli evaluate` --checkpoint runs/exp1/ckpt_final.pt --num-samples 50
 """
 
 from __future__ import annotations
 
-import argparse
 import io
 import json
 import os
 import random
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import Annotated, Iterator, Optional
 
 import numpy as np
 import soundfile as sf
 import torch
+from cyclopts import App, Parameter
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.abspath(os.path.join(HERE, "..", "src")))
-
-from open_voicefilter_lite.audio import (
+from voicefilter_lite.audio import (
     extract_dvec,
     make_mel_basis,
     pad_or_trim,
@@ -39,19 +37,24 @@ from open_voicefilter_lite.audio import (
     snr_mix,
     wav_to_log_mel,
 )
-from open_voicefilter_lite.cli import apply_hf_endpoint
-from open_voicefilter_lite.dataset import (
+from voicefilter_cli.dataset import first_librispeech_other_source
+from voicefilter_cli.hf import apply_hf_endpoint
+from voicefilter_cli.dataset import (
     _cast_audio_no_decode,
     _disable_hf_audio_decode,
 )
-from open_voicefilter_lite.hparams import HParams
-from open_voicefilter_lite.model import VoiceFilterLite
-from open_voicefilter_lite.streaming import StreamingVoiceFilter
-from open_voicefilter_lite.speaker_encoder import SpeakerEncoder
-
+from voicefilter_cli.local_pool import (
+    DEFAULT_POOL_ROOT,
+    LocalLibriSpeechPool,
+    has_local_pool,
+    resolve_eval_pair,
+)
+from voicefilter_lite.hparams import HParams, resolve_source
+from voicefilter_lite.model import VoiceFilterLite
+from voicefilter_lite.streaming import StreamingVoiceFilter
+from voicefilter_lite.speaker_encoder import SpeakerEncoder
 
 # ---- SI-SNR / SDR ----
-
 
 def si_snr(estimate: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> float:
     """Scale-invariant SNR (dB). Both inputs are (T,) mono."""
@@ -63,13 +66,11 @@ def si_snr(estimate: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> f
     noise = estimate - proj
     return 10.0 * torch.log10(proj.pow(2).sum() / (noise.pow(2).sum() + eps) + eps)
 
-
 def sdr(estimate: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> float:
     """Plain SDR without scale invariance."""
     return 10.0 * torch.log10(
         target.pow(2).sum() / ((estimate - target).pow(2).sum() + eps) + eps
     )
-
 
 def log_mel_snr(
     estimate: torch.Tensor,
@@ -78,7 +79,7 @@ def log_mel_snr(
     eps: float = 1e-8,
 ) -> tuple[float, float, float]:
     """Compute SI-SNR in the **linear-mel** domain. The model itself operates
-    on linear-mel filterbank energies (`VoiceFilterLite._apply_mask` applies
+    on linear-mel filterbank energies (`voicefilter_lite.model.apply_mask` applies
     the mask to magnitude then re-logs), so this metric is the cleanest
     phase-free proxy for how well VoiceFilter recovers the target's spectral
     envelope.
@@ -112,9 +113,7 @@ def log_mel_snr(
     snr_out = _snr_db(est_lin, tgt_lin)
     return snr_in, snr_out, snr_out - snr_in
 
-
 # ---- Audio decoding ----
-
 
 def decode_audio(audio_field: dict, target_sr: int) -> torch.Tensor:
     if isinstance(audio_field, dict):
@@ -142,56 +141,151 @@ def decode_audio(audio_field: dict, target_sr: int) -> torch.Tensor:
         wav = wav / peak
     return wav
 
-
 # ---- Main eval loop ----
-
 
 def build_eval_pairs(
     hp: HParams,
     num_samples: int,
     seed: int,
+    use_local_pool: bool = True,
+    pool_root: str = str(DEFAULT_POOL_ROOT),
 ) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
     """Yield (mixed_wav, target_wav, ref_wav, interference_wav) tuples.
 
     target + ref come from the same speaker (ref for d-vector),
     interference is a different speaker from the other split.
+
+    When `use_local_pool=True` (default), reads wavs directly from
+    `<pool_root>/target/librispeech/clean/{split}/...` and
+    `<pool_root>/pool/librispeech/other/{split}/...` — the tree
+    produced by `scripts/prepare_dataset.py`. No HF traffic, ~0 ms
+    network overhead, identical fidelity to what training consumed.
+
+    Falls back to HF streaming when either pool is missing
+    (`use_local_pool=False` forces the legacy path).
     """
     from datasets import load_dataset
     from itertools import chain
 
+    # Resolve target + interference SourceRefs against the top-level
+    # `dataset.sources` declarations (used in the HF fallback).
+    if not hp.target_sources:
+        raise RuntimeError("[evaluate] hp.target_sources is empty")
+    target_resolved = resolve_source(hp, hp.target_sources[0])
+    inter_resolved = first_librispeech_other_source(hp)
+
+    # ---- Try local pool first ----
+    pool_path = Path(pool_root)
+    # paper.yaml sets target split = train.clean.360, interference = train.other.500
+    target_split = target_resolved.splits[0] if target_resolved.splits else "train.clean.360"
+    inter_split = (
+        inter_resolved.splits[0] if (inter_resolved and inter_resolved.splits) else "train.other.500"
+    )
+
+    use_pool = use_local_pool and (
+        has_local_pool(root=pool_path, role="clean", split=target_split)
+        and has_local_pool(root=pool_path, role="other", split=inter_split)
+    )
+    if use_local_pool and not use_pool:
+        print(
+            f"[evaluate] WARNING: --use-local-pool requested but the baked "
+            f"pool is missing under {pool_path}/. "
+            f"Falling back to HF streaming. (Run `scripts/prepare_dataset.py` "
+            f"to bake the pool.)"
+        )
+
+    rng = random.Random(seed)
+
+    if use_pool:
+        # ---- Local-pool path ----
+        target_pool, inter_pool = resolve_eval_pair(
+            pool_root=pool_path,
+            target_role="clean",
+            target_split=target_split,
+            inter_role="other",
+            inter_split=inter_split,
+        )
+        spk_buf: dict[str, list[torch.Tensor]] = {}
+
+        n = 0
+        # We over-pull from both pools until we have `num_samples` mixed
+        # wavs. The legacy HF path consumed one row from each per
+        # sample; the pool equivalent is two random picks (target,
+        # interference) plus a separate ref pick from the same speaker.
+        while n < num_samples:
+            tgt_spk, tgt_path = target_pool.random_path(rng)
+            buf = spk_buf.setdefault(tgt_spk, [])
+            if len(buf) < 4:
+                buf.append(tgt_path)
+                continue
+            ref_path = rng.choice(buf)
+            _, intf_path = inter_pool.random_path(rng)
+            try:
+                # Re-decode each time (cheap on SSD-backed pools; ~ms each).
+                target_wav = _read_pool_wav(tgt_path)
+                interference_wav = _read_pool_wav(intf_path)
+                ref_wav = _read_pool_wav(ref_path)
+            except Exception:
+                continue
+
+            sample_len = hp.sample_length_samples
+            target_wav = random_crop(target_wav, sample_len)
+            interference_wav = random_crop(interference_wav, sample_len)
+            snr = rng.uniform(hp.snr_min_db, hp.snr_max_db)
+            mixed = snr_mix(target_wav, interference_wav, snr)
+
+            yield mixed, target_wav, ref_wav, interference_wav
+            n += 1
+        return
+
+    # ---- HF streaming fallback (legacy path) ----
     # `cache_dir` is honoured by `load_dataset` only when `streaming=False`;
-    # when streaming, the rows come straight from the HF Hub stream. The
-    # `librispeech_cache` field on HParams points at the on-disk arrow
-    # cache populated by `scripts/download_data.py`.
-    load_kwargs: dict = {"streaming": hp.streaming}
-    if not hp.streaming:
-        load_kwargs["cache_dir"] = hp.librispeech_cache
+    # when streaming, the rows come straight from the HF Hub stream. We
+    # build a kwargs dict per source so target / interference can point at
+    # different caches if a config wants that.
+    def _load_kwargs(cache_dir: str) -> dict:
+        kw: dict = {"streaming": hp.streaming}
+        if not hp.streaming:
+            kw["cache_dir"] = cache_dir or "data/librispeech"
+        return kw
 
     # Disable HF datasets' eager torchcodec/FFmpeg audio decode so we can
     # hand the bytes to `soundfile` (which is already used by
     # `decode_audio` below) — see `dataset._disable_hf_audio_decode`.
     _disable_hf_audio_decode()
 
-    def _load(config: str, split: str):
-        ds = load_dataset(
-            "openslr/librispeech_asr",
-            config,
-            split=split,
-            **load_kwargs,
-        )
+    def _load(repo: str, config: str, split: str, cache_dir: str):
+        ds = load_dataset(repo, config, split=split, **_load_kwargs(cache_dir))
         return _cast_audio_no_decode(ds)
 
+    # Target: use the first declared target source (function-oriented
+    # `hp.target_sources`). Eval scripts assume a single LibriSpeech
+    # target pool; multi-source targets would need a per-source rotation.
+    # LibriSpeech is loaded via the `all` config — the role tag (`clean` /
+    # `other`) lives in the split name (`train.clean.360`).
+    assert target_resolved.is_librispeech(), (
+        f"eval target must be a LibriSpeech source; got {target_resolved}"
+    )
     target_iter = iter(
         chain.from_iterable(
-            _load(hp.target_config, s) for s in hp.target_splits
+            _load(target_resolved.repo, "all", s, target_resolved.cache_dir)
+            for s in target_resolved.splits
         )
     )
+    # Interference: pick the first enabled LibriSpeech `other` source from
+    # `hp.interference` (the canonical "other" pool used by `babble` in
+    # paper.yaml).
+    assert inter_resolved.is_librispeech(), (
+        f"eval interference must be a LibriSpeech source; got {inter_resolved}"
+    )
     interference_iter = iter(
-        _load(hp.interference_config, hp.interference_split)
+        _load(
+            inter_resolved.repo, "all",
+            inter_resolved.splits[0], inter_resolved.cache_dir,
+        )
     )
 
-    rng = random.Random(seed)
-    spk_buf: dict[str, dict] = {}
+    spk_buf_hf: dict[str, dict] = {}
 
     n = 0
     while n < num_samples:
@@ -202,7 +296,7 @@ def build_eval_pairs(
             return
 
         spk = str(tgt.get("speaker_id", rng.randint(0, 10_000)))
-        buf = spk_buf.setdefault(spk, [])
+        buf = spk_buf_hf.setdefault(spk, [])
         if len(buf) < 4:
             buf.append(tgt)
             continue
@@ -225,14 +319,31 @@ def build_eval_pairs(
         n += 1
 
 
-def evaluate(hp: HParams, args: argparse.Namespace) -> None:
-    device = torch.device(hp.device if torch.backends.mps.is_available() or torch.cuda.is_available() else "cpu")
+def _read_pool_wav(path) -> torch.Tensor:
+    """Read a baked-pool wav → (T,) float32 at 16 kHz mono. The pool is
+    always 16 kHz mono (enforced by `prepare_dataset.py`), so no resample."""
+    import soundfile as sf
+    data, _sr = sf.read(str(path), dtype="float32")
+    if data.ndim > 1:
+        data = data.mean(axis=1)
+    return torch.from_numpy(data)
+
+def evaluate(hp: HParams, args: "EvalArgs") -> None:
+    # Auto-detect device at runtime unless `--device` forces one.
+    if args.device == "auto":
+        if torch.backends.mps.is_available():
+            device = torch.device("mps")
+        elif torch.cuda.is_available():
+            device = torch.device("cuda")
+        else:
+            device = torch.device("cpu")
+    else:
+        device = torch.device(args.device)
     print(f"[eval] device={device}")
 
     # Load checkpoint.
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     hp = HParams.from_dict(ckpt["hparams"])
-    hp.device = str(device)
 
     # Resolve HF endpoint after hp is rebuilt from the checkpoint — the ckpt
     # may carry a different `hf_endpoint` than the default HParams, and that's
@@ -276,7 +387,13 @@ def evaluate(hp: HParams, args: argparse.Namespace) -> None:
     log_mel_snr_out: list[float] = []
 
     for i, (mixed, target, ref, interference) in enumerate(
-        build_eval_pairs(hp, args.num_samples, hp.seed)
+        build_eval_pairs(
+            hp,
+            args.num_samples,
+            hp.seed,
+            use_local_pool=getattr(args, "use_local_pool", True),
+            pool_root=getattr(args, "pool_root", str(DEFAULT_POOL_ROOT)),
+        )
     ):
         # Compute d-vector from ref. The VoiceFilter d-vector recipe expects
         # arbitrary-length refs (it does its own windowed aggregation),
@@ -380,7 +497,6 @@ def evaluate(hp: HParams, args: argparse.Namespace) -> None:
     if args.results_json:
         Path(args.results_json).write_text(json.dumps(summary, indent=2))
 
-
 def _logmel_to_wav(
     log_mel: torch.Tensor,
     hp: HParams,
@@ -398,7 +514,7 @@ def _logmel_to_wav(
     iterative `InverseMelScale(max_iter, tolerance_loss, tolerance_change)`
     constructor; the newer API (>=2.10) dropped those kwargs and uses a
     direct LAPACK `gels` solve that fails on rank-deficient filterbank
-    matrices — which is exactly our case (n_mels=80, n_freq//2+1=201, so
+    matrices — which is exactly our case (n_mels=128, n_freq//2+1=201, so
     the basis is rectangular). Doing the pseudoinverse ourselves is more
     robust and matches what the old iterative constructor converged on.
     """
@@ -426,33 +542,107 @@ def _logmel_to_wav(
     # Align length to `mixed` (the caller expects same length).
     return wav
 
+@dataclass
+class EvalArgs:
+    """Typed CLI surface for ``evaluate voicefilter-lite``."""
 
-def main() -> None:
-    p = argparse.ArgumentParser(description="Evaluate VoiceFilter-Lite")
-    p.add_argument("--checkpoint", required=True)
-    p.add_argument("--num-samples", type=int, default=200)
-    p.add_argument("--device", type=str, default="mps")
-    p.add_argument("--results-json", type=str, default=None)
-    p.add_argument("--gl-iter", type=int, default=10)
-    p.add_argument("--no-adaptive", action="store_true",
-                   help="Disable adaptive suppression (use raw mask).")
-    # Highest-priority HF endpoint override — see `cli.apply_hf_endpoint`.
-    p.add_argument("--hf-endpoint", type=str, default=None,
-                   help="Override HF Hub base URL (e.g. https://hf-mirror.com).")
-    # HF hf_transfer protocol toggle. Default is whatever the env says;
-    # use --no-hf-transfer when targeting a mirror that doesn't support it.
-    xf = p.add_mutually_exclusive_group()
-    xf.add_argument("--hf-transfer", dest="hf_transfer", action="store_true",
-                    default=None,
-                    help="Force-enable HF hf_transfer protocol.")
-    xf.add_argument("--no-hf-transfer", dest="hf_transfer", action="store_false",
-                    help="Force-disable HF hf_transfer protocol.")
-    args = p.parse_args()
+    checkpoint: str
+    num_samples: int = 200
+    device: str = "auto"
+    results_json: Optional[str] = None
+    gl_iter: int = 10
+    no_adaptive: bool = False
+    hf_endpoint: Optional[str] = None
+    hf_transfer: Optional[bool] = None
+    use_local_pool: bool = True
+    pool_root: str = str(DEFAULT_POOL_ROOT)
 
+
+app = App(name="voicefilter-lite", help_format="plaintext")
+
+
+@app.default
+def main(
+    checkpoint: Annotated[str, Parameter(help="VoiceFilter-Lite trained ckpt_*.pt.")],
+    *,
+    num_samples: Annotated[
+        int, Parameter(name="--num-samples", help="Number of evaluation samples (target/interference pairs).")
+    ] = 200,
+    device: Annotated[
+        str,
+        Parameter(
+            name="--device",
+            help="Force a device (mps / cuda / cpu). Default 'auto' picks "
+                 "MPS → CUDA → CPU based on availability.",
+        ),
+    ] = "auto",
+    results_json: Annotated[
+        Optional[str],
+        Parameter(name="--results-json", help="Write summary metrics to this JSON file path."),
+    ] = None,
+    gl_iter: Annotated[
+        int,
+        Parameter(
+            name="--gl-iter",
+            help="Griffin-Lim iterations (used for time-domain SI-SNR/SDR approximation).",
+        ),
+    ] = 10,
+    no_adaptive: Annotated[
+        bool,
+        Parameter(
+            negative="",
+            name="--no-adaptive",
+            help="Disable per-frame adaptive suppression (isolate the raw mask's contribution).",
+        ),
+    ] = False,
+    hf_endpoint: Annotated[
+        Optional[str],
+        Parameter(
+            name="--hf-endpoint",
+            help="Override HF Hub base URL (e.g. https://hf-mirror.com).",
+        ),
+    ] = None,
+    hf_transfer: Annotated[
+        Optional[bool],
+        Parameter(negative="--no-hf-transfer", help="Force-enable HF hf_transfer protocol."),
+    ] = None,
+    use_local_pool: Annotated[
+        bool,
+        Parameter(
+            name="--use-local-pool",
+            help="Read LibriSpeech wavs from the baked pool at <pool-root>/ "
+                 "(default: data/processed). Requires prepare_dataset.py to "
+                 "have baked both target/librispeech/clean/<split>/ and "
+                 "pool/librispeech/other/<split>/.",
+        ),
+    ] = True,
+    pool_root: Annotated[
+        str,
+        Parameter(
+            name="--pool-root",
+            help="Root of the baked pool (default: data/processed).",
+        ),
+    ] = str(DEFAULT_POOL_ROOT),
+) -> None:
+    """Evaluate a trained VoiceFilter-Lite checkpoint on LibriSpeech.
+
+    Metrics: SI-SNR / SDR / log-mel SNR improvements over the mixed signal.
+    """
+    args = EvalArgs(
+        checkpoint=checkpoint,
+        num_samples=num_samples,
+        device=device,
+        results_json=results_json,
+        gl_iter=gl_iter,
+        no_adaptive=no_adaptive,
+        hf_endpoint=hf_endpoint,
+        hf_transfer=hf_transfer,
+        use_local_pool=use_local_pool,
+        pool_root=pool_root,
+    )
     hp = HParams()
-    hp.device = args.device
     evaluate(hp, args)
 
 
 if __name__ == "__main__":
-    main()
+    app()

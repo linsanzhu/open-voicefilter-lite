@@ -14,14 +14,13 @@ mask value the model emits. Then print:
 
 Usage
 -----
-    python scripts/diag_mask.py --checkpoint runs/mps/ckpt_step047000.pt
-    python scripts/diag_mask.py --checkpoint runs/mps/ckpt_final.pt \\
+    `voicefilter-cli diag-mask` --checkpoint runs/mps/ckpt_step047000.pt
+    `voicefilter-cli diag-mask` --checkpoint runs/mps/ckpt_final.pt \\
         --num-samples 100 --results-json mask_stats.json
 """
 
 from __future__ import annotations
 
-import argparse
 import io
 import json
 import os
@@ -30,16 +29,14 @@ import sys
 from collections import defaultdict
 from itertools import chain
 from pathlib import Path
-from typing import Iterator
+from typing import Annotated, Iterator, Optional
 
 import numpy as np
 import soundfile as sf
 import torch
+from cyclopts import App, Parameter
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.abspath(os.path.join(HERE, "..", "src")))
-
-from open_voicefilter_lite.audio import (
+from voicefilter_lite.audio import (
     extract_dvec,
     make_mel_basis,
     pad_or_trim,
@@ -47,15 +44,15 @@ from open_voicefilter_lite.audio import (
     snr_mix,
     wav_to_log_mel,
 )
-from open_voicefilter_lite.cli import apply_hf_endpoint
-from open_voicefilter_lite.dataset import (
+from voicefilter_cli.hf import apply_hf_endpoint
+from voicefilter_cli.dataset import (
     _cast_audio_no_decode,
     _disable_hf_audio_decode,
+    first_librispeech_other_source,
 )
-from open_voicefilter_lite.hparams import HParams
-from open_voicefilter_lite.model import VoiceFilterLite
-from open_voicefilter_lite.speaker_encoder import SpeakerEncoder
-
+from voicefilter_lite.hparams import HParams, resolve_source
+from voicefilter_lite.model import VoiceFilterLite
+from voicefilter_lite.speaker_encoder import SpeakerEncoder
 
 # Threshold for input frame energy buckets (log-mel mean across bins).
 # log_mel_floor=1e-6 → log(1e-6)≈-13.8 is the absolute silence floor.
@@ -70,11 +67,10 @@ ENERGY_BUCKETS: list[tuple[str, float, float]] = [
     ("high",      0.0,       float("inf")),
 ]
 
-
 def decode_audio(audio_field: dict, target_sr: int) -> torch.Tensor:
     """Decode HF audio bytes → mono float32 tensor at target_sr.
 
-    Mirrors `open_voicefilter_lite.dataset._decode_audio` so this script
+    Mirrors `voicefilter_cli.dataset._decode_audio` so this script
     behaves identically to the training-time path (handles dict-with-bytes,
     dict-with-array, and AudioDecoder-with-bytes/path). The latter shows up
     if `_disable_hf_audio_decode` monkey-patch didn't apply for any reason.
@@ -138,7 +134,6 @@ def decode_audio(audio_field: dict, target_sr: int) -> torch.Tensor:
         wav = wav / peak
     return wav
 
-
 def _soundfile_fallback(audio_field, target_sr: int):
     """Last-resort: try soundfile on an AudioDecoder's `.bytes` / `.path`."""
     try:
@@ -163,34 +158,57 @@ def _soundfile_fallback(audio_field, target_sr: int):
     except Exception:
         return None
 
-
 def build_eval_pairs(
     hp: HParams,
     num_samples: int,
     seed: int,
 ) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
-    """Same construction as `scripts/evaluate.build_eval_pairs`."""
+    """Same construction as `scripts/evaluate.build_eval_pairs`.
+
+    Target + interference specs are resolved against `hp.dataset.sources`
+    (`HfSourceSpec` by `id`) before any HF load — each gets its own
+    `repo` / `configs` / `splits` / `cache_dir`.
+    """
     from datasets import load_dataset
 
-    load_kwargs: dict = {"streaming": hp.streaming}
-    if not hp.streaming:
-        load_kwargs["cache_dir"] = hp.librispeech_cache
+    if not hp.target_sources:
+        raise RuntimeError("[diag] hp.target_sources is empty")
+    target_resolved = resolve_source(hp, hp.target_sources[0])
+    # Interference: first enabled LibriSpeech `other` source under any TYPE.
+    inter_resolved = first_librispeech_other_source(hp)
+
+    def _load_kwargs(cache_dir: str) -> dict:
+        kw: dict = {"streaming": hp.streaming}
+        if not hp.streaming:
+            kw["cache_dir"] = cache_dir or "data/librispeech"
+        return kw
 
     _disable_hf_audio_decode()
 
-    def _load(config: str, split: str):
-        ds = load_dataset(
-            "openslr/librispeech_asr",
-            config,
-            split=split,
-            **load_kwargs,
-        )
+    def _load(repo: str, config: str, split: str, cache_dir: str):
+        ds = load_dataset(repo, config, split=split, **_load_kwargs(cache_dir))
         return _cast_audio_no_decode(ds)
 
-    target_iter = iter(
-        chain.from_iterable(_load(hp.target_config, s) for s in hp.target_splits)
+    # LibriSpeech is loaded via the `all` config — the role tag (`clean` /
+    # `other`) lives in the split name (`train.clean.360`).
+    assert target_resolved.is_librispeech(), (
+        f"diag target must be a LibriSpeech source; got {target_resolved}"
     )
-    interference_iter = iter(_load(hp.interference_config, hp.interference_split))
+    target_iter = iter(
+        chain.from_iterable(
+            _load(target_resolved.repo, "all", s, target_resolved.cache_dir)
+            for s in target_resolved.splits
+        )
+    )
+    assert inter_resolved.is_librispeech(), (
+        f"diag interference must be a LibriSpeech source; got {inter_resolved}"
+    )
+    interference_iter = iter(
+        _load(
+            inter_resolved.repo, "all",
+            inter_resolved.splits[0], inter_resolved.cache_dir,
+        )
+    )
 
     # Probe the first row so we can fail loudly if the schema is wrong
     # (instead of silently consuming the whole iterator on bad `audio`).
@@ -280,7 +298,6 @@ def build_eval_pairs(
         print(f"[diag] hit max_attempts={max_attempts} with only "
               f"{n}/{num_samples} samples; last_decode_err={last_decode_err}")
 
-
 def _mask_per_frame_hook(model: VoiceFilterLite) -> dict:
     """Install a forward hook on `model.out_proj` so we capture every sigmoid
     mask the model emits during streaming inference (without re-running the
@@ -304,7 +321,6 @@ def _mask_per_frame_hook(model: VoiceFilterLite) -> dict:
     store["__handle__"] = handle
     return store
 
-
 def _print_histogram(counts: np.ndarray, total: int, n_buckets: int = 10) -> str:
     """ASCII histogram. `counts[i]` = #samples in bucket i."""
     width = 50
@@ -322,42 +338,60 @@ def _print_histogram(counts: np.ndarray, total: int, n_buckets: int = 10) -> str
         )
     return "\n".join(lines)
 
-
 def _format_pct(p: float) -> str:
     return f"{100.0 * p:5.2f}%"
 
+app = App(name="diag-mask", help_format="plaintext")
 
-def main() -> None:
-    p = argparse.ArgumentParser(description="Diagnose mask distribution of a VoiceFilter ckpt")
-    p.add_argument("--checkpoint", required=True)
-    p.add_argument("--num-samples", type=int, default=50,
-                   help="Number of LibriSpeech (target, interference) pairs.")
-    p.add_argument("--device", type=str, default="mps")
-    p.add_argument("--results-json", type=str, default=None,
-                   help="If set, dump stats to this JSON file.")
-    p.add_argument("--n-bins-show", type=int, default=16,
-                   help="Number of mel-bin groups in the per-bin report "
-                        "(bins are averaged within each group for readability).")
-    p.add_argument("--hf-endpoint", type=str, default=None)
-    args = p.parse_args()
 
-    device = torch.device(args.device)
+@app.default
+def main(
+    *,
+    checkpoint: Annotated[
+        str, Parameter(help="Path to a VoiceFilter-Lite checkpoint (.pt).")
+    ],
+    num_samples: Annotated[
+        int, Parameter(name="--num-samples", help="Number of LibriSpeech (target, interference) pairs.")
+    ] = 50,
+    device: Annotated[
+        str, Parameter(help="Force a device (mps / cuda / cpu). Default 'auto' picks MPS → CUDA → CPU.")
+    ] = "auto",
+    results_json: Annotated[
+        Optional[str], Parameter(name="--results-json", help="If set, dump stats to this JSON file.")
+    ] = None,
+    n_bins_show: Annotated[
+        int, Parameter(name="--n-bins-show", help="Number of mel-bin groups in the per-bin report.")
+    ] = 16,
+    hf_endpoint: Annotated[
+        Optional[str], Parameter(name="--hf-endpoint", help="Override HF Hub base URL (e.g. https://hf-mirror.com).")
+    ] = None,
+) -> None:
+    """Diagnose mask distribution of a VoiceFilter ckpt."""
+    # Auto-detect device unless forced via `--device`.
+    if device == "auto":
+        if torch.backends.mps.is_available():
+            device_obj = torch.device("mps")
+        elif torch.cuda.is_available():
+            device_obj = torch.device("cuda")
+        else:
+            device_obj = torch.device("cpu")
+    else:
+        device_obj = torch.device(device)
 
-    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    ckpt = torch.load(checkpoint, map_location=device_obj, weights_only=False)
     hp = HParams.from_dict(ckpt["hparams"])
-    hp.device = str(device)
 
     apply_hf_endpoint(
         hp,
-        cli_override=args.hf_endpoint,
+        cli_override=hf_endpoint,
         cli_transfer=None,
     )
 
-    print(f"[diag] loading {args.checkpoint} (step={ckpt.get('step')}) on {device}")
-    model = VoiceFilterLite(hp).to(device).eval()
+    print(f"[diag] loading {checkpoint} (step={ckpt.get('step')}) on {device_obj}")
+    model = VoiceFilterLite(hp).to(device_obj).eval()
     model.load_state_dict(ckpt["model_state"])
 
-    speaker_encoder = SpeakerEncoder(hp).to(device)
+    speaker_encoder = SpeakerEncoder(hp).to(device_obj)
     if Path(hp.dvector_pt_path).is_file():
         speaker_encoder.load_pretrained(hp.dvector_pt_path)
         print(f"[diag] SpeakerEncoder loaded from {hp.dvector_pt_path}")
@@ -388,20 +422,20 @@ def main() -> None:
     n_frames_collected = 0
 
     for sample_i, (mixed, target, ref, _interference) in enumerate(
-        build_eval_pairs(hp, args.num_samples, hp.seed)
+        build_eval_pairs(hp, num_samples, hp.seed)
     ):
         # Compute d-vector (full ref, capped at ref_max_sec; the VoiceFilter
         # d-vector recipe expects arbitrary-length refs).
         ref_for_dvec = pad_or_trim(ref, int(hp.ref_max_sec * hp.sample_rate))
         with torch.no_grad():
-            dvec = extract_dvec(ref_for_dvec, hp, speaker_encoder, device=device).squeeze(0)
+            dvec = extract_dvec(ref_for_dvec, hp, speaker_encoder, device=device_obj).squeeze(0)
 
         # Install the mask-capture hook on `out_proj`. The streaming
         # pipeline calls `model.out_proj(x)` once per frame inside
         # `_run_model`, so the hook fires every frame.
         store = _mask_per_frame_hook(model)
         try:
-            from open_voicefilter_lite.streaming import StreamingVoiceFilter
+            from voicefilter_lite.streaming import StreamingVoiceFilter
             sf_model = StreamingVoiceFilter(model, hp)
             sf_model.set_dvector(dvec)
 
@@ -443,7 +477,7 @@ def main() -> None:
         n_frames_collected += T
 
         if (sample_i + 1) % 10 == 0:
-            print(f"[diag] processed {sample_i + 1}/{args.num_samples} samples "
+            print(f"[diag] processed {sample_i + 1}/{num_samples} samples "
                   f"(frames so far: {n_frames_collected})")
 
     if not all_masks:
@@ -457,7 +491,7 @@ def main() -> None:
     # ---- Report ----
     print()
     print(f"[diag] ===== MASK DISTRIBUTION REPORT =====")
-    print(f"[diag] checkpoint : {args.checkpoint}")
+    print(f"[diag] checkpoint : {checkpoint}")
     print(f"[diag] samples    : {len(all_masks)}")
     print(f"[diag] frames     : {n_frames_collected}")
     print(f"[diag] total bins : {total:,}  (frames × {n_mels} bins/frame)")
@@ -486,7 +520,7 @@ def main() -> None:
     print()
 
     # ---- Per-bin (grouped) ----
-    n_groups = max(1, args.n_bins_show)
+    n_groups = max(1, n_bins_show)
     bin_group_size = n_mels // n_groups
     print(f"[diag] Per-bin mean mask ({n_groups} groups of "
           f"~{bin_group_size} bins, low-freq → high-freq):")
@@ -537,10 +571,10 @@ def main() -> None:
     print()
 
     # ---- Optional JSON dump ----
-    if args.results_json:
+    if results_json:
         # Summary statistics in JSON form (drop per-bin detail to keep file small).
         summary = {
-            "checkpoint": args.checkpoint,
+            "checkpoint": checkpoint,
             "num_samples": len(all_masks),
             "frames": n_frames_collected,
             "total_bins": int(total),
@@ -593,9 +627,9 @@ def main() -> None:
             },
             "corr_mask_input_energy": corr,
         }
-        Path(args.results_json).write_text(json.dumps(summary, indent=2))
-        print(f"[diag] wrote {args.results_json}")
+        Path(results_json).write_text(json.dumps(summary, indent=2))
+        print(f"[diag] wrote {results_json}")
 
 
 if __name__ == "__main__":
-    main()
+    app()

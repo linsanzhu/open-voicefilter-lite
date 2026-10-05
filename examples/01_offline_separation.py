@@ -137,7 +137,13 @@ def main() -> None:
     hp.device = str(device)
 
     model = VoiceFilterLite(hp).to(device).eval()
-    model.load_state_dict(ckpt["model_state"])
+    # Training wraps the model with `torch.compile` (see train.py), which
+    # saves state_dict keys prefixed by `_orig_mod.` — strip it so the
+    # un-compiled model here can load the weights unchanged.
+    model_state = {
+        k.removeprefix("_orig_mod."): v for k, v in ckpt["model_state"].items()
+    }
+    model.load_state_dict(model_state)
     print(f"[offline] loaded {args.checkpoint} (step={ckpt.get('step')})")
 
     # ---- Speaker encoder (lazy-loads d-vector weights on first call) ----

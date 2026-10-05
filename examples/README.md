@@ -19,7 +19,7 @@ mixed audio file you want to separate. All three are 16 kHz mono WAVs.
 | 01 | [`01_offline_separation.py`](01_offline_separation.py) | Load a checkpoint, separate a mixed WAV file, write the enhanced WAV. The simplest end-to-end path; matches the README's snippet but as a proper script. |
 | 02 | [`02_streaming_inference.py`](02_streaming_inference.py) | Frame-by-frame inference over a file or live microphone. The `StreamingVoiceFilter` wrapper keeps LSTM hidden state across calls. |
 | 03 | [`03_onnx_inference.py`](03_onnx_inference.py) | Run the exported ONNX model with `onnxruntime`. The SpeakerEncoder produces the 256-d d-vector directly; the graph consumes it as-is (no in-graph projection). Optional `--verify` flag cross-checks ONNX against PyTorch. |
-| 04 | [`04_integration_mix_and_enhance.py`](04_integration_mix_and_enhance.py) | Integration test: synthesize N mixed clips from the actual training sources (LibriSpeech target + LibriSpeech / Musan interference, with RIR augmentation), run the model, and dump per-sample `target / enrollment / interference / mixed / enhanced` WAVs you can audition directly. |
+| 04 | [`04_integration_mix_and_enhance.py`](04_integration_mix_and_enhance.py) | Integration test: synthesize N mixed clips from the actual training sources (LibriSpeech target + LibriSpeech / Musan interference), run the model, and dump per-sample `target / enrollment / interference / mixed / enhanced` WAVs you can audition directly. |
 
 ## Common prerequisites
 
@@ -119,12 +119,10 @@ in the repo. For each of N samples the script:
    source via `SpeakerEncoder`).
 2. Samples interference from one of: LibriSpeech `other` split, Musan
    music, Musan noise, or Musan speech overlaid as babble (paper §3.4).
-3. Optionally convolves the target with a real (or procedural fallback)
-   RIR — same augmentation as training.
-4. Mixes target + interference at random SNR in
+3. Mixes target + interference at random SNR in
    `[hp.snr_min_db, hp.snr_max_db]`. Both sides are always active so the
    enhanced clip has audible content.
-5. Streams the mix through `StreamingVoiceFilter` and reconstructs a
+4. Streams the mix through `StreamingVoiceFilter` and reconstructs a
    waveform with Griffin-Lim.
 
 Output layout (`data/integration_test/`):
@@ -145,7 +143,6 @@ against `*_target.wav` to see how close it gets to the clean reference.
 
 Flags worth knowing:
 - `--no-musan`: skip Musan entirely; interference is LibriSpeech `other` only.
-- `--no-rir`: don't apply room reverberation to the target.
 - `--num-samples N`: how many mixes to generate (default 5).
 - `--gl-iter N`: Griffin-Lim iterations (default 16; more = cleaner audio
   but slower).

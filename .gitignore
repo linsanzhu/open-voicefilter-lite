@@ -36,6 +36,7 @@ ENV/
 *.swp
 *.swo
 .DS_Store
+.claude/settings.json
 
 # Type checkers / linters
 .mypy_cache/

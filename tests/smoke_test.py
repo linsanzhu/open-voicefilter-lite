@@ -7,7 +7,11 @@ These verify that:
     3. `audio.extract_dvec` runs the full VoiceFilter pipeline
        (fbank + windowed encoder forward + L2 aggregation) and returns
        L2-normalised (B, d_vector_dim) d-vectors.
-    4. The model is constructible and has ~2.2 M params (paper §4.4).
+    4. The model is constructible and has ~1.75 M params at the default
+       HParams (3 × LSTM 256 + linear heads); the slides p.28 ship-target
+       3 × LSTM 512 config used by `configs/paper.yaml` lands at ~6.7 M
+       params (still FP32 — INT8 dynamic-range quantization brings it
+       down to slides p.32 / p.36's 2.2 MB ship size).
     5. A forward + backward pass works (with fake d-vectors; no real audio).
     6. Streaming inference matches batched inference within fp tolerance.
     7. The asymmetric loss is finite and decreases after one step.
@@ -29,23 +33,18 @@ PyTorch state_dict that loads with no key remapping.
 
 from __future__ import annotations
 
-import os
-import sys
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.abspath(os.path.join(HERE, "..", "src")))
-
 import torch
 
-from open_voicefilter_lite.dataset import _per_frame_overlap_label
-from open_voicefilter_lite.hparams import HParams
-from open_voicefilter_lite.losses import (
+from voicefilter_cli.dataset import _per_frame_overlap_label
+from voicefilter_lite.hparams import HParams
+from voicefilter_cli.losses import (
     AsymmetricL2Loss,
     build_loss,
     hinge_loss,
 )
-from open_voicefilter_lite.model import VoiceFilterLite
-from open_voicefilter_lite.streaming import StreamingVoiceFilter
+from voicefilter_lite.audio import linear_to_log_mel
+from voicefilter_lite.model import VoiceFilterLite, apply_mask
+from voicefilter_lite.streaming import StreamingVoiceFilter
 
 
 def _select_device() -> torch.device:
@@ -61,7 +60,7 @@ def test_dvector_encoder_construct_only(hp: HParams) -> None:
     The actual weight load happens lazily inside `forward`, so the
     constructor + submodules are the only smoke-checkable surface.
     """
-    from open_voicefilter_lite.speaker_encoder import SpeakerEncoder
+    from voicefilter_lite.speaker_encoder import SpeakerEncoder
 
     enc = SpeakerEncoder(hp)
     assert enc.lstm.num_layers == hp.dvector_lstm_layers, (
@@ -99,7 +98,7 @@ def test_speaker_encoder_only(hp: HParams) -> None:
     `hp.d_vector_dim` is fixed at 256. `HParams(speaker_encoder=...)` is
     no longer a supported kwarg, so the only path is the default.
     """
-    from open_voicefilter_lite.speaker_encoder import SpeakerEncoder
+    from voicefilter_lite.speaker_encoder import SpeakerEncoder
 
     enc = SpeakerEncoder(hp)
     assert enc.lstm.input_size == hp.dvector_n_mels
@@ -123,10 +122,10 @@ def test_extract_dvec_pipeline(hp: HParams, device: torch.device) -> None:
 
     Uses random SpeakerEncoder weights (no pretrained file required) —
     the test verifies shape + L2-norm contract, not d-vector quality.
-    The latter is `scripts/verify_dvec.py`'s job.
+    The latter is `voicefilter-cli verify-dvec`'s job.
     """
-    from open_voicefilter_lite.audio import extract_dvec, wav_to_dvec_mel
-    from open_voicefilter_lite.speaker_encoder import SpeakerEncoder
+    from voicefilter_lite.audio import extract_dvec, wav_to_dvec_mel
+    from voicefilter_lite.speaker_encoder import SpeakerEncoder
 
     enc = SpeakerEncoder(hp).to(device).eval()
     enc.freeze()
@@ -183,7 +182,7 @@ def test_d_vector_dim_fixed(hp: HParams) -> None:
     guard re-affirms 256 so the model's `in_proj` always has the right
     input shape.
     """
-    from open_voicefilter_lite.cli import apply_overrides
+    from voicefilter_lite.config import apply_overrides
 
     # Direct kwarg
     assert HParams(d_vector_dim=192).d_vector_dim == 256, (
@@ -203,11 +202,13 @@ def test_param_count(hp: HParams) -> None:
     model = VoiceFilterLite(hp)
     n = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  trainable params: {n:,}")
-    # Default HParams (hidden=384, layers=2) is ~2.7M; paper.yaml config
-    # (hidden=256, layers=3) is ~1.82M. Both are within the paper's 2.2 MB
-    # 8-bit quantization envelope (§4.4) — sanity-check the *order* of
-    # magnitude rather than a tight window.
-    assert 1.5e6 <= n <= 3.5e6, f"param count {n:,} outside expected ~1.8-2.7M range"
+    # Default HParams (hidden=256, layers=3) is ~1.75 M FP32 — well
+    # within the slides p.32 / p.36 "ship-target" envelope after INT8
+    # dynamic-range quantization. Sanity-check the *order* of magnitude
+    # rather than a tight window so deliberate hyperparam choices that
+    # deviate from the slides (e.g. paper.yaml's hidden=512 → ~6.7 M)
+    # still pass.
+    assert 1.0e6 <= n <= 8.0e6, f"param count {n:,} outside expected ~1.5-7.0M range"
 
 
 def test_forward_backward(hp: HParams, device: torch.device) -> None:
@@ -223,13 +224,27 @@ def test_forward_backward(hp: HParams, device: torch.device) -> None:
     frame_labels = torch.randint(0, 2, (B, T), device=device).mul(2).sub(1)
 
     model.train()
-    enhanced, _hidden, frame_logits, mask = model(stacked, dvec)
-    assert enhanced.shape == target.shape, f"shape mismatch {enhanced.shape} vs {target.shape}"
+    # Model returns (mask, hidden). Apply the mask (paper §3.2 in
+    # linear-mel) and run the noise-type head (paper §4.2) externally —
+    # both are caller work now that the model exposes only the mask +
+    # LSTM state. Random target/cur are already in log-mel-style
+    # domain; convert both to linear-mel before applying the mask and
+    # the asymmetric L2 loss.
+    mask, _hidden = model(stacked, dvec)
+    cur_idx = hp.frame_stack - 1
+    cur = stacked[..., cur_idx * hp.n_mels : (cur_idx + 1) * hp.n_mels]
+    cur_linear = torch.exp(cur).clamp(min=0.0)                  # random log-mel → linear-mel (random has no floor noise)
+    target_linear = torch.exp(target).clamp(min=0.0)
+    enhanced_linear = apply_mask(mask, cur_linear)
+    frame_logits = model.alpha_head(cur).squeeze(-1)
+    assert enhanced_linear.shape == target_linear.shape, (
+        f"shape mismatch {enhanced_linear.shape} vs {target_linear.shape}"
+    )
     assert frame_logits.shape == (B, T), f"frame_logits shape {frame_logits.shape} != {(B, T)}"
     assert mask.shape == (B, T, hp.n_mels), f"mask shape {mask.shape} != {(B, T, hp.n_mels)}"
 
     comps = loss_fn.forward_with_components(
-        enhanced, target,
+        enhanced_linear, target_linear,
         frame_logits=frame_logits,
         frame_labels=frame_labels,
     )
@@ -241,7 +256,7 @@ def test_forward_backward(hp: HParams, device: torch.device) -> None:
     assert grad_norm > 0, "no gradients flowed"
     print(
         f"  forward/backward OK — loss={loss.item():.4f} "
-        f"asym={comps['loss_asym'].item():.4f} hinge={comps['loss_hinge'].item():.4f} "
+        f"asym={comps['loss_asym'].item():.4f} noise_type={comps['loss_noise_type'].item():.4f} "
         f"|grad|={grad_norm.item():.3f}"
     )
 
@@ -266,7 +281,12 @@ def test_streaming_matches_batched(hp: HParams, device: torch.device) -> None:
 
     # Batched forward (no adaptive suppression at inference — uses pure mask).
     with torch.no_grad():
-        ref_enhanced, _, _, _ = model(stacked, dvec)
+        ref_mask, _ = model(stacked, dvec)
+        cur_idx = hp.frame_stack - 1
+        cur = stacked[..., cur_idx * hp.n_mels : (cur_idx + 1) * hp.n_mels]
+        cur_linear = torch.exp(cur).clamp(min=0.0)
+        ref_enhanced_linear = apply_mask(ref_mask, cur_linear)
+        ref_enhanced = linear_to_log_mel(ref_enhanced_linear, floor=hp.log_mel_floor)
 
     # Streaming forward (adaptive w^(t) per §3.4).
     sf = StreamingVoiceFilter(model, hp)
@@ -293,8 +313,13 @@ def test_streaming_matches_batched(hp: HParams, device: torch.device) -> None:
 
 
 def test_loss_sanity(hp: HParams) -> None:
-    """Loss should be larger when the prediction is wrong than when close."""
-    target = torch.randn(2, 10, hp.n_mels)
+    """Loss should be larger when the prediction is wrong than when close.
+
+    Paper §3.3 asymmetric L2 lives in linear-mel (see losses.py), but the
+    loss is domain-agnostic — random tensors are positive after `abs()`,
+    so `torch.abs` here stands in for the linear-mel energy convention.
+    """
+    target = torch.abs(torch.randn(2, 10, hp.n_mels))           # non-negative "energy"
     near = target + 0.01 * torch.randn_like(target)
     far = target + 2.0 * torch.randn_like(target)
 
@@ -306,16 +331,24 @@ def test_loss_sanity(hp: HParams) -> None:
 
 
 def test_hinge_loss_sanity() -> None:
-    """Hinge loss: large positive logit when label=+1 → small loss;
-    large positive logit when label=-1 → ~margin loss."""
+    """Hinge loss: logit agrees with label sign → small loss;
+    logit disagrees → larger loss.
+
+    Paper §4.2 explicitly specifies hinge for the noise-type predictor.
+    Labels live in {-1, +1}; loss = mean(max(0, margin − y · logit)),
+    margin defaults to 1.0.
+    """
     B, T = 4, 20
-    # Correct side of margin: labels match the sign of logits.
-    good_logits = torch.randn(B, T) * 0.1
+    # Correct side: labels match the sign of logits → y · logit > 0 and
+    # well above the margin → hinge contribution max(0, 1 − y·logit)
+    # shrinks toward 0.
+    good_logits = torch.randn(B, T) * 2.0
     good_labels = torch.sign(good_logits)
     good_loss = hinge_loss(good_logits, good_labels).item()
 
-    # Wrong side: labels are opposite to the sign of logits.
-    bad_logits = torch.randn(B, T) * 0.1
+    # Wrong side: labels opposite sign → y · logit < 0 → hinge fires
+    # at full magnitude (1 + |logit|).
+    bad_logits = torch.randn(B, T) * 2.0
     bad_labels = -torch.sign(bad_logits)
     bad_loss = hinge_loss(bad_logits, bad_labels).item()
 
@@ -323,6 +356,9 @@ def test_hinge_loss_sanity() -> None:
     assert bad_loss > good_loss, (
         f"hinge loss ordering wrong (good={good_loss} vs bad={bad_loss})"
     )
+    # For logits N(0, 2), |logit| typically ≫ 1 on the good side, so
+    # max(0, 1 − y·logit) is essentially 0; the mean sits well below 0.5.
+    assert good_loss < 0.5, f"hinge good-loss too high: {good_loss}"
 
 
 def test_build_loss_factory(hp: HParams) -> None:
@@ -331,30 +367,31 @@ def test_build_loss_factory(hp: HParams) -> None:
 
 
 def test_mask_apply_paper(hp: HParams, device: torch.device) -> None:
-    """Paper §3.2 literal mask application: `Y_enh = M · Y` in log-mel.
+    """Paper §3.2 literal mask application: `Y_enh = M · Y` in linear-mel.
 
-    M=0 must yield exactly 0 (not log(floor)); M=1 must be identity.
-    This is the *only* mask application in the model; `hp.mask_mode` is
-    gone — the legacy "linear_mel" mode was kept around only for
-    backward compatibility with already-trained checkpoints.
+    M=0 must yield exactly 0 (silence); M=1 must be identity on the
+    linear-mel input. Callers convert log-mel → linear-mel via
+    `log_mel_to_linear` before calling (see `train.py` /
+    `streaming.py`).
     """
     model = VoiceFilterLite(hp).to(device).eval()
 
     B, T, n_mels = 1, 4, hp.n_mels
-    logmel = torch.randn(B, T, n_mels, device=device)
+    # Synthetic non-negative linear-mel input (energy is always ≥ 0).
+    linear = torch.rand(B, T, n_mels, device=device) + 0.1
 
     mask_zero = torch.zeros(B, T, n_mels, device=device)
     mask_one = torch.ones(B, T, n_mels, device=device)
-    enh_zero = model._apply_mask(mask_zero, logmel)
-    enh_one = model._apply_mask(mask_one, logmel)
-    assert torch.allclose(enh_zero, torch.zeros_like(logmel), atol=1e-7), (
+    enh_zero = apply_mask(mask_zero, linear)
+    enh_one = apply_mask(mask_one, linear)
+    assert torch.allclose(enh_zero, torch.zeros_like(linear), atol=1e-7), (
         f"M=0 should be exactly 0, got max abs={enh_zero.abs().max().item():.3e}"
     )
-    assert torch.allclose(enh_one, logmel, atol=1e-6), (
+    assert torch.allclose(enh_one, linear, atol=1e-6), (
         f"M=1 should be identity, got max diff="
-        f"{(enh_one - logmel).abs().max().item():.3e}"
+        f"{(enh_one - linear).abs().max().item():.3e}"
     )
-    print(f"  mask apply OK — paper §3.2 M=0→0, M=1=identity")
+    print(f"  mask apply OK — paper §3.2 M=0→0, M=1=identity (linear-mel)")
 
 
 def test_optional_cnn(hp: HParams, device: torch.device) -> None:
@@ -402,8 +439,13 @@ def test_optional_cnn(hp: HParams, device: torch.device) -> None:
     model_off.eval()
     model_on.eval()
     with torch.no_grad():
-        e_off, _, _, mask_off = model_off(stacked, dvec)
-        e_on, _, _, mask_on = model_on(stacked, dvec)
+        mask_off, _ = model_off(stacked, dvec)
+        mask_on, _ = model_on(stacked, dvec)
+        cur_idx = hp.frame_stack - 1
+        cur = stacked[..., cur_idx * hp.n_mels : (cur_idx + 1) * hp.n_mels]
+        cur_linear = torch.exp(cur).clamp(min=0.0)
+        e_off = apply_mask(mask_off, cur_linear)
+        e_on = apply_mask(mask_on, cur_linear)
 
     assert e_off.shape == (B, T, hp.n_mels), f"e_off shape {e_off.shape}"
     assert e_on.shape == e_off.shape, f"e_on shape {e_on.shape} != {e_off.shape}"
@@ -500,7 +542,7 @@ def test_activity_burst_no_oob() -> None:
     """
     import random
 
-    from open_voicefilter_lite.dataset import _sample_activity_burst
+    from voicefilter_cli.dataset import _sample_activity_burst
 
     hp = HParams()  # sample_len=48000, fade_ms=50.0, sr=16000
     rng = random.Random(5017)

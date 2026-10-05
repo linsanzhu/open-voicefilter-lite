@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Example 03 — Inference with the exported ONNX model.
 
-`scripts/export_onnx.py` ships a streaming-friendly ONNX graph whose inputs
+`voicefilter-cli export onnx` ships a streaming-friendly ONNX graph whose inputs
 are the 256-d d-vector (from `SpeakerEncoder`) plus the persistent LSTM
 (h, c). The deployment side has to:
 
@@ -53,7 +53,7 @@ from open_voicefilter_lite.audio import (  # noqa: E402
     wav_to_log_mel,
 )
 from open_voicefilter_lite.hparams import HParams  # noqa: E402
-from open_voicefilter_lite.model import VoiceFilterLite  # noqa: E402
+from open_voicefilter_lite.model import VoiceFilterLite, apply_mask  # noqa: E402
 from open_voicefilter_lite.speaker_encoder import (  # noqa: E402
     SpeakerEncoder,
 )
@@ -258,24 +258,13 @@ def _load_onnx_from_model(hp: HParams, model: VoiceFilterLite):
             self.model = m
 
         def forward(self, slm, dv, h0, c0):
-            B_, T_, _ = slm.shape
-            dt = dv.unsqueeze(1).expand(-1, T_, -1)
-            x = torch.cat([slm, dt], dim=-1)
-            x = self.model.in_proj(x)
-            x = self.model.in_norm(x)
-            # Optional 1D CNN (paper §3.2, frequency-axis). When
-            # `hp.use_cnn=False` this branch is a no-op and the wrapper
-            # matches the LSTM-only export.
-            if self.model.cnn is not None:
-                x_per = x.reshape(-1, 1, x.shape[-1])              # (B*T, 1, H)
-                x_conv = self.model.cnn(x_per)                     # (B*T, cnn_channels, H)
-                x = x_conv.mean(dim=-1).reshape(x.shape[0], x.shape[1], -1)
-            x, (hN, cN) = self.model.lstm(x, (h0, c0))
-            mask = torch.sigmoid(self.model.out_proj(x))
+            # Shared LSTM core (in_proj + in_norm + [cnn] + lstm).
+            x, (hN, cN) = self.model.lstm_forward(slm, dv, (h0, c0))
+            mask = torch.sigmoid(self.model.out_proj(self.model.dropout(x)))
             cur_idx = self.model.hp.frame_stack - 1
             cur = slm[..., cur_idx * self.model.hp.n_mels:(cur_idx + 1) * self.model.hp.n_mels]
             # Paper §3.2 literal mask application (Y_enh = M · Y in log-mel).
-            return self.model._apply_mask(mask, cur), hN, cN
+            return apply_mask(mask, cur), hN, cN
 
     wrap = _Wrap(model).eval()
     buf = io.BytesIO()
@@ -349,7 +338,7 @@ def main() -> None:
     # projection Linear) and any `alpha_head.*` keys that don't fit the
     # current paper-faithful 2-Linear head (paper §4.2). Strict shape
     # filter: keep only keys that exist in the model with the matching
-    # shape. See the matching block in `scripts/export_onnx.py`.
+    # shape. See the matching block in `voicefilter-cli export onnx`.
     model_sd = model.state_dict()
     kept = {k: v for k, v in sd.items()
             if k in model_sd and tuple(v.shape) == tuple(model_sd[k].shape)}

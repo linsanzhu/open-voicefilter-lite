@@ -1,0 +1,33 @@
+[project]
+name = "open-voicefilter-lite"
+version = "0.1.0"
+description = "Streaming targeted voice separation — model + audio primitives (VoiceFilter-Lite reimplementation)"
+readme = "README.md"
+authors = [{ name = "linsan", email = "bin.zaq@foxmail.com" }]
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+
+dependencies = [
+    # Core
+    "torch>=2.2",
+    "torchaudio>=2.2",
+    "numpy>=1.26",
+    # Audio IO + DSP
+    "soundfile>=0.12",
+    "scipy>=1.11",
+    # CLI / config
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.5",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/voicefilter_lite"]

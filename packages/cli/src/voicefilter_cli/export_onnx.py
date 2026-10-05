@@ -18,12 +18,12 @@ and emits:
 
 Usage
 -----
-    python scripts/export_onnx.py \\
+    `voicefilter-cli export onnx` \\
         --checkpoint runs/exp1/ckpt_final.pt \\
         --output      voicefilter_lite.onnx
 
     # INT8 post-training dynamic quantization (paper §3.5):
-    python scripts/export_onnx.py \\
+    `voicefilter-cli export onnx` \\
         --checkpoint runs/exp1/ckpt_final.pt \\
         --output      voicefilter_lite.onnx \\
         --quantize    int8
@@ -37,18 +37,16 @@ Usage
 
 from __future__ import annotations
 
-import argparse
 import os
 import sys
+from typing import Annotated, Literal
 
 import torch
+from cyclopts import App, Parameter
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.abspath(os.path.join(HERE, "..", "src")))
-
-from open_voicefilter_lite.hparams import HParams
-from open_voicefilter_lite.model import VoiceFilterLite
-
+from voicefilter_lite.hparams import HParams
+from voicefilter_lite.audio import log_mel_to_linear, linear_to_log_mel
+from voicefilter_lite.model import VoiceFilterLite, apply_mask
 
 class StreamWrapper(torch.nn.Module):
     """Wraps VoiceFilterLite for ONNX export with explicit LSTM state IO."""
@@ -64,47 +62,46 @@ class StreamWrapper(torch.nn.Module):
         h0: torch.Tensor,
         c0: torch.Tensor,
     ):
-        B, T, _ = stacked_logmel.shape
-        dvec_tiled = dvec.unsqueeze(1).expand(-1, T, -1)
-        x = torch.cat([stacked_logmel, dvec_tiled], dim=-1)
-        x = self.model.in_proj(x)
-        x = self.model.in_norm(x)
-        # Optional 1D CNN (paper §3.2). Mirrors `VoiceFilterLite.forward` —
-        # `nn.Conv1d` sliding along the frequency axis (H positions are
-        # Conv1d's L axis after the `(B, T, H) → (B*T, 1, H)` reshape),
-        # then mean-pool over the preserved H positions. When
-        # `hp.use_cnn=False` this branch is a no-op and the exported
-        # graph matches the legacy LSTM-only variant.
-        if self.model.cnn is not None:
-            x_per = x.reshape(-1, 1, x.shape[-1])              # (B*T, 1, H)
-            x_conv = self.model.cnn(x_per)                     # (B*T, cnn_channels, H)
-            x = x_conv.mean(dim=-1).reshape(x.shape[0], x.shape[1], -1)
-        x, (hN, cN) = self.model.lstm(x, (h0, c0))
-        mask = torch.sigmoid(self.model.out_proj(x))
+        # Shared LSTM core (in_proj + in_norm + [cnn] + lstm).
+        x, (hN, cN) = self.model.lstm_forward(
+            stacked_logmel, dvec, (h0, c0),
+        )
+        mask = torch.sigmoid(self.model.out_proj(self.model.dropout(x)))
 
         cur_idx = self.model.hp.frame_stack - 1
         cur = stacked_logmel[..., cur_idx * self.model.hp.n_mels:(cur_idx + 1) * self.model.hp.n_mels]
-        # Paper §3.2 literal mask application (Y_enh = M · Y in log-mel).
-        enhanced = self.model._apply_mask(mask, cur)
+        # Paper §3.2 literal mask application (Y_enh = M · Y in
+        # **linear** filterbank-energy space — NOT log-mel). The ONNX
+        # graph is consumed by an ASR pipeline that takes log-mel, so
+        # we round-trip through `log_mel_to_linear` /
+        # `linear_to_log_mel` here so the exported model's input/output
+        # interface stays `log-mel → log-mel` (ASR-friendly) while the
+        # mask runs in the paper-correct domain.
+        cur_linear = log_mel_to_linear(cur, floor=self.model.hp.log_mel_floor)
+        enhanced_linear = apply_mask(mask, cur_linear)
+        enhanced = linear_to_log_mel(enhanced_linear, floor=self.model.hp.log_mel_floor)
         return enhanced, hN, cN
 
+app = App(name="onnx", help_format="plaintext")
 
-def main() -> None:
-    p = argparse.ArgumentParser(description="Export VoiceFilter-Lite to ONNX")
-    p.add_argument("--checkpoint", required=True)
-    p.add_argument("--output", default="voicefilter_lite.onnx")
-    p.add_argument("--opset", type=int, default=17)
-    p.add_argument(
-        "--quantize",
-        choices=["none", "int8"],
-        default="none",
-        help="Post-training quantization to apply after torch.onnx.export. "
-             "'int8' mirrors paper §3.5's 8-bit deployed model and writes "
-             "<output>.int8.onnx via onnxruntime.quantization.quantize_dynamic.",
-    )
-    args = p.parse_args()
 
-    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+@app.default
+def main(
+    checkpoint: Annotated[str, Parameter(help="Path to the trained VoiceFilter-Lite ckpt.")],
+    *,
+    output: Annotated[str, Parameter(help="Output ONNX file path.")] = "voicefilter_lite.onnx",
+    opset: Annotated[int, Parameter(help="ONNX opset version.")] = 17,
+    quantize: Annotated[
+        Literal["none", "int8"],
+        Parameter(
+            help="Post-training quantization to apply after torch.onnx.export. "
+                 "'int8' mirrors paper §3.5's 8-bit deployed model and writes "
+                 "<output>.int8.onnx via onnxruntime.quantization.quantize_dynamic.",
+        ),
+    ] = "none",
+) -> None:
+    """Export VoiceFilter-Lite to ONNX (streaming-friendly variant)."""
+    ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
     hp = HParams.from_dict(ckpt["hparams"])
 
     model = VoiceFilterLite(hp)
@@ -158,8 +155,8 @@ def main() -> None:
         torch.onnx.export(
             traced,
             (stacked, dvec, h0, c0),
-            args.output,
-            opset_version=args.opset,
+            output,
+            opset_version=opset,
             do_constant_folding=True,
             input_names=["stacked_logmel", "dvec", "h0", "c0"],
             output_names=["enhanced", "hN", "cN"],
@@ -170,8 +167,8 @@ def main() -> None:
         torch.onnx.export(
             traced,
             (stacked, dvec, h0, c0),
-            args.output,
-            opset_version=args.opset,
+            output,
+            opset_version=opset,
             do_constant_folding=True,
             input_names=["stacked_logmel", "dvec", "h0", "c0"],
             output_names=["enhanced", "hN", "cN"],
@@ -185,10 +182,10 @@ def main() -> None:
                 "cN":             {1: "batch"},
             },
         )
-    print(f"[export] wrote {args.output}")
+    print(f"[export] wrote {output}")
 
     # ---- Optional INT8 dynamic quantization (paper §3.5) ----
-    if args.quantize == "int8":
+    if quantize == "int8":
         try:
             from onnxruntime.quantization import QuantType, quantize_dynamic
         except ImportError:
@@ -196,7 +193,7 @@ def main() -> None:
                 "[export] --quantize int8 requires onnxruntime >= 1.13. "
                 "Install with `pip install onnxruntime`."
             )
-        int8_path = args.output
+        int8_path = output
         if not int8_path.endswith(".onnx"):
             int8_path = int8_path + ".onnx"
         int8_out = int8_path[:-len(".onnx")] + ".int8.onnx"
@@ -212,7 +209,7 @@ def main() -> None:
         import onnxruntime as ort
         import numpy as np
 
-        sess = ort.InferenceSession(args.output, providers=["CPUExecutionProvider"])
+        sess = ort.InferenceSession(output, providers=["CPUExecutionProvider"])
         outs = sess.run(
             None,
             {
@@ -236,4 +233,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    app()

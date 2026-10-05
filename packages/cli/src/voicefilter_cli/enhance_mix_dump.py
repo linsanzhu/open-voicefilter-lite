@@ -17,35 +17,32 @@ the original phase gives the cleanest listening result.
 
 Usage
 -----
-    python scripts/enhance_mix_dump.py --checkpoint runs/v2_fix/ckpt_final.pt
-    python scripts/enhance_mix_dump.py --checkpoint runs/mps/ckpt_step047000.pt \\
+    `voicefilter-cli enhance-mix-dump` --checkpoint runs/v2_fix/ckpt_final.pt
+    `voicefilter-cli enhance-mix-dump` --checkpoint runs/mps/ckpt_step047000.pt \\
         --mix-dump-dir runs/mps/mix_dump
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Annotated
 
 import numpy as np
 import soundfile as sf
 import torch
 import torch.linalg as la
+from cyclopts import App, Parameter
 
-HERE = Path(__file__).parent.resolve()
-sys.path.insert(0, str(HERE.parent / "src"))
-
-from open_voicefilter_lite.audio import (
+from voicefilter_lite.audio import (
     extract_dvec,
     make_mel_basis,
     pad_or_trim,
 )
-from open_voicefilter_lite.hparams import HParams
-from open_voicefilter_lite.model import VoiceFilterLite
-from open_voicefilter_lite.speaker_encoder import SpeakerEncoder
-
+from voicefilter_lite.hparams import HParams
+from voicefilter_lite.model import VoiceFilterLite
+from voicefilter_lite.speaker_encoder import SpeakerEncoder
 
 def compute_si_sdr(estimate: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> float:
     """Scale-invariant SDR in dB. Both inputs (T,) mono."""
@@ -57,7 +54,6 @@ def compute_si_sdr(estimate: torch.Tensor, target: torch.Tensor, eps: float = 1e
     return float(
         10 * torch.log10(proj.pow(2).sum() / (noise.pow(2).sum() + eps) + eps)
     )
-
 
 def enhance_sample(
     mixed_wav: torch.Tensor,
@@ -125,8 +121,13 @@ def enhance_sample(
             masks.append(mask.squeeze(0).squeeze(0).cpu())
     masks = torch.stack(masks, dim=0)                             # (T_frames, n_mels)
 
-    # ---- Apply mask in mel domain → invert to linear magnitude ----
-    # masked_mel = mask * mix_mel;  then mag = pinv(fb) @ masked_mel
+    # ---- Apply mask in LINEAR-mel domain → invert to linear magnitude ----
+    # Paper §3.2: `Y_enh = M · S_in` is on the linear filterbank energy
+    # `S_in`, NOT on log-mel. `mel = fb.T @ magnitude` is the linear
+    # filterbank energy of the mixed frame, so we multiply the mask with
+    # `mel` directly (not the log-mel the NN was conditioned on) — then
+    # pseudo-invert through the mel basis to recover the enhanced
+    # magnitude, and combine with the original phase for the wav.
     masked_mel = masks.T.to(mel.dtype) * mel                     # (n_mels, T_frames)
     masked_magnitude = (pinv_fb.T @ masked_mel).clamp(min=0.0)   # (n_freq, T_frames)
 
@@ -150,29 +151,48 @@ def enhance_sample(
     si_sdr_out = compute_si_sdr(enhanced_wav, target_wav)
     return enhanced_wav, si_sdr_in, si_sdr_out
 
+app = App(name="enhance-mix-dump", help_format="plaintext")
 
-def main() -> None:
-    p = argparse.ArgumentParser(description="Enhance mix_dump samples with a VoiceFilter ckpt")
-    p.add_argument("--checkpoint", required=True)
-    p.add_argument("--mix-dump-dir", default="runs/mps/mix_dump")
-    p.add_argument("--device", default="mps")
-    p.add_argument("--output-name", default="04_enhanced.wav",
-                   help="Filename inside each sample dir.")
-    p.add_argument("--no-normalize", action="store_true",
-                   help="Don't normalize the enhanced wav peak to 0.95.")
-    args = p.parse_args()
 
-    device = torch.device(args.device)
+@app.default
+def main(
+    *,
+    checkpoint: Annotated[
+        str, Parameter(help="Path to a VoiceFilter-Lite checkpoint (.pt).")
+    ],
+    mix_dump_dir: Annotated[
+        str, Parameter(name="--mix-dump-dir", help="Directory containing mix_dump samples + manifest.json.")
+    ] = "runs/mps/mix_dump",
+    device: Annotated[
+        str, Parameter(help="Force a device (mps / cuda / cpu). Default 'auto' picks MPS → CUDA → CPU.")
+    ] = "auto",
+    output_name: Annotated[
+        str, Parameter(name="--output-name", help="Filename written inside each sample dir.")
+    ] = "04_enhanced.wav",
+    no_normalize: Annotated[
+        bool, Parameter(negative="", name="--no-normalize", help="Don't normalize the enhanced wav peak to 0.95.")
+    ] = False,
+) -> None:
+    """Enhance mix_dump samples with a VoiceFilter ckpt."""
+    # Auto-detect device unless forced via `--device`.
+    if device == "auto":
+        if torch.backends.mps.is_available():
+            device_obj = torch.device("mps")
+        elif torch.cuda.is_available():
+            device_obj = torch.device("cuda")
+        else:
+            device_obj = torch.device("cpu")
+    else:
+        device_obj = torch.device(device)
 
-    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    ckpt = torch.load(checkpoint, map_location=device_obj, weights_only=False)
     hp = HParams.from_dict(ckpt["hparams"])
-    hp.device = str(device)
 
-    model = VoiceFilterLite(hp).to(device).eval()
+    model = VoiceFilterLite(hp).to(device_obj).eval()
     model.load_state_dict(ckpt["model_state"])
-    print(f"[enhance] loaded {args.checkpoint} (step={ckpt.get('step')}) on {device}")
+    print(f"[enhance] loaded {checkpoint} (step={ckpt.get('step')}) on {device_obj}")
 
-    speaker_encoder = SpeakerEncoder(hp).to(device)
+    speaker_encoder = SpeakerEncoder(hp).to(device_obj)
     if Path(hp.dvector_pt_path).is_file():
         speaker_encoder.load_pretrained(hp.dvector_pt_path)
         print(f"[enhance] SpeakerEncoder loaded from {hp.dvector_pt_path}")
@@ -190,7 +210,7 @@ def main() -> None:
     pinv_fb = la.pinv(fb, rcond=1e-4)                            # (n_mels, n_freq)
     window = torch.hann_window(hp.win_length)
 
-    mix_dump = Path(args.mix_dump_dir)
+    mix_dump = Path(mix_dump_dir)
     manifest = json.loads((mix_dump / "manifest.json").read_text())
     print(f"[enhance] found {len(manifest)} samples in {mix_dump}")
 
@@ -211,15 +231,15 @@ def main() -> None:
 
         enhanced_wav, si_in, si_out = enhance_sample(
             mixed_wav_t, target_wav_t, ref_wav_t,
-            model, speaker_encoder, hp, fb, pinv_fb, window, device,
+            model, speaker_encoder, hp, fb, pinv_fb, window, device_obj,
         )
 
-        if not args.no_normalize:
+        if not no_normalize:
             peak = enhanced_wav.abs().max().clamp(min=1e-8)
             if peak > 1.0:
                 enhanced_wav = enhanced_wav / peak * 0.95
 
-        out_path = sample_dir / args.output_name
+        out_path = sample_dir / output_name
         sf.write(str(out_path), enhanced_wav.numpy(), hp.sample_rate)
         print(f"[enhance]   → {out_path.name}  "
               f"peak={enhanced_wav.abs().max():.3f}  "
@@ -250,4 +270,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    app()

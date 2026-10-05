@@ -15,7 +15,7 @@ Architecture (identical to upstream `SpeechEmbedder`):
 The forward signature `forward(mel_window) → (B, 256)` is the upstream
 `SpeechEmbedder.forward` literally. All audio preprocessing (fbank
 extraction, sliding-window aggregation, L2-normalisation, per-window
-mean) lives in `open_voicefilter_lite.audio` — see `wav_to_dvec_mel`
+mean) lives in `voicefilter_lite.audio` — see `wav_to_dvec_mel`
 and `extract_dvec`. This mirrors the upstream VoiceFilter repo's
 separation (`model/embedder.py` is just the model; `utils/audio.py`
 owns the audio side).
@@ -43,7 +43,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from open_voicefilter_lite.hparams import HParams
+from voicefilter_lite.hparams import HParams
 
 
 class LinearNorm(nn.Module):
@@ -83,7 +83,7 @@ class SpeakerEncoder(nn.Module):
     The model itself is windowed — i.e. it consumes a single 80-frame
     mel window. Aggregation over multiple windows (L2-norm per window →
     mean → final L2-norm) is the caller's job and lives in
-    `open_voicefilter_lite.audio.extract_dvec`. Pretrained weights load
+    `voicefilter_lite.audio.extract_dvec`. Pretrained weights load
     with `load_pretrained(...)`; `freeze()` after loading when used as a
     frozen feature extractor.
     """
@@ -117,8 +117,8 @@ class SpeakerEncoder(nn.Module):
 
         Aggregation (per-window L2 → mean → final L2) and audio
         preprocessing (fbank extraction) are the caller's job — see
-        `open_voicefilter_lite.audio.wav_to_dvec_mel` and
-        `open_voicefilter_lite.audio.extract_dvec`.
+        `voicefilter_lite.audio.wav_to_dvec_mel` and
+        `voicefilter_lite.audio.extract_dvec`.
         """
         # `flatten_parameters()` packs the LSTM weights into contiguous
         # memory for faster cuDNN dispatch; the original VoiceFilter repo

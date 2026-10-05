@@ -25,7 +25,7 @@ import torch
 import torch.nn.functional as F
 import torchaudio
 
-from open_voicefilter_lite.hparams import HParams
+from voicefilter_lite.hparams import HParams
 
 
 # ---- Cached transforms (constructed once, reused across calls) ----
@@ -81,6 +81,47 @@ def wav_to_log_mel(
     if squeeze:
         log_mel = log_mel.squeeze(0)
     return log_mel
+
+
+def log_mel_to_linear(log_mel: torch.Tensor, floor: float = 1e-6) -> torch.Tensor:
+    """Convert log-mel → linear filterbank energies, undoing `log(x + floor)`.
+
+    Inverse of `wav_to_log_mel`'s log compression. Used to recover
+    linear-mel values from the model's log-mel input so the mask
+    application (paper §3.2, paper §3.4) can run in the linear energy
+    domain — the paper's mask is `M · S_in` on linear filterbank
+    energies, NOT on log-mel.
+
+    Args:
+        log_mel: (..., F) tensor that came out of `log(x + floor)`.
+        floor:  the same `floor` used in `wav_to_log_mel` so the
+                round-trip is exact for `log_mel > log(floor)`. Below
+                that, the result is clamped to 0 (silence floor).
+
+    Returns:
+        (..., F) non-negative linear filterbank energies.
+    """
+    return (torch.exp(log_mel) - floor).clamp(min=0.0)
+
+
+def linear_to_log_mel(linear: torch.Tensor, floor: float = 1e-6) -> torch.Tensor:
+    """Convert linear → log-mel filterbank energies (forward compression).
+
+    Inverse of `log_mel_to_linear`. Used by the streaming wrapper to
+    hand the ASR pipeline the same domain it would have produced from
+    the un-filtered input (`log(x + floor)`), so downstream ASR sees no
+    feature-distribution shift even though the mask application itself
+    runs in linear-mel.
+
+    Args:
+        linear: (..., F) non-negative linear filterbank energies.
+        floor:  the same `floor` used in `wav_to_log_mel`.
+
+    Returns:
+        (..., F) log-mel features with the same compression convention
+        as `wav_to_log_mel`.
+    """
+    return torch.log(linear + floor)
 
 
 def frame_stack_left(
