@@ -49,7 +49,7 @@ warnings.filterwarnings(
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 
-from voicefilter_cli.dataset import LocalTripletStream, collate_triplets
+from voicefilter_cli.dataset import HfTripletStream, collate_triplets
 from voicefilter_cli.hf import apply_hf_endpoint
 from voicefilter_cli.losses import build_loss
 from voicefilter_lite.audio import log_mel_to_linear
@@ -406,7 +406,7 @@ def train(hp: HParams, args: "TrainArgs") -> None:
         print(f"[train] EMA enabled (decay={hp.ema_decay}, warmup={hp.ema_warmup_steps})")
 
     # ---- Data ----
-    train_ds = LocalTripletStream(
+    train_ds = HfTripletStream(
         hp=hp,
         worker_id=0,
         num_workers=1,
@@ -433,8 +433,8 @@ def train(hp: HParams, args: "TrainArgs") -> None:
     # (default 2) — on memory-constrained MPS machines the queue holds
     # `prefetch × batch_size × ref_padded_len` of CPU memory plus a copy
     # on MPS after `.to(device)`; deep queues just trade idle-GPU time
-    # for OOM kills. 2 keeps the GPU fed given the dataset's own
-    # `decode_prefetch` jobs running in parallel.
+    # for OOM kills. PrefetchIterator runs a single producer thread
+    # (the GPU is the bottleneck, not decode).
     train_iter: Iterable[dict] = PrefetchIterator(
         train_loader, max_prefetch=hp.prefetch_batches_max
     )
@@ -517,10 +517,10 @@ def train(hp: HParams, args: "TrainArgs") -> None:
         stacked = batch["stacked_mixed"].to(device)
         target = batch["target_logmel"].to(device)
         # D-vectors are filled lazily by `DVectorCache` inside
-        # `LocalTripletStream`: first sight of a new speaker triggers a
+        # `HfTripletStream`: first sight of a new speaker triggers a
         # single SpeakerEncoder forward + atomic save to
-        # `dvectors/librispeech/<spk>.npy`; every subsequent draw (this
-        # run and any future run) is a one-`.npy`-read.
+        # `<cache_dir>/voicefilter-dvectors/<spec_id>/<spk>.npy`; every
+        # subsequent draw (this run and any future run) is a one-`.npy`-read.
         dvec = batch["ref_dvecs"].to(device)
         overlap_labels = batch["overlap_label"].to(device) if hp.use_noise_type_predictor else None
 

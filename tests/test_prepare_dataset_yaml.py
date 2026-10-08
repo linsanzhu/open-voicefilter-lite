@@ -72,9 +72,9 @@ def test_paper_yaml_yields_function_oriented_defaults() -> None:
     # `first_librispeech_other_source` stays discoverable for
     # evaluation / audition harnesses.
     assert types["babble"]["enabled"] is True
-    assert types["babble"]["prob"] == 0.5
+    assert types["babble"]["prob"] == 0.8
     assert types["babble"]["n_speakers_min"] == 1
-    assert types["babble"]["n_speakers_max"] == 5
+    assert types["babble"]["n_speakers_max"] == 3
     assert len(types["babble"]["sources"]) == 1, (
         f"paper.yaml babble.sources should contain only musan(speech); "
         f"got {types['babble']['sources']!r}"
@@ -82,9 +82,9 @@ def test_paper_yaml_yields_function_oriented_defaults() -> None:
     assert types["babble"]["sources"][0]["source"] == "musan"
     assert types["babble"]["sources"][0]["subset"] == "speech"
     # Babble synthesis happens at training time; the relevant knobs are
-    # per-speaker segment length (0.5-2 s by default).
-    assert types["babble"]["babble_seg_min_sec"] == 0.5
-    assert types["babble"]["babble_seg_max_sec"] == 2.0
+    # per-speaker segment length (1-4 s per paper.yaml).
+    assert types["babble"]["babble_seg_min_sec"] == 1
+    assert types["babble"]["babble_seg_max_sec"] == 4.0
     # `pool_size` no longer exists — was a pre-bake pool count, removed
     # when babble moved to runtime synthesis.
     assert "pool_size" not in types["babble"], (
@@ -99,8 +99,8 @@ def test_paper_yaml_yields_function_oriented_defaults() -> None:
     # moved from babble.sources to noise.sources so it gets baked + is
     # discoverable, but the runtime noise mixer still only consumes
     # pool/musan/noise/ (config-driven behaviour matches code).
-    assert types["noise"]["prob"] == 0.6
-    assert types["music"]["prob"] == 0.3
+    assert types["noise"]["prob"] == 0.5
+    assert types["music"]["prob"] == 0.5
     assert len(types["noise"]["sources"]) == 2, (
         f"paper.yaml noise.sources should contain musan(noise) + "
         f"librispeech(other); got {types['noise']['sources']!r}"
@@ -114,8 +114,12 @@ def test_paper_yaml_yields_function_oriented_defaults() -> None:
     assert types["music"]["sources"][0]["source"] == "musan"
     assert types["music"]["sources"][0]["subset"] == "music"
 
-    # processed_dir (top-level `dataset.processed_dir`).
-    assert out["output_dir"] == "data/processed", out.get("output_dir")
+    # processed_dir is fully retired — no `output_dir` key in defaults.
+    # Output is per-cache-dir `<cache_dir>/voicefilter-manifest.json`
+    # alongside each HF arrow cache, not a single central `data/processed`.
+    assert "output_dir" not in out, (
+        f"processed_dir is retired; got output_dir={out.get('output_dir')!r}"
+    )
     # sample_rate from model.audio
     assert out["sample_rate"] == 16000, out.get("sample_rate")
 

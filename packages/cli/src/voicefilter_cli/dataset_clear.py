@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Delete baked dataset products and HF arrow caches.
+"""Delete HF arrow caches and per-source d-vector caches.
 
-`voicefilter-cli dataset prepare` writes three kinds of artefacts. The
+`voicefilter-cli dataset prepare` writes two kinds of artefacts. The
 *paths below are the conventional defaults baked into the CLI flags*;
 your `*.yaml` may have set `cache_dir:` on any `HfSourceSpec`, in
 which case that source's HF cache lives wherever the spec points (e.g.
@@ -9,8 +9,6 @@ which case that source's HF cache lives wherever the spec points (e.g.
 `data/musan` — see `--librispeech-cache` / `--musan-cache` to learn
 what *this run* actually used).
 
-    data/processed/...                          baked wavs + manifest.json
-                                               (the `processed_dir` flag)
     data/librispeech/                            LibriSpeech HF arrow cache
       openslr___librispeech_asr/<config>/        (root path is the
         <version>/<hash>/...                      `--librispeech-cache`
@@ -19,6 +17,11 @@ what *this run* actually used).
                                                    nests the actual
                                                    arrows under
                                                    `<repo_sanitized>/`)
+      voicefilter-index/                         per-source JSON index
+      voicefilter-dvectors/<spec_id>/<spk>.npy   per-speaker d-vectors
+                                                (lazily filled by
+                                                `HfTripletStream`)
+      voicefilter-manifest.json                  per-source manifest
     data/musan/                                 MUSAN HF arrow cache
                                                 (root path is the
                                                  `--musan-cache`
@@ -31,9 +34,9 @@ what *this run* actually used).
                                                  `<repo_sanitized>/`)
 
 This script wipes those directories so the next `dataset prepare` run
-re-downloads / re-decodes from scratch — useful when the manifest is
-stale, when an HF mirror serves corrupted arrows, or when you just want
-to reclaim disk space.
+re-downloads from scratch — useful when the manifest is stale, when an
+HF mirror serves corrupted arrows, or when you just want to reclaim disk
+space.
 
 By default the script asks for an interactive confirmation. Pass
 `--yes` (`-y`) to skip the prompt (handy for CI).
@@ -46,12 +49,12 @@ Usage
     # Non-interactive
     python scripts/dataset_clear.py --yes
 
-    # Skip the baked wav dir, only clear HF caches
-    python scripts/dataset_clear.py --no-processed --yes
+    # Skip LibriSpeech, only clear MUSAN + d-vectors
+    python scripts/dataset_clear.py --no-librispeech --yes
 
     # Custom cache locations (overrides defaults)
     python scripts/dataset_clear.py \\
-        --processed-dir /tmp/vflite \\
+        --librispeech-cache /tmp/librispeech_hf \\
         --musan-cache /tmp/musan_hf \\
         --yes
 """
@@ -66,41 +69,11 @@ from typing import Annotated
 from cyclopts import App, Parameter
 
 
-def _rm(path: Path) -> tuple[str, int]:
-    """Recursively delete `path`.  Returns the path (display) and the size
-    that was freed (bytes).  Missing directories count as 0 freed."""
-    if not path.exists():
-        return str(path), 0
-
-    total = 0
-    if path.is_dir():
-        for root, _dirs, files in path.walk() if hasattr(path, "walk") else _walk(path):
-            for f in files:
-                fp = Path(root) / f
-                try:
-                    total += fp.stat().st_size
-                except OSError:
-                    pass
-    else:
-        try:
-            total += path.stat().st_size
-        except OSError:
-            pass
-
-    shutil_rmtree(path) if path.is_dir() else path.unlink(missing_ok=True)
-    return str(path), total
-
-
 def _walk(path: Path):
     """`Path.walk` was added in 3.12; provide a fallback for 3.11."""
     import os as _os
-    for root, dirs, files in _os.walk(path):
-        yield root, dirs, files
-
-
-def shutil_rmtree(path: Path) -> None:
-    import shutil
-    shutil.rmtree(path)
+    for root, dirs, _os in _os.walk(path):
+        yield root, dirs, _os
 
 
 app = App(name="clear", help_format="plaintext")
@@ -109,14 +82,9 @@ app = App(name="clear", help_format="plaintext")
 @app.default
 def main(
     *,
-    processed_dir: Annotated[
-        str,
-        Parameter(name="--processed-dir", help="Baked wav / npy / manifest output of `prepare_dataset.py`."),
-    ] = "data/processed",
     librispeech_cache: Annotated[
         str,
         Parameter(
-            name="--librispeech-cache",
             help=(
                 "HF arrow cache for LibriSpeech. Default matches "
                 "`configs/paper.yaml` (`cache_dir: data/librispeech`); "
@@ -127,7 +95,6 @@ def main(
     musan_cache: Annotated[
         str,
         Parameter(
-            name="--musan-cache",
             help=(
                 "HF arrow cache for MUSAN. Default matches "
                 "`configs/paper.yaml` (`cache_dir: data/musan`); "
@@ -136,10 +103,6 @@ def main(
         ),
     ] = "data/musan",
     # Toggle flags (default = delete; pass the negative flag to skip).
-    clear_processed: Annotated[
-        bool,
-        Parameter(name="--processed", negative="--no-processed", help="Clear --processed-dir (default: delete). Pass --no-processed to skip."),
-    ] = True,
     clear_librispeech: Annotated[
         bool,
         Parameter(name="--librispeech", negative="--no-librispeech", help="Clear --librispeech-cache (default: delete). Pass --no-librispeech to skip."),
@@ -147,6 +110,10 @@ def main(
     clear_musan: Annotated[
         bool,
         Parameter(name="--musan", negative="--no-musan", help="Clear --musan-cache (default: delete). Pass --no-musan to skip."),
+    ] = True,
+    clear_dvectors: Annotated[
+        bool,
+        Parameter(name="--dvectors", negative="--no-dvectors", help="Clear per-source voicefilter-dvectors/ caches (default: delete). Pass --no-dvectors to skip."),
     ] = True,
     yes: Annotated[
         bool,
@@ -157,16 +124,24 @@ def main(
         Parameter(name="--dry-run", help="Print what would be deleted without actually removing anything."),
     ] = False,
 ) -> None:
-    """Delete baked dataset products and HF arrow caches.
+    """Delete HF arrow caches and per-source d-vector caches.
 
     Pass ``--yes`` (``-y``) to skip the interactive confirmation.
     """
     targets: list[tuple[str, str, bool]] = [
-        ("processed",     processed_dir,     clear_processed),
-        ("librispeech",   librispeech_cache, clear_librispeech),
-        ("musan",         musan_cache,       clear_musan),
+        ("librispeech", librispeech_cache, clear_librispeech),
+        ("musan",       musan_cache,       clear_musan),
     ]
-    planned = [(name, p_str) for name, p_str, on in targets if on]
+    dvec_targets: list[tuple[str, str, bool]] = [
+        ("dvectors@librispeech", librispeech_cache, clear_dvectors and clear_librispeech),
+        ("dvectors@musan",       musan_cache,       clear_dvectors and clear_musan),
+    ]
+    planned = [
+        (name, p_str) for name, p_str, on in targets if on
+    ] + [
+        (name, str(Path(p_d) / "voicefilter-dvectors"))
+        for name, p_d, on in dvec_targets if on
+    ]
 
     if not planned:
         print("[clear] nothing selected — pass at least one target (or drop --no-* flags).")
@@ -196,7 +171,7 @@ def main(
         rows.append((label, p, exists, size))
         total_size += size
         marker = "[ok]" if exists else "[missing]"
-        print(f"  {marker} {label:<14s} {p}  ({_fmt_size(size)})")
+        print(f"  {marker} {label:<24s} {p}  ({_fmt_size(size)})")
 
     print(f"[clear] total to free: {_fmt_size(total_size)}")
 

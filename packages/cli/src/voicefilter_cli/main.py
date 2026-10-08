@@ -90,16 +90,16 @@ train_app.command(
 root.command(train_app)
 
 # `dataset <action>` — prepare or clear.
-dataset_app = App(name="dataset", help="Manage the baked dataset.")
+dataset_app = App(name="dataset", help="Manage HF arrow caches and per-source d-vector caches.")
 dataset_app.command(
     "voicefilter_cli.prepare_dataset:app",
     name="prepare",
-    help="Bake audio into data/processed/.",
+    help="Populate HF arrow caches (no wav baking).",
 )
 dataset_app.command(
     "voicefilter_cli.dataset_clear:app",
     name="clear",
-    help="Delete baked dataset products + HF arrow caches.",
+    help="Delete HF arrow caches + per-source d-vector caches.",
 )
 root.command(dataset_app)
 

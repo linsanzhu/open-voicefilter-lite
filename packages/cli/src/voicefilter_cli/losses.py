@@ -95,7 +95,7 @@ def hinge_loss(
     Paper §4.2 (Wang et al., Interspeech 2020) explicitly specifies the
     noise-type predictor is trained with a **hinge loss** for binary
     classification. Labels are in `{-1, +1}` (delivered as-is by
-    `LocalTripletStream`); +1 = frame is overlapped speech, -1 =
+    `HfTripletStream`); +1 = frame is overlapped speech, -1 =
     pass-through / no overlap.
 
     Standard hinge form: `mean( max(0, margin − y · logit) )`. The margin

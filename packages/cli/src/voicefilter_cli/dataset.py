@@ -1,19 +1,34 @@
-"""Local-dataset triplet iterator for VoiceFilter-Lite training.
+"""HF-backed triplet iterator for VoiceFilter-Lite training.
 
-Reads pre-baked wav files from `data/processed/` (produced by
-`voicefilter-cli dataset prepare`). All HF streaming + FLAC decode happens
-at the preprocessing stage; d-vector extraction happens lazily inside
-this module via `DVectorCache` (so the preprocessing step stays
-audio-only — see comment in `prepare_dataset.py`). Interference synthesis
-(babble / noise / music) also happens HERE, at training time per
-sample — `prepare_dataset` only decodes the source pools and this
-iterator mixes them on the fly.
+Reads from the HuggingFace arrow cache that `voicefilter-cli dataset
+prepare` populates — **no wav files are written to disk**. Each row of
+each (source, config, split) becomes an `HfEntry` (a `(dataset, row_idx,
+spk_id, utt_id, source_sr)` pointer). At iteration time the
+`wav_loader` reads `entry.dataset[entry.row_idx]['audio']` (a
+`{"bytes": ...}` dict with FLAC bytes when HF was downloaded as audio,
+or `{"array": ..., "sampling_rate": ...}` when upstream pre-decoded),
+then decodes via `soundfile.read(io.BytesIO(...))` and resamples to
+`hp.sample_rate` if needed. LibriSpeech is 16 kHz natively; MUSAN
+`speech` is 16 kHz, `noise` / `music` are 44.1 kHz → the loader
+handles both transparently.
+
+`prepare_dataset` now does **only** HF download + per-source index
+writing. Disk savings vs. the old wav-baking pipeline is ~80-200 GB on
+a full LibriSpeech-500 + MUSAN bake (HF arrow cache is ~10-20 GB;
+decoded wavs at 16 kHz float32 were 200+ GB).
+
+D-vector extraction happens lazily inside this module via
+`DVectorCache`. Per-speaker `<spk>.npy` files live under
+`<cache_dir>/voicefilter-dvectors/<spec_id>/<spk>.npy` (≈256 KB per
+speaker, ~256 KB total for LibriSpeech clean-360). Cache invalidation:
+wipe `<cache_dir>/voicefilter-dvectors/` to force recomputation after
+retraining the d-vector encoder.
 
 Per-sample stochastic work that must vary every iteration:
 
   1. Sample (target_speaker, target_utt)            # random
   2. Sample ref wav (70% same-speaker, 30% self)   # random
-  3. Read 2 local wavs (target + ref)              # ~3 ms/sample
+  3. Read 2 HF entries (target + ref)             # ~10 ms/sample
   4. Random crop target to `sample_length_sec`     # stochastic
   5. Compute `target_power = mean(target²)`        # used for budget
   6. Roll silent flags (target, interference)      # random
@@ -52,19 +67,21 @@ because its natural energy is higher than a raw music clip's.
 
 Interference TYPEs (`babble` / `noise` / `music`) are configured as
 direct fields on `hp.dataset.interference` (no `types` wrapper).
-`prepare_dataset` bakes each `SourceRef` referenced by any enabled TYPE
-into a flat `pool/<HfSourceSpec.id>/...` directory (e.g.
-`pool/musan/speech|noise|music/` for MUSAN). Per-sample, each TYPE's
-`prob` is an INDEPENDENT Bernoulli inclusion probability (no longer a
-weighted pick); types with `prob <= 0` or empty backing pools are
-skipped. The babble pool is **config-driven** — `_collect_babble_pool_paths`
-walks `hp.interference.babble.sources[*]` at scan time and builds
+`prepare_dataset` writes a JSON index per source at
+`<cache_dir>/voicefilter-index/<spec_id>__<subset>__<split>.json`; this
+iterator reads those JSONs at scan time to build the in-memory
+`{spk_id: [HfEntry, ...]}` map. Per-sample, each TYPE's `prob` is an
+INDEPENDENT Bernoulli inclusion probability; types with `prob <= 0` or
+empty backing pools are skipped. The babble pool is **config-driven**
+— `_collect_babble_pool_entries` walks
+`hp.interference.babble.sources[*]` at scan time and builds
 `_spk_to_paths` from the union of every babble-eligible source
-(currently musan(speech) + librispeech(other)). The librispeech `other`
-pool is NOT used for babble unless `babble.sources` declares it; the
-canonical paper.yaml keeps librispeech(other) under `noise.sources`
-for `prepare_dataset` baking + `first_librispeech_other_source`
-discovery (eval / audition harnesses), not as runtime babble input.
+(currently musan(speech) + librispeech(other)). The librispeech
+`other` pool is NOT used for babble unless `babble.sources` declares
+it; the canonical paper.yaml keeps librispeech(other) under
+`noise.sources` for `prepare_dataset` prefetch +
+`first_librispeech_other_source` discovery (eval / audition harnesses),
+not as runtime babble input.
 
 Each yielded `Sample` carries `(stacked_mixed, target_logmel, ref_dvec,
 overlap_label, noise_kind)`. `noise_kind` is a `tuple[str, ...]` of the
@@ -76,13 +93,14 @@ TYPE names actually included in this sample's interference (e.g.
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import random
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Any, Callable, Iterator, Optional
 
 import numpy as np
 import soundfile as sf
@@ -103,17 +121,50 @@ NOISE_KIND_MUSIC = "music"
 NOISE_KIND_NOISE = "noise"
 
 
-# Top-level subdir names under `processed_dir/`. These describe the
-# SEMANTIC ROLE of each subtree, not a layout choice — deliberately not
-# configurable (see `LocalTripletStream` docstring for the rationale).
-# Anything beneath them (spec_id, role, split, …) IS config-driven via
-# `HfSourceSpec`. Module-level so both `LocalTripletStream` and the
-# module-level helpers (`_collect_babble_pool_paths` / dvec cache) can
-# reference the same name.
-TARGET_TOP_SUBDIR = "target"
-POOL_TOP_SUBDIR = "pool"
-DVEC_TOP_SUBDIR = "dvectors"
-MANIFEST_FILENAME = "manifest.json"
+# Per-source subdirectory names that live next to the HF arrow cache.
+# These are the ONLY on-disk artefacts outside the HF cache itself.
+# Per-source so each cache is self-describing — no central processed_dir.
+DVEC_DIRNAME = "voicefilter-dvectors"
+INDEX_DIRNAME = "voicefilter-index"
+MANIFEST_FILENAME = "voicefilter-manifest.json"
+
+
+@dataclass(frozen=True)
+class HfEntry:
+    """Pointer into one row of one HF `datasets.Dataset`.
+
+    The audio is NOT loaded here — `wav_loader(entry, target_sr)` is
+    called at iteration. Forking a `HfTripletStream` is safe because the
+    payload is just ints + refcount-stable dataset objects (the
+    `datasets.Dataset` itself is mmap-backed by arrow, so copy-on-write
+    is fine for read-only access).
+
+    Fields:
+        dataset_id: human-readable id, e.g. `"librispeech/train.clean.360"`.
+        dataset: the mmap'd `datasets.Dataset` for this (source, config, split).
+        row_idx: row index into `dataset`.
+        spk_id: speaker id (`speaker_id` field for LibriSpeech; clip stem
+            for MUSAN). Empty string only when truly anonymous.
+        utt_id: utterance id (HF `file`/`id` field, sanitised).
+        source_sr: native sample rate of this row's audio (16k for
+            LibriSpeech, 16k for MUSAN `speech`, 44.1k for MUSAN
+            `noise` / `music`). The wav_loader uses this to decide
+            whether to resample to `target_sr`.
+    """
+    dataset_id: str
+    dataset: Any
+    row_idx: int
+    spk_id: str
+    utt_id: str
+    source_sr: int
+
+
+WavLoader = Callable[[HfEntry, int], np.ndarray]
+# `(entry, target_sr) → mono float32 (T,) at target_sr`.
+# Implementation: read `entry.dataset[entry.row_idx]['audio']` (the HF
+# row with `Audio(decode=False)`), pick `bytes` / `array` / `path`,
+# decode with `soundfile`, mixdown to mono, resample if sr != target_sr,
+# peak-clip if |x|>5.0. See `default_hf_wav_loader` below.
 
 
 def first_librispeech_other_source(hp: HParams) -> ResolvedSource:
@@ -164,19 +215,374 @@ def first_musan_repo(hp: HParams, subset: str) -> str:
     return "corypaik/musan"
 
 
-def _collect_babble_pool_paths(
-    hp: HParams,
-    processed_dir: Path,
-) -> list[tuple[str, Path]]:
-    """Walk `hp.interference.babble.sources[*]` and return babble-pool paths.
+# ============================================================ #
+# HF dataset open + iter helpers (per-source HfEntry builders)    #
+# ============================================================ #
 
-    Returns a list of `(spk_id, wav_path)` pairs. `spk_id` is a stable
+
+# `_disable_hf_audio_decode` monkey-patches HF's `Audio.decode_example`
+# and guards against re-patching on repeated calls via this module-level
+# flag. Initialised here so the first call from any module-import path
+# sees `False` rather than `NameError`.
+_HF_AUDIO_DECODE_PATCHED = False
+
+
+def _disable_hf_audio_decode() -> None:
+    """Idempotently monkey-patch HF `Audio.decode_example` to never decode.
+
+    Idempotent: the `_HF_AUDIO_DECODE_PATCHED` flag (module-level, set
+    above) prevents re-patching on repeated calls.
+    """
+    global _HF_AUDIO_DECODE_PATCHED
+    if _HF_AUDIO_DECODE_PATCHED:
+        return
+    from datasets.features import audio as _hf_audio
+    _orig_decode_example = _hf_audio.Audio.decode_example
+
+    def _passthrough_decode_example(self, value, token_per_repo_id=None):
+        if value is None:
+            return None
+        if isinstance(value, dict):
+            return value
+        return _orig_decode_example(self, value, token_per_repo_id)
+
+    _hf_audio.Audio.decode_example = _passthrough_decode_example
+    _HF_AUDIO_DECODE_PATCHED = True
+
+
+def _cast_audio_no_decode(ds):
+    """Return a copy of `ds` with every `Audio` column set to `decode=False`.
+
+    Same module-level helper exposed for callers that build a single
+    dataset directly. Combined with `_disable_hf_audio_decode` above,
+    row access returns the raw dict payload (`{"bytes": ..., "path": ...}`)
+    so `default_hf_wav_loader` decodes via `soundfile` only when needed.
+    """
+    from datasets import Audio, Features
+    new_features = Features(
+        {k: (Audio(decode=False) if k == "audio" else v) for k, v in ds.features.items()}
+    )
+    try:
+        ds = ds.cast_features(new_features)
+    except Exception:
+        ds.features.update(new_features)
+    for k, v in ds.features.items():
+        if isinstance(v, Audio):
+            v.decode = False
+    return ds
+
+
+def _open_hf_dataset(
+    resolved: ResolvedSource,
+    split: str,
+) -> "datasets.Dataset":
+    """Open one HF `datasets.Dataset` for a single (spec, subset, split).
+
+    Uses `load_dataset(..., split=..., cache_dir=...)` so the result is
+    a single concrete split — easier to index by row than a
+    `DatasetDict`. Applies the no-decode patch so row access returns
+    `{"bytes": ...}` (or `{"array": ...}`) without forcing a full
+    FLAC decode.
+
+    Cached per-process by `HfTripletStream` (the iterator doesn't
+    re-call `load_dataset` every iteration — only at scan time).
+    """
+    import datasets as _ds
+
+    # `load_dataset` takes the repo id as positional `path` (NOT a
+    # `repo=` kwarg — passing `repo=...` silently drops it and HF raises
+    # `TypeError("missing 1 required positional argument: 'path')`,
+    # which is exactly the prepare crash we hit on 2026-10-08).
+    kwargs: dict[str, Any] = {
+        "path": resolved.repo,
+        "split": split,
+        "cache_dir": resolved.cache_dir,
+    }
+    if resolved.is_librispeech():
+        # LibriSpeech uses `config="all"` (the only config that exposes
+        # both clean and other); `subset` defaults to that single config
+        # when the SourceRef didn't override it.
+        kwargs["name"] = resolved.subset or "all"
+    elif resolved.is_musan():
+        kwargs["name"] = resolved.subset
+
+    ds = _ds.load_dataset(**kwargs)
+    _disable_hf_audio_decode()
+    return _cast_audio_no_decode(ds)
+
+
+def _dataset_id(resolved: ResolvedSource, split: str) -> str:
+    """Stable id used in `HfEntry.dataset_id` (e.g. "librispeech/train.clean.360").
+
+    Human-readable; helps in error messages + d-vector path lookup.
+    """
+    if resolved.is_librispeech():
+        return f"{resolved.id}/{split}"
+    if resolved.is_musan():
+        return f"{resolved.id}/{resolved.subset}/{split}"
+    return f"{resolved.id}/{split}"
+
+
+def _load_index(
+    resolved: ResolvedSource,
+    split: str,
+    cache_dir: Path,
+) -> Optional[list[dict]]:
+    """Load `<cache_dir>/voicefilter-index/<dataset_id>.json` if present.
+
+    `prepare_dataset` writes one JSON per (spec, subset, split) so
+    training can rebuild the in-memory `{spk_id → [HfEntry, …]}` map
+    without re-walking the HF arrow cache at startup (~1-2 s saved for
+    LibriSpeech clean-360 on cold cache; ~30 s saved when the cache
+    is on cold spinning disk).
+
+    Returns the `entries` list (each dict: `{row_idx, spk_id, utt_id,
+    source_sr}`) or `None` when the JSON is missing (the iterator then
+    falls back to walking the dataset). Missing file is OK — older
+    prepare outputs didn't write this JSON.
+    """
+    ds_id = _dataset_id(resolved, split)
+    safe_ds = ds_id.replace("/", "__")
+    path = Path(cache_dir) / INDEX_DIRNAME / f"{safe_ds}.json"
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text())
+    except Exception:
+        return None
+    entries = payload.get("entries")
+    if not isinstance(entries, list) or not entries:
+        return None
+    return entries
+
+
+def _row_metadata(
+    resolved: ResolvedSource,
+    row: Any,
+    source_sr: int,
+) -> tuple[str, str]:
+    """Extract `(spk_id, utt_id)` from a single HF row.
+
+    LibriSpeech: `speaker_id` (int → str) + `file` (path → utt id).
+    MUSAN: clip stem from `audio.path` (or `id` / `file`). MUSAN has
+    no real speaker; we use the clip stem as the identity.
+    """
+    if resolved.is_librispeech():
+        spk = row.get("speaker_id") if hasattr(row, "get") else row["speaker_id"]
+        utt = row.get("id") or row.get("file") if hasattr(row, "get") else (
+            row.get("id") or row.get("file")
+        )
+        spk_id = str(spk).strip() if spk is not None else ""
+        utt_id = Path(str(utt).strip()).stem if utt else ""
+        if not utt_id:
+            audio = row.get("audio") if hasattr(row, "get") else row.get("audio")
+            if isinstance(audio, dict) and audio.get("path"):
+                utt_id = Path(audio["path"]).stem
+        if not spk_id:
+            spk_id = "unknown"
+        if not utt_id:
+            utt_id = "unknown"
+        return spk_id, utt_id
+    if resolved.is_musan():
+        audio = row.get("audio") if hasattr(row, "get") else row.get("audio")
+        path_str = ""
+        if isinstance(audio, dict):
+            path_str = audio.get("path") or ""
+        if not path_str:
+            for k in ("id", "file", "utt_id"):
+                v = row.get(k) if hasattr(row, "get") else None
+                if v:
+                    path_str = str(v)
+                    break
+        stem = Path(path_str).stem if path_str else "(unknown)"
+        spk_id = f"musan_{resolved.subset}_{stem}" if resolved.subset else stem
+        return spk_id, stem
+    # Generic: pull spk_id from `speaker_id`, `spk_id`, or fall back.
+    spk = None
+    for k in ("speaker_id", "spk_id", "speaker"):
+        if hasattr(row, "get"):
+            spk = row.get(k)
+        else:
+            spk = row.get(k) if k in row else None
+        if spk:
+            break
+    utt = None
+    for k in ("id", "utt_id", "file"):
+        if hasattr(row, "get"):
+            utt = row.get(k)
+        else:
+            utt = row.get(k) if k in row else None
+        if utt:
+            break
+    return (str(spk).strip() if spk else "unknown"), (
+        str(utt).strip() if utt else "unknown"
+    )
+
+
+def _iter_musan_speech_entries(
+    resolved: ResolvedSource,
+    dataset_cache: dict[str, "datasets.Dataset"],
+) -> list[HfEntry]:
+    """Build `[HfEntry]` for a MUSAN `speech` resolved source.
+
+    Cache key = `_dataset_id(resolved, split)`. The same cache key is
+    reused by `_iter_musan_subset_entries` (called by `_collect_passthrough_pool_entries`
+    when the noise config also lists a MUSAN source) — each unique
+    (spec, subset, split) opens exactly ONE `datasets.Dataset`.
+    """
+    out: list[HfEntry] = []
+    source_sr = 16000
+    for split in resolved.splits:
+        ds_id = _dataset_id(resolved, split)
+        ds = dataset_cache.get(ds_id)
+        if ds is None:
+            ds = _open_hf_dataset(resolved, split)
+            dataset_cache[ds_id] = ds
+        for row_idx in range(len(ds)):
+            row = ds[row_idx]
+            spk_id, utt_id = _row_metadata(resolved, row, source_sr)
+            out.append(
+                HfEntry(
+                    dataset_id=ds_id,
+                    dataset=ds,
+                    row_idx=row_idx,
+                    spk_id=spk_id,
+                    utt_id=utt_id,
+                    source_sr=source_sr,
+                )
+            )
+    return out
+
+
+def _iter_musan_subset_entries(
+    resolved: ResolvedSource,
+    dataset_cache: dict[str, "datasets.Dataset"],
+    type_name: str,
+) -> list[HfEntry]:
+    """Build `[HfEntry]` for a MUSAN `noise` or `music` resolved source.
+
+    `type_name` is `noise` / `music` — used to pick the source_sr (both
+    `noise` and `music` are 44.1 kHz on MUSAN). The caller only feeds
+    musan sources here (the librispeech(other) refs are skipped before
+    we get called).
+    """
+    out: list[HfEntry] = []
+    # MUSAN noise / music subsets are natively 44.1 kHz (sampling rate
+    # carried on each row's `audio.sampling_rate` too; we hardcode here
+    # for speed — see plan).
+    source_sr = 44100
+    for split in resolved.splits:
+        ds_id = _dataset_id(resolved, split)
+        ds = dataset_cache.get(ds_id)
+        if ds is None:
+            ds = _open_hf_dataset(resolved, split)
+            dataset_cache[ds_id] = ds
+        for row_idx in range(len(ds)):
+            row = ds[row_idx]
+            spk_id, utt_id = _row_metadata(resolved, row, source_sr)
+            out.append(
+                HfEntry(
+                    dataset_id=ds_id,
+                    dataset=ds,
+                    row_idx=row_idx,
+                    spk_id=spk_id,
+                    utt_id=utt_id,
+                    source_sr=source_sr,
+                )
+            )
+    return out
+
+
+def _iter_librispeech_entries(
+    resolved: ResolvedSource,
+    dataset_cache: dict[str, "datasets.Dataset"],
+) -> list[HfEntry]:
+    """Build `[HfEntry]` for a LibriSpeech resolved source (target or `other` pool).
+
+    Walks each split in `resolved.splits` (e.g. `train.clean.360`,
+    `train.other.500`). Source_sr is uniformly 16 kHz on LibriSpeech.
+    """
+    out: list[HfEntry] = []
+    source_sr = 16000
+    for split in resolved.splits:
+        ds_id = _dataset_id(resolved, split)
+        ds = dataset_cache.get(ds_id)
+        if ds is None:
+            ds = _open_hf_dataset(resolved, split)
+            dataset_cache[ds_id] = ds
+        for row_idx in range(len(ds)):
+            row = ds[row_idx]
+            spk_id, utt_id = _row_metadata(resolved, row, source_sr)
+            out.append(
+                HfEntry(
+                    dataset_id=ds_id,
+                    dataset=ds,
+                    row_idx=row_idx,
+                    spk_id=spk_id,
+                    utt_id=utt_id,
+                    source_sr=source_sr,
+                )
+            )
+    return out
+
+
+def _build_target_index(
+    hp: HParams,
+    dataset_cache: dict[str, "datasets.Dataset"],
+) -> tuple[
+    dict[str, list[HfEntry]],
+    dict[str, str],
+]:
+    """Build target `{spk_id → [HfEntry, …]}` + `{spk_id → spec_id}`.
+
+    Walks `hp.target_sources[*]`, resolves each via `resolve_source`,
+    and unions every HfEntry. The spec_id partition is used by
+    `DVectorCache` so multi-source targets don't collide on speaker ids.
+
+    Returns `(target_index, spk_to_spec_id)`.
+    """
+    target_index: dict[str, list[HfEntry]] = {}
+    spk_to_spec_id: dict[str, str] = {}
+
+    for ref in hp.target_sources:
+        try:
+            resolved = resolve_source(hp, ref)
+        except KeyError:
+            continue
+        if resolved.is_librispeech():
+            entries = _iter_librispeech_entries(resolved, dataset_cache)
+        elif resolved.is_musan():
+            # MUSAN is not a target source (no real speakers) — skip.
+            continue
+        else:
+            entries = _iter_librispeech_entries(resolved, dataset_cache)
+        for entry in entries:
+            target_index.setdefault(entry.spk_id, []).append(entry)
+            spk_to_spec_id[entry.spk_id] = resolved.id
+
+    # Sort each speaker's entry list by `(dataset_id, row_idx)` so the
+    # "first available utterance" reference choice is deterministic
+    # across runs (the d-vector cache uses `paths[0]` for ref-wav
+    # resolution).
+    for spk in target_index:
+        target_index[spk].sort(key=lambda e: (e.dataset_id, e.row_idx))
+
+    return target_index, spk_to_spec_id
+
+
+def _collect_babble_pool_entries(
+    hp: HParams,
+    dataset_cache: dict[str, "datasets.Dataset"],
+) -> list[tuple[str, HfEntry]]:
+    """Walk `hp.interference.babble.sources[*]` and return babble-pool `HfEntry`s.
+
+    Returns a list of `(spk_id, entry)` pairs. `spk_id` is a stable
     identity key for babble dedup (the runtime picks N DISTINCT
     `spk_id`s — see `_pick_babble_speakers`):
 
       * musan(speech)        : `musan_speech__<clip_stem>` —
                                 each clip is one long-monologue
-                                identity, exactly one wav each.
+                                identity, exactly one entry each.
       * librispeech(other)   : `librispeech_other__<spk>` —
                                 `parts[0]` under the split dir is the
                                 speaker id (multiple utts per spk).
@@ -186,21 +592,16 @@ def _collect_babble_pool_paths(
     target pools, not babble-eligible.
 
     Empty list when babble is disabled, or when no configured source
-    has a non-empty pool on disk. `prepare_dataset` bakes every
-    configured source into `processed_dir/pool/...` so an empty
-    return here usually means the user ran training without baking
-    first — a config / pipeline error rather than a runtime concern.
+    has a non-empty pool in the HF cache. An empty return is a config /
+    pipeline error (the user ran training without `prepare`) — surfaced
+    elsewhere.
     """
     babble_cfg = hp.interference_types.get("babble")
     if babble_cfg is None or not babble_cfg.enabled or babble_cfg.prob <= 0:
         return []
 
-    pool_root = Path(processed_dir) / POOL_TOP_SUBDIR
-    if not pool_root.is_dir():
-        return []
-
-    out: list[tuple[str, Path]] = []
-    seen: set[Path] = set()
+    out: list[tuple[str, HfEntry]] = []
+    seen_keys: set[tuple[str, int]] = set()  # (dataset_id, row_idx)
 
     for ref in babble_cfg.sources:
         try:
@@ -211,30 +612,21 @@ def _collect_babble_pool_paths(
             continue
 
         if resolved.is_musan() and resolved.subset == "speech":
-            sub = pool_root / resolved.id / "speech"
-            if not sub.is_dir():
-                continue
-            for wav in sorted(sub.glob("*.wav")):
-                if wav in seen:
+            for entry in _iter_musan_speech_entries(resolved, dataset_cache):
+                key = (entry.dataset_id, entry.row_idx)
+                if key in seen_keys:
                     continue
-                seen.add(wav)
-                out.append((f"musan_speech__{wav.stem}", wav))
+                seen_keys.add(key)
+                out.append((f"musan_speech__{entry.utt_id}", entry))
             continue
 
         if resolved.is_librispeech() and resolved.librispeech_role() == "other":
-            for split in resolved.splits:
-                sub = pool_root / resolved.id / "other" / split
-                if not sub.is_dir():
+            for entry in _iter_librispeech_entries(resolved, dataset_cache):
+                key = (entry.dataset_id, entry.row_idx)
+                if key in seen_keys:
                     continue
-                for wav_path in sorted(sub.glob("*/*.wav")):
-                    parts = wav_path.relative_to(sub).parts
-                    if len(parts) < 2:
-                        continue
-                    spk = parts[0]
-                    if wav_path in seen:
-                        continue
-                    seen.add(wav_path)
-                    out.append((f"librispeech_other__{spk}", wav_path))
+                seen_keys.add(key)
+                out.append((f"librispeech_other__{entry.spk_id}", entry))
             continue
 
         # Other kinds (noise / music subsets, librispeech clean role):
@@ -242,36 +634,31 @@ def _collect_babble_pool_paths(
     return out
 
 
-def _collect_passthrough_pool_paths(
+def _collect_passthrough_pool_entries(
     hp: HParams,
-    pool_root: Path,
+    dataset_cache: dict[str, "datasets.Dataset"],
     type_name: str,
-) -> list[Path]:
+) -> list[HfEntry]:
     """Collect passthrough-pool clips for the `noise` / `music` TYPEs.
 
     Walks `hp.interference.<type_name>.sources[*]` and unions every
-    on-disk `pool/<spec_id>/<subset>/<clip>.wav` clip. Only MUSAN
-    sources are consumed at runtime (the noise / music TYPE mixer is
-    a "1 random clip + random_crop" passthrough, and we keep the
-    speech-source concern out of it). Non-musan refs (e.g.
-    librispeech(other) under `noise.sources` for eval discoverability)
-    are skipped silently — they're still baked by `prepare_dataset`
-    so `first_librispeech_other_source` can find them.
+    `HfEntry` from each MUSAN-configured source. Only MUSAN sources are
+    consumed at runtime (the noise / music TYPE mixer is a "1 random
+    clip + random_crop" passthrough, and we keep the speech-source
+    concern out of it). Non-musan refs (e.g. librispeech(other) under
+    `noise.sources` for eval discoverability) are skipped silently —
+    `prepare_dataset` still downloads them so `first_librispeech_other_source`
+    can find them.
 
-    Spec.id is resolved via `resolve_source(...)` — change a musan
-    `HfSourceSpec.id` and the scan follows automatically (no literal
-    "musan" anywhere in this function).
-
-    Returns a deduplicated, sorted list of wav paths. Empty when the
-    TYPE is disabled, has `prob <= 0`, or has no enabled musan source
-    with a non-empty on-disk pool.
+    Empty when the TYPE is disabled, has `prob <= 0`, or has no enabled
+    musan source with a non-empty on-disk cache.
     """
     type_cfg = hp.interference_types.get(type_name)
     if type_cfg is None or not type_cfg.enabled or type_cfg.prob <= 0:
         return []
 
-    out: list[Path] = []
-    seen: set[Path] = set()
+    out: list[HfEntry] = []
+    seen_keys: set[tuple[str, int]] = set()
     for ref in type_cfg.sources:
         try:
             resolved = resolve_source(hp, ref)
@@ -279,16 +666,15 @@ def _collect_passthrough_pool_paths(
             continue
         if not resolved.is_musan() or not resolved.subset:
             # Runtime noise/music mixer only consumes musan pools;
-            # librispeech(other) etc. are baked-only for eval discovery.
+            # librispeech(other) etc. are downloaded-only for eval
+            # discovery.
             continue
-        sub = pool_root / resolved.id / resolved.subset
-        if not sub.is_dir():
-            continue
-        for wav in sorted(sub.glob("*.wav")):
-            if wav in seen:
+        for entry in _iter_musan_subset_entries(resolved, dataset_cache, type_name):
+            key = (entry.dataset_id, entry.row_idx)
+            if key in seen_keys:
                 continue
-            seen.add(wav)
-            out.append(wav)
+            seen_keys.add(key)
+            out.append(entry)
     return out
 
 
@@ -324,7 +710,7 @@ class RawSample:
     invoke the SAME per-sample synthesis logic without re-implementing
     the silent-flag / activity-burst / Dirichlet-budget dance.
 
-    The training iterator (`LocalTripletStream.__iter__`) calls
+    The training iterator (`HfTripletStream.__iter__`) calls
     `synthesize_raw_sample` and then converts these wavs into log-mel
     features for `Sample` (see `_sample_to_feature`). The `RawSample`
     fields are exactly the WAV-side state at the moment log-mel would
@@ -369,15 +755,109 @@ class RawSample:
     interference_silent: bool
 
 
-# Module-level default wav loader — used by `synthesize_raw_sample` and
-# `_mix_passthrough_v2` when the caller doesn't supply one. Matches the
-# behaviour of training (path → mono float32 numpy). Example scripts
-# that have in-memory wavs pass a custom loader.
+# Module-level default wav loaders. Two related APIs:
+#
+#   `_default_wav_loader(path)`        — legacy, takes a `Path` to a
+#                                         baked `.wav` on disk. Retained
+#                                         for unit tests that still build
+#                                         tiny tempdir wavs; NOT used by
+#                                         `HfTripletStream` at runtime.
+#
+#   `default_hf_wav_loader(entry, sr)` — the canonical loader for the
+#                                         HF arrow cache pipeline. Reads
+#                                         `entry.dataset[entry.row_idx]['audio']`
+#                                         and decodes via `soundfile`
+#                                         (or returns the pre-decoded
+#                                         array). Resamples via
+#                                         librosa if `entry.source_sr !=
+#                                         target_sr`. Peak-clips `|x|>5.0`
+#                                         defensively (don't let a single
+#                                         spike dominate the d-vector or
+#                                         log-mel).
+
+
 def _default_wav_loader(path: Path) -> np.ndarray:
-    """Read `path` as a mono float32 numpy array (training's default)."""
+    """Legacy `Path → np.ndarray` loader.
+
+    Reads a baked `.wav` from disk via `soundfile.read(...)`, downmixes to
+    mono, returns float32. Used by unit tests that still build a tempdir
+    of small wavs; the runtime iterator (`HfTripletStream`) does NOT
+    use this loader — it uses `default_hf_wav_loader`.
+    """
     wav, _ = sf.read(str(path), dtype="float32")
     if wav.ndim > 1:
         wav = wav.mean(axis=1)
+    return wav.astype(np.float32, copy=False)
+
+
+def default_hf_wav_loader(entry: HfEntry, target_sr: int) -> np.ndarray:
+    """Load one `HfEntry` as a mono float32 `(T,)` array at `target_sr`.
+
+    Reads `entry.dataset[entry.row_idx]['audio']` — HF `Audio(decode=False)`
+    exposes three payloads depending on upstream:
+      * `{"bytes": ..., "path": ...}` — FLAC bytes on disk; `soundfile`
+        decodes via `BytesIO`. **The common path** for LibriSpeech /
+        MUSAN after `_disable_hf_audio_decode` + `_cast_audio_no_decode`.
+      * `{"array": np.ndarray, "sampling_rate": int}` — pre-decoded
+        array; we copy + resample if SR differs.
+      * `{"path": str}` only (no `array`, no `bytes`) — fallback path
+        decode via the on-disk file.
+
+    Always mono (mean over channels). Resamples via `librosa.resample`
+    when `entry.source_sr != target_sr` (MUSAN `noise` / `music` are
+    44.1 kHz; LibriSpeech + MUSAN `speech` are 16 kHz).
+
+    Defensive peak clip `|x|>5.0`: a single transient can dominate
+    `extract_dvec` (large magnitude → softmax saturation → uniform
+    embedding) and the log-mel pipeline. Clip anything clearly
+    pathological; leave normal speech / noise untouched.
+    """
+    row = entry.dataset[entry.row_idx]
+    audio = row.get("audio") if hasattr(row, "get") else row["audio"]
+    if audio is None:
+        raise RuntimeError(
+            f"[default_hf_wav_loader] entry has no 'audio' field; "
+            f"row keys={list(row.keys()) if hasattr(row, 'keys') else 'n/a'}"
+        )
+
+    sr = entry.source_sr
+    wav: np.ndarray
+
+    # Case 1: pre-decoded array (HF sometimes ships one).
+    if isinstance(audio, dict) and audio.get("array") is not None:
+        wav = np.asarray(audio["array"], dtype=np.float32)
+        sr = int(audio.get("sampling_rate", sr))
+    # Case 2: bytes payload — `soundfile.read` handles FLAC via BytesIO.
+    elif isinstance(audio, dict) and audio.get("bytes") is not None:
+        with io.BytesIO(audio["bytes"]) as buf:
+            wav, file_sr = sf.read(buf, dtype="float32")
+        sr = int(file_sr)
+    # Case 3: bare on-disk path.
+    elif isinstance(audio, dict) and audio.get("path"):
+        wav, file_sr = sf.read(audio["path"], dtype="float32")
+        sr = int(file_sr)
+    else:
+        raise RuntimeError(
+            f"[default_hf_wav_loader] audio payload has no "
+            f"`array`/`bytes`/`path`; got keys="
+            f"{list(audio.keys()) if isinstance(audio, dict) else type(audio)}"
+        )
+
+    wav = np.asarray(wav, dtype=np.float32)
+    if wav.ndim > 1:
+        wav = wav.mean(axis=1)
+
+    if sr != target_sr:
+        import librosa  # local import; only needed for resample path
+
+        wav = librosa.resample(
+            wav, orig_sr=int(sr), target_sr=int(target_sr)
+        ).astype(np.float32)
+
+    peak = float(np.abs(wav).max()) if wav.size else 0.0
+    if peak > 5.0:
+        wav = (wav / peak).astype(np.float32)
+
     return wav.astype(np.float32, copy=False)
 
 
@@ -455,46 +935,47 @@ def _per_frame_overlap_label(
 
 def _pick_babble_speakers(
     rng: random.Random,
-    spk_to_paths: dict[str, list[Path]],
+    spk_to_entries: dict[str, list[HfEntry]],
     n_speakers_min: int,
     n_speakers_max: int,
-) -> list[tuple[str, Path]]:
+) -> list[tuple[str, HfEntry]]:
     """Pick N DISTINCT speakers for one babble mix (no replacement).
 
-    Returns `[(spk_id, path), ...]` of length N ∈ `[n_speakers_min,
-    n_speakers_max]` (clamped to `len(spk_to_paths)`). For each chosen
-    speaker one random utterance from `spk_to_paths[spk]` is selected.
+    Returns `[(spk_id, entry), ...]` of length N ∈ `[n_speakers_min,
+    n_speakers_max]` (clamped to `len(spk_to_entries)`). For each chosen
+    speaker one random `HfEntry` from `spk_to_entries[spk]` is selected.
 
     Splitting the picker from the mixer lets the unit test verify
     "exactly N distinct speakers" without stubbing `sf.read`; the
     iterator calls this then hands the picks to `_mix_babble_from_picks`.
     """
-    if not spk_to_paths:
+    if not spk_to_entries:
         return []
-    n_avail = len(spk_to_paths)
+    n_avail = len(spk_to_entries)
     n_min = max(1, min(int(n_speakers_min), n_avail))
     n_max = max(n_min, min(int(n_speakers_max), n_avail))
     n = rng.randint(n_min, n_max)
-    chosen_spks = rng.sample(list(spk_to_paths.keys()), k=n)
-    return [(spk, rng.choice(spk_to_paths[spk])) for spk in chosen_spks]
+    chosen_spks = rng.sample(list(spk_to_entries.keys()), k=n)
+    return [(spk, rng.choice(spk_to_entries[spk])) for spk in chosen_spks]
 
 
 def _mix_babble_from_picks(
     rng: random.Random,
     sample_len: int,
     sr: int,
-    picks: list[tuple[str, Path]],
+    picks: list[tuple[str, HfEntry]],
     seg_min_sec: float,
     seg_max_sec: float,
     gain_min: float,
     gain_max: float,
-    wav_loader=_default_wav_loader,
+    wav_loader=default_hf_wav_loader,
 ) -> torch.Tensor:
     """Mix N speakers (already picked) into one `(sample_len,)` wav.
 
-    For each `(spk, path)`:
-      1. Load the wav via `wav_loader(path)` (default = `sf.read` from
-         disk, mono float32), downmix to mono.
+    For each `(spk, entry)`:
+      1. Load the wav via `wav_loader(entry, sr)` (default =
+         `default_hf_wav_loader` — reads FLAC bytes from HF arrow
+         cache, decodes via soundfile, resamples to `sr` if needed).
       2. Pick a random segment length ∈ `[seg_min_sec, seg_max_sec]`
          (clamped to the wav length).
       3. Pick a random start within the wav for that segment.
@@ -506,18 +987,18 @@ def _mix_babble_from_picks(
     Clips shorter than `seg_min_sec * sr` samples are skipped — should
     only matter for tiny fixture wavs in tests. Empty input → silence.
 
-    The `wav_loader` hook lets callers with non-filesystem wavs (HF
-    arrow cache, in-memory tensors) supply their own loader without
-    writing the wavs to disk. Training uses the default (`_default_wav_loader`).
+    The `wav_loader` hook lets callers with in-memory wavs (e.g.
+    unit-test mocks that hand back canned arrays) supply their own
+    loader without touching the HF arrow cache.
     """
     out = np.zeros(sample_len, dtype=np.float32)
     if not picks:
         return torch.from_numpy(out)
     seg_min = max(1, int(seg_min_sec * sr))
     seg_max = max(seg_min, int(seg_max_sec * sr))
-    for _spk, path in picks:
+    for _spk, entry in picks:
         try:
-            wav = wav_loader(path)
+            wav = wav_loader(entry, sr)
         except Exception:
             continue
         if wav.ndim > 1:
@@ -671,32 +1152,37 @@ def _allocate_interference_budget(
 # Module-level interference synthesis (pool-agnostic)              #
 # ============================================================ #
 #
-# These are the same algorithms `LocalTripletStream._sample_interference`
+# These are the same algorithms `HfTripletStream._sample_interference`
 # runs, but lifted to module scope so callers that hold their own
 # pool structures (e.g. `examples/04_*` after backing in-memory wavs to
 # a tmp `pool/` directory) can invoke them without instantiating the
-# full `LocalTripletStream` dataset. Training and example scripts share
+# full `HfTripletStream` dataset. Training and example scripts share
 # the same code path → identical sampling statistics.
 
 
 def _mix_passthrough_v2(
     rng: random.Random,
     sample_len: int,
-    pool: list[Path],
-    wav_loader=_default_wav_loader,
+    pool: list[HfEntry],
+    target_sr: int,
+    wav_loader=default_hf_wav_loader,
 ) -> torch.Tensor:
     """`noise` / `music` TYPEs — 1 random clip from `pool`, cropped/padded to `sample_len`.
 
-    Module-level twin of `LocalTripletStream._mix_passthrough`. Same
+    Module-level twin of `HfTripletStream._mix_passthrough`. Same
     algorithm, same RNG contract (the `random_crop` call inside
     `random_crop` consumes one RNG draw); the only difference is the
-    `wav_loader` hook so callers with non-filesystem wavs can supply
-    their own. Returns zeros when `pool` is empty (defensive).
+    `wav_loader` hook so callers with in-memory wavs can supply their
+    own. Returns zeros when `pool` is empty (defensive).
+
+    `target_sr` is passed to `wav_loader(entry, target_sr)` so MUSAN
+    `noise` / `music` clips (44.1 kHz natively) get resampled to the
+    model sample rate on read.
     """
     if not pool:
         return torch.zeros(sample_len, dtype=torch.float32)
-    path = rng.choice(pool)
-    wav_np = wav_loader(path)
+    entry = rng.choice(pool)
+    wav_np = wav_loader(entry, target_sr)
     wav_t = torch.from_numpy(wav_np)
     return random_crop(wav_t, sample_len)
 
@@ -708,15 +1194,15 @@ def _sample_interference_v2(
     target_power: float,
     snr_db: float,
     *,
-    babble_spk_to_paths: dict[str, list[Path]],
-    noise_pool: list[Path],
-    music_pool: list[Path],
+    babble_spk_to_entries: dict[str, list[HfEntry]],
+    noise_pool: list[HfEntry],
+    music_pool: list[HfEntry],
     babble_cfg,
     noise_cfg,
     music_cfg,
-    wav_loader=_default_wav_loader,
+    wav_loader=default_hf_wav_loader,
 ) -> tuple[torch.Tensor, tuple[str, ...]]:
-    """Module-level twin of `LocalTripletStream._sample_interference`.
+    """Module-level twin of `HfTripletStream._sample_interference`.
 
     Rolls each TYPE's independent Bernoulli `prob`, synthesises the
     included components, then delegates energy-budget allocation to
@@ -729,18 +1215,19 @@ def _sample_interference_v2(
     the same RNG seed.
 
     Args:
-        babble_spk_to_paths: pooled babble pool (spk_id → list of paths).
-            `babble_cfg.sources` decides which sources feed in; this map
-            is the union. `_pick_babble_speakers` ensures N distinct
-            identities.
+        babble_spk_to_entries: pooled babble pool (spk_id → list of
+            `HfEntry`s). `babble_cfg.sources` decides which sources
+            feed in; this map is the union. `_pick_babble_speakers`
+            ensures N distinct identities.
         noise_pool / music_pool: passthrough pools (`_mix_passthrough_v2`
             picks one clip + random-crop).
         babble_cfg / noise_cfg / music_cfg: `InterferenceTypeCfg` objects
             from `hp.interference_types[<name>]` — `prob`, segment
             lengths, gain range, etc. `None` is treated as disabled.
-        wav_loader: `Path → np.ndarray (T,)` hook. Default =
-            `_default_wav_loader`. Example scripts with in-memory wavs
-            pass their own loader.
+        wav_loader: `(HfEntry, target_sr) → np.ndarray (T,)` hook.
+            Default = `default_hf_wav_loader` (reads FLAC bytes from
+            HF arrow cache, decodes via soundfile). Example scripts
+            with in-memory wavs pass their own loader.
     """
     components: list[torch.Tensor] = []
     included: list[str] = []
@@ -749,7 +1236,7 @@ def _sample_interference_v2(
         if cfg is None or not cfg.enabled or float(cfg.prob) <= 0.0:
             return False
         if type_name == NOISE_KIND_BABBLE:
-            return bool(babble_spk_to_paths)
+            return bool(babble_spk_to_entries)
         if type_name == NOISE_KIND_NOISE:
             return bool(noise_pool)
         if type_name == NOISE_KIND_MUSIC:
@@ -770,7 +1257,7 @@ def _sample_interference_v2(
         if type_name == NOISE_KIND_BABBLE:
             picks = _pick_babble_speakers(
                 rng=rng,
-                spk_to_paths=babble_spk_to_paths,
+                spk_to_entries=babble_spk_to_entries,
                 n_speakers_min=cfg.n_speakers_min,
                 n_speakers_max=cfg.n_speakers_max,
             )
@@ -786,9 +1273,13 @@ def _sample_interference_v2(
                 wav_loader=wav_loader,
             )
         elif type_name == NOISE_KIND_NOISE:
-            component = _mix_passthrough_v2(rng, sample_len, noise_pool, wav_loader)
+            component = _mix_passthrough_v2(
+                rng, sample_len, noise_pool, hp.sample_rate, wav_loader,
+            )
         elif type_name == NOISE_KIND_MUSIC:
-            component = _mix_passthrough_v2(rng, sample_len, music_pool, wav_loader)
+            component = _mix_passthrough_v2(
+                rng, sample_len, music_pool, hp.sample_rate, wav_loader,
+            )
         else:
             continue  # unreachable; defensive
         components.append(component)
@@ -825,16 +1316,16 @@ def synthesize_raw_sample(
     *,
     target_wav_full: torch.Tensor,
     ref_wav_full: torch.Tensor,
-    babble_spk_to_paths: dict[str, list[Path]],
-    noise_pool: list[Path],
-    music_pool: list[Path],
+    babble_spk_to_entries: dict[str, list[HfEntry]],
+    noise_pool: list[HfEntry],
+    music_pool: list[HfEntry],
     type_probs: dict[str, float],
     babble_cfg,
     noise_cfg,
     music_cfg,
-    wav_loader=_default_wav_loader,
+    wav_loader=default_hf_wav_loader,
 ) -> RawSample:
-    """One end-to-end per-sample WAV synthesis — mirrors `LocalTripletStream.__iter__` lines 1387–1464.
+    """One end-to-end per-sample WAV synthesis — mirrors `HfTripletStream.__iter__`.
 
     The caller picks the target speaker/utterance and the reference
     utterance (training does this from a pre-baked index;
@@ -891,7 +1382,7 @@ def synthesize_raw_sample(
 
     `type_probs` is currently unused by this function (the configs
     carry their own `prob`); accepted for forward-compat and to make
-    the signature symmetric with `LocalTripletStream._sample_interference`.
+    the signature symmetric with `HfTripletStream._sample_interference`.
 
     Returns a `RawSample` carrying the wavs, activity masks, ref wav,
     snr draw, included kinds, and the silent flags.
@@ -973,7 +1464,7 @@ def synthesize_raw_sample(
     snr_db = float(rng.uniform(hp.snr_min_db, hp.snr_max_db))
     interference_wav, included_kinds = _sample_interference_v2(
         hp, rng, sample_len, target_power, snr_db,
-        babble_spk_to_paths=babble_spk_to_paths,
+        babble_spk_to_entries=babble_spk_to_entries,
         noise_pool=noise_pool,
         music_pool=music_pool,
         babble_cfg=babble_cfg,
@@ -1052,22 +1543,25 @@ class DVectorCache:
     Replaces the old `voicefilter-cli dataset prepare` d-vector step:
     instead of pre-baking one `.npy` per speaker before training, we
     fill the cache on first sight of each new speaker during training
-    iteration. Disk path is `<processed_dir>/dvectors/<spec_id>/<spk>.npy`
-    where `spec_id` is the `HfSourceSpec.id` of the source the speaker
-    came from (e.g. `dvectors/librispeech/<spk>.npy` for the default
-    LibriSpeech target). Multi-source targets get separate partitions
-    (no speaker-id collision across sources in practice).
+    iteration. Disk path is
+    `<spec.cache_dir>/voicefilter-dvectors/<spec_id>/<spk>.npy` where
+    `spec_id` is the `HfSourceSpec.id` of the source the speaker came
+    from (e.g. `voicefilter-dvectors/librispeech/<spk>.npy` for the
+    default LibriSpeech target). Multi-source targets get separate
+    partitions (no speaker-id collision across sources in practice).
+    `cache_dir` is taken from the resolved spec so the d-vector cache
+    lives next to the source's HF arrow cache (no central `processed_dir`).
 
     Lookup order (cheapest first):
         1. In-process dict (`_mem_cache`) — O(1), µs.
         2. On-disk file — one `np.load`.
-        3. Compute — read the speaker's reference wav, run
+        3. Compute — read the speaker's reference `HfEntry`, run
            `extract_dvec(...)`, atomic-rename-save to disk.
 
     Concurrency:
         * In-process: `_mem_cache` is plain dict access — safe (CPython
           GIL). Encoder is a module-level singleton keyed by
-          `(pt_path, mtime_ns, size)` so multiple `LocalTripletStream`
+          `(pt_path, mtime_ns, size)` so multiple `HfTripletStream`
           instances share weights.
         * Cross-process (DataLoader workers): each worker has its own
           `_mem_cache` and its own encoder singleton. The disk write
@@ -1078,7 +1572,7 @@ class DVectorCache:
           sees the same disk file and falls through to the cheap path.
 
     Failure mode:
-        * No reference wav for the speaker → zeros + WARN.
+        * No reference entry for the speaker → zeros + WARN.
         * Encoder weights missing at `hp.dvector_pt_path` → random init
           + WARN; the d-vector is uninformative but training still runs.
         * Any compute exception → zeros + WARN. (Training would
@@ -1086,42 +1580,38 @@ class DVectorCache:
 
     Cache invalidation: keyed only by (spec_id, speaker id). If you
     retrain the d-vector encoder (`voicefilter-cli train dvector`),
-    delete `data/processed/dvectors/` to force recomputation. Future
-    improvements (mtime-based invalidation) tracked separately.
+    delete `<cache_dir>/voicefilter-dvectors/` to force recomputation.
+    Future improvements (mtime-based invalidation) tracked separately.
     """
 
     def __init__(
         self,
         hp: HParams,
-        processed_dir: Path,
-        target_index: dict[str, list[Path]],
+        target_index: dict[str, list[HfEntry]],
         spk_to_spec_id: Optional[dict[str, str]] = None,
+        cache_root: Optional[Path] = None,
     ):
         self.hp = hp
-        self.processed_dir = Path(processed_dir)
-        # spk → spec_id map built by `LocalTripletStream._scan_processed_dir`
+        # spk → spec_id map built by `HfTripletStream._scan_hf_datasets`
         # (falls back to an empty dict when target is empty / not scanned yet).
         self._spk_to_spec_id: dict[str, str] = dict(spk_to_spec_id or {})
-        # Resolve the d-vector partition by target spec.id — not a literal.
-        # When the target is empty (e.g. unit test with no fixtures), the
-        # cache is created anyway but `_path` falls back to the FIRST
-        # declared target spec if the speaker isn't in the map.
-        first_spec_id = self._first_target_spec_id()
-        if first_spec_id is None:
-            # No target at all — just root on the top-level subdir; every
-            # _path() call will look up spec_id by speaker (and fall back
-            # to "unknown" if the speaker isn't seen, which can't happen
-            # because there's nothing to iterate over).
-            self.dvec_root = self.processed_dir / DVEC_TOP_SUBDIR
-        else:
-            self.dvec_root = self.processed_dir / DVEC_TOP_SUBDIR / first_spec_id
+        # Default cache root = first target spec's cache_dir. When no
+        # target exists (empty unit-test fixture) the caller can pass a
+        # fallback path explicitly; otherwise we use cwd/.cache/voicefilter-dvectors.
+        if cache_root is None:
+            first_spec = self._first_target_spec()
+            if first_spec is not None:
+                cache_root = Path(first_spec.cache_dir)
+            else:
+                cache_root = Path(".cache") / DVEC_DIRNAME
+        self.dvec_root = Path(cache_root) / DVEC_DIRNAME
         self.dvec_root.mkdir(parents=True, exist_ok=True)
-        # Stable reference utterance per speaker (sorted wav list → [0]).
+        # Stable reference utterance per speaker (sorted HfEntry list → [0]).
         # Mirrors the old `_bake_dvectors` reference-wav choice so cached
         # d-vectors are byte-compatible with what the previous pipeline
         # would have produced.
-        self._ref_for: dict[str, Path] = {
-            spk: paths[0] for spk, paths in target_index.items() if paths
+        self._ref_for: dict[str, HfEntry] = {
+            spk: entries[0] for spk, entries in target_index.items() if entries
         }
         # In-process LRU-by-construction (we never evict; spk count is
         # bounded by LibriSpeech). ~256 KB at 1000 speakers × 1 KB.
@@ -1132,7 +1622,7 @@ class DVectorCache:
     def get_or_compute(self, spk: str) -> np.ndarray:
         """Return `(hp.d_vector_dim,)` float32 d-vector for `spk`.
 
-        On any failure path (no ref wav, encoder error, …) returns a
+        On any failure path (no ref entry, encoder error, …) returns a
         zero vector and prints one WARN the first time per speaker.
         """
         if spk in self._mem_cache:
@@ -1153,18 +1643,17 @@ class DVectorCache:
 
     # ---- internals ----
 
-    def _first_target_spec_id(self) -> Optional[str]:
-        """Return the `HfSourceSpec.id` of the first declared target source.
+    def _first_target_spec(self) -> Optional["ResolvedSource"]:
+        """Return the first declared target spec.
 
-        Used to pick the d-vector partition when no per-speaker spec_id
-        is available (legacy callers / empty target / unit tests). Returns
-        None when `hp.target_sources` is empty or the first ref doesn't
-        resolve to a known spec.
+        Used to pick the d-vector cache root when no `cache_root` is
+        passed explicitly. Returns `None` when `hp.target_sources` is
+        empty or the first ref doesn't resolve to a known spec.
         """
         if not self.hp.target_sources:
             return None
         try:
-            return resolve_source(self.hp, self.hp.target_sources[0]).id
+            return resolve_source(self.hp, self.hp.target_sources[0])
         except KeyError:
             return None
 
@@ -1183,20 +1672,20 @@ class DVectorCache:
         sid = self._spk_to_spec_id.get(spk)
         if sid is not None:
             return sid
-        first = self._first_target_spec_id()
+        first = self._first_target_spec()
         if first is not None:
-            return first
+            return first.id
         return "unknown"
 
     def _path(self, spk: str) -> Path:
-        """`<processed_dir>/dvectors/<spec_id>/<spk>.npy`.
+        """`<cache_root>/voicefilter-dvectors/<spec_id>/<spk>.npy`.
 
         `spec_id` is looked up per-speaker so multi-source targets
         partition cleanly. Falls back to the first target's spec_id
         when the speaker wasn't seen at scan time.
         """
         sid = self._spec_id_for(spk)
-        return self.processed_dir / DVEC_TOP_SUBDIR / sid / f"{spk}.npy"
+        return self.dvec_root / sid / f"{spk}.npy"
 
     def _encoder(self):
         """Return (process-singleton) SpeakerEncoder for `hp.dvector_pt_path`.
@@ -1234,7 +1723,7 @@ class DVectorCache:
         return enc
 
     def _compute(self, spk: str) -> np.ndarray:
-        """Read `spk`'s reference wav → `extract_dvec` → (d_dim,) np."""
+        """Read `spk`'s reference HfEntry → `extract_dvec` → (d_dim,) np."""
         ref = self._ref_for.get(spk)
         if ref is None:
             # (Removed: WARN print — per training-log-only policy.
@@ -1242,15 +1731,7 @@ class DVectorCache:
             return np.zeros(self.hp.d_vector_dim, dtype=np.float32)
         from voicefilter_lite.audio import extract_dvec
 
-        wav, sr = sf.read(str(ref), dtype="float32")
-        if wav.ndim > 1:
-            wav = wav.mean(axis=1)
-        if sr != self.hp.sample_rate:
-            import librosa
-
-            wav = librosa.resample(
-                wav, orig_sr=sr, target_sr=self.hp.sample_rate
-            ).astype(np.float32)
+        wav = default_hf_wav_loader(ref, self.hp.sample_rate)
         wav_t = torch.from_numpy(wav.astype(np.float32))
         cap = int(self.hp.ref_max_sec * self.hp.sample_rate)
         if wav_t.shape[-1] > cap:
@@ -1297,103 +1778,75 @@ class DVectorCache:
 
 
 # ============================================================ #
-# LocalTripletStream                                              #
+# HfTripletStream                                                 #
 # ============================================================ #
 
 
-class LocalTripletStream(IterableDataset):
-    """Reads pre-baked wavs from `data/processed/`, yields `Sample` triples.
+class HfTripletStream(IterableDataset):
+    """Reads HF arrow cache lazily + decodes FLAC on the fly.
 
-    The pre-baked directory layout (produced by `voicefilter-cli dataset prepare`):
-        data/processed/
-            manifest.json
-            target/<spec_id>/<role>/<split>/<spk>/<utt}.wav
-                # spec_id = HfSourceSpec.id of the target source
-                # role    = librispeech_role() (clean|other)
-            pool/<spec_id>/<role-or-subset>/...
-                # musan: <subset> ∈ {speech, noise, music}
-                # librispeech: <role>/<split>/<spk>/<utt>.wav
-            dvectors/<spec_id>/<spk>.npy     # created lazily by DVectorCache
+    Reads from the HuggingFace `datasets.Dataset` objects that
+    `voicefilter-cli dataset prepare` populated — there are no wav files
+    on disk. Each row in each (source, subset, split) becomes an
+    `HfEntry` (a `(dataset, row_idx, spk_id, utt_id, source_sr)`
+    pointer). At iteration time the loader calls
+    `default_hf_wav_loader(entry, hp.sample_rate)`, which reads
+    `entry.dataset[entry.row_idx]['audio']` and decodes via
+    `soundfile` (FLAC bytes via `BytesIO`), resampling to
+    `hp.sample_rate` if `entry.source_sr` differs (MUSAN `noise` /
+    `music` are 44.1 kHz).
 
-    **All subdirectory names under `target/` / `pool/` / `dvectors/` are
-    config-driven** — they derive from `HfSourceSpec.id` and the
-    resolved source's role/subset. The top-level names `target/`,
-    `pool/`, `dvectors/`, and `manifest.json` are FIXED conventions
-    (deliberately not configurable — they describe what each subtree
-    semantically holds, not a layout choice).
+    Multi-worker strategy: `datasets.Dataset` is mmap-backed; forking a
+    worker process creates a CoW view of the arrow file and is
+    fork-safe for read-only access. Each worker opens its own
+    `datasets.Dataset` instance lazily (`__iter__` does a single
+    `load_dataset` per (source, subset, split) and caches the handle).
 
-    `pool/<HfSourceSpec.id>/...` is a flat per-source pool shared across
-    every TYPE (`babble` / `noise` / `music`) that references it —
-    `prepare_dataset` does no TYPE-specific synthesis. The actual
-    interference waveform is synthesised at training time by
-    `_sample_interference`:
+    Per-speaker d-vectors land in
+    `<spec.cache_dir>/voicefilter-dvectors/<spec_id>/<spk>.npy` — see
+    `DVectorCache`. The d-vector partition lives next to the source's
+    HF cache, not under a central `processed_dir`.
 
-        * `babble`         : N ∈ [n_min, n_max] DISTINCT identities drawn
-                              from the babble pool. The pool is the union
-                              of every source listed in
-                              `hp.interference.babble.sources[*]`
-                              (config-driven, NOT hardcoded —
-                              `_collect_babble_pool_paths` walks the
-                              configured refs). Each supported kind is keyed
-                              by a `spk_id` prefix:
-                                - musan(speech)      → `musan_speech__<stem>`
-                                  (each clip = one monologue identity)
-                                - librispeech(other) → `librispeech_other__<spk>`
-                                  (`parts[0]` under the split dir; multiple
-                                  utts per spk, dedup keeps them under one
-                                  identity so the picker can never pick
-                                  the same speaker twice in one babble mix)
-                              Each speaker contributes a random-length
-                              segment ∈ [babble_seg_min_sec,
-                              babble_seg_max_sec] placed at a random
-                              offset within the sample, summed with
-                              per-speaker gain uniform in [gain_min,
-                              gain_max]. `n_speakers_min=1` covers the
-                              single-speaker phone-interference case. The
-                              default paper.yaml keeps `babble.sources`
-                              to musan(speech) only; librispeech(other)
-                              is kept under `noise.sources` for
-                              `prepare_dataset` baking + eval discovery,
-                              NOT consumed by runtime babble.
-        * `noise` / `music`: 1 random clip from the matching MUSAN
-                              subset (`pool/<musan_spec.id>/<subset>/`),
-                              `random_crop` to `sample_len`. The spec.id
-                              comes from the TYPE's `sources[*]` via
-                              `resolve_source(...)` — change the musan
-                              `HfSourceSpec.id` in your config and the
-                              scan will follow (no silent empty pool).
+    Per-sample synthesis:
 
-    Per-sample, each TYPE's `prob` is an INDEPENDENT Bernoulli inclusion
-    probability (no longer a weighted pick); types whose underlying
-    pool is empty or whose `prob <= 0` are skipped. Multiple TYPES can
-    be included in one sample — their contributions are summed into one
-    interference waveform with the **energy budget preserved across K
-    components** (see module docstring + `_sample_interference`):
-    `target_power / 10^(snr/10)` is split across the K included TYPES
-    via Dirichlet(α=1) sampling on the simplex; each component is
-    scaled so its RMS² = `w_i × budget`; the SUM's RMS² = budget, so
-    post-mix SIR matches `snr_db` exactly. Without this, naive summing
-    inflates the SUM's RMS by ~sqrt(K), dropping the effective SIR
-    per individual TYPE by `10·log10(K)` dB. Any combination is
-    possible (pure noise, pure music, noise+music, babble+noise, …, all
-    three, or none).
+      * `babble`         : N ∈ [n_min, n_max] DISTINCT identities drawn
+                            from the babble pool (union of
+                            `hp.interference.babble.sources[*]`). Each
+                            supported kind is keyed by a `spk_id` prefix:
+                              - musan(speech)      → `musan_speech__<stem>`
+                                (each clip = one monologue identity)
+                              - librispeech(other) → `librispeech_other__<spk>`
+                            Each speaker contributes a random-length
+                            segment placed at a random offset within
+                            the sample, summed with per-speaker gain.
+      * `noise` / `music`: 1 random clip from the matching MUSAN
+                            subset, `random_crop` to `sample_len`. The
+                            loader resamples 44.1 kHz → 16 kHz.
 
-    The constructor scans the directory once and builds in-memory indices
-    (`_target_index`, `_speech_pool`, `_noise_pool`, `_music_pool`,
-    `_spk_to_paths`, `_spk_to_spec_id`) plus a `DVectorCache` that lazily
-    fills per-speaker d-vectors. All reads at iteration time use these
-    indices; no HF streaming, no FLAC decode.
+    Per-sample, each TYPE's `prob` is an INDEPENDENT Bernoulli
+    inclusion probability; types whose pool is empty or whose `prob <=
+    0` are skipped. Multiple TYPES can be included in one sample —
+    the energy budget is preserved across K components via Dirichlet
+    sampling on the simplex (see `_allocate_interference_budget`).
+
+    Lazy initialisation: the constructor is intentionally cheap — it
+    does NOT open any HF dataset or build any indices. Each worker
+    process (after fork) runs the one-shot scan on its first
+    `__iter__` call via `_ensure_initialized`. With N dataloader
+    workers, the N scans run in parallel after fork and the OS page
+    cache for arrow mmap files is shared between them — wall-clock
+    init time is close to a single-process scan rather than N× it.
+    Once the scan has run, the dataset exposes the same surface
+    area as before: `_target_index`, `_speech_pool`, `_noise_pool`,
+    `_music_pool`, `_spk_to_entries`, `_spk_to_spec_id`, plus a
+    `DVectorCache` that lazily fills per-speaker d-vectors.
     """
 
-    # Fixed top-level subdir names under `processed_dir/`. These describe
-    # the SEMANTIC ROLE of each subtree, not a layout choice, so they're
-    # deliberately not configurable. Anything beneath them (spec_id,
-    # role, split, …) IS config-driven via HfSourceSpec. Re-exported
-    # from module level so callers / tests can reach them either way.
-    TARGET_TOP_SUBDIR = TARGET_TOP_SUBDIR
-    POOL_TOP_SUBDIR = POOL_TOP_SUBDIR
-    DVEC_TOP_SUBDIR = DVEC_TOP_SUBDIR
+    # Per-source manifest filename. Re-exported for tests / CLI code
+    # that wants to locate the manifest next to a specific HF cache.
     MANIFEST_FILENAME = MANIFEST_FILENAME
+    DVEC_DIRNAME = DVEC_DIRNAME
+    INDEX_DIRNAME = INDEX_DIRNAME
 
     def __init__(
         self,
@@ -1408,201 +1861,174 @@ class LocalTripletStream(IterableDataset):
         self.num_workers = num_workers
         self._seed = seed if seed is not None else hp.seed
 
+        # Mel basis built lazily on first `__iter__` (per worker).
         self._mel = None
-        self._target_index: dict[str, list[Path]] = {}
-        # spk → spec_id, populated at scan time from
-        # `target/<spec_id>/<role>/<split>/<spk>/<utt>.wav`. Used by
-        # `DVectorCache._path` to partition d-vectors per source so
-        # multi-source targets never collide on speaker ids.
+
+        # The remaining state is populated lazily by `_scan_hf_datasets()`
+        # on the first `__iter__` call of each worker process — see
+        # `_ensure_initialized`. The previous design ran the scan
+        # synchronously in `__init__`, which blocked the main thread
+        # for 10-60 s on a full LibriSpeech+MUSAN bake before the
+        # DataLoader could even fork its workers. Lazy init lets the
+        # main thread reach the training loop almost immediately; the
+        # scan then runs in parallel across N worker processes after
+        # fork.
+        #
+        # With `dataloader_workers > 0` + fork, each worker invokes
+        # `_ensure_initialized` exactly once on its first iteration,
+        # and the scans run in parallel after fork. Wall-clock scan
+        # time is bounded by the slowest worker rather than the sum:
+        # arrow files are mmap'd, and the OS page cache is shared
+        # across fork'd processes, so the first worker to scan warms
+        # the cache and subsequent workers hit it (near memory-
+        # bandwidth speed). The end result is "data flows continuously
+        # from workers" rather than "main thread waits for a giant
+        # synchronous scan before workers can spawn".
+        #
+        # With `dataloader_workers == 0`, the main thread scans inline
+        # before yielding the first sample — same observable behaviour
+        # as the old synchronous `__init__`, just deferred by one
+        # `__iter__` call.
+        self._datasets: dict[str, Any] = {}
+        self._target_index: dict[str, list[HfEntry]] = {}
+        # spk → spec_id, populated by the lazy scan. Used by
+        # `DVectorCache` to partition d-vectors per source so multi-
+        # source targets never collide on speaker ids.
         self._spk_to_spec_id: dict[str, str] = {}
-        # Babble pool — config-driven via `_collect_babble_pool_paths`:
+        # Babble pool — config-driven via `_collect_babble_pool_entries`:
         # walks `hp.interference.babble.sources[*]` and unions every
         # babble-eligible kind (musan_speech__ + librispeech_other__).
-        # The librispeech `other` pool is included only when the user
-        # explicitly adds it to `babble.sources`; the default paper.yaml
-        # keeps it under `noise.sources` for baking + eval discovery
-        # only (see `_collect_babble_pool_paths` for the supported kinds).
-        self._speech_pool: list[tuple[str, Path]] = []
-        # spk_id → list[Path] derived from `_speech_pool` once at scan
-        # time. `babble` picks N distinct keys from this map.
-        self._spk_to_paths: dict[str, list[Path]] = {}
+        self._speech_pool: list[tuple[str, HfEntry]] = []
+        # spk_id → list[HfEntry] derived from `_speech_pool` once the
+        # scan runs. `babble` picks N distinct keys from this map.
+        self._spk_to_entries: dict[str, list[HfEntry]] = {}
         # MUSAN pools for the `noise` / `music` TYPEs (no speaker concept).
-        # Populated by `_scan_processed_dir` from each TYPE's musan
-        # sources via `resolve_source(...)` — no literal "musan" anywhere.
-        self._noise_pool: list[Path] = []
-        self._music_pool: list[Path] = []
+        self._noise_pool: list[HfEntry] = []
+        self._music_pool: list[HfEntry] = []
         # type_name → independent Bernoulli inclusion `prob` (0 = disabled).
-        # Types with `prob <= 0` or empty pools are skipped per-iteration
-        # in `_sample_interference`.
         self._interference_type_probs: dict[str, float] = {}
-        # Lazy per-speaker d-vector (compute on first sight; cached on
-        # disk at `dvectors/<spec_id>/<spk>.npy` for subsequent runs).
+        # Lazy per-speaker d-vector.
         self._dvec_cache: Optional[DVectorCache] = None
 
-        self._scan_processed_dir()
+        # Per-worker init gate — first `__iter__` call triggers the scan.
+        self._initialized: bool = False
+        # Wall-clock cost of the first scan (debug aid / training-log
+        # heartbeat). Recorded once per worker so the training loop can
+        # print "workers ready after Xs" alongside the existing
+        # "first batch built in Ys" line.
+        self._init_seconds: float = 0.0
 
-    # ---- One-time directory scan ----
+    # ---- One-time dataset scan ----
 
-    def _scan_processed_dir(self) -> None:
-        root = Path(self.hp.dataset.processed_dir)
-        if not root.is_dir():
-            raise FileNotFoundError(
-                f"[LocalTripletStream] processed_dir not found: "
-                f"{root.resolve()}. Run `voicefilter-cli dataset prepare` first."
-            )
+    def _ensure_initialized(self) -> None:
+        """Populate per-worker state on first `__iter__` call.
 
+        Each worker process (after fork) invokes this exactly once on
+        its first iteration. With `dataloader_workers > 0`, N workers
+        invoke it concurrently and their scans run in parallel — the
+        wall-clock init time is bounded by the slowest single scan,
+        not the sum of N scans, because:
+
+          * Arrow files are mmap'd; the OS page cache is shared across
+            fork'd processes. The first worker to scan warms the
+            cache; subsequent workers (and subsequent iterations in
+            the same worker) hit cache and run near memory-bandwidth
+            speed.
+          * Per-row work is small (`ds[row_idx]` mmap read + a dict
+            insert in `_row_metadata`). On a multi-core M-series chip
+            with 4-8 workers the scans overlap well enough that the
+            wall-clock cost is close to a single-process scan rather
+            than N×.
+
+        With `dataloader_workers == 0`, the main thread invokes this
+        inline before the first sample is yielded — same observable
+        behaviour as the old synchronous `__init__`, just deferred by
+        one `__iter__` call. Tests that access `_target_index` (or
+        other scan-built state) after construction must call
+        `_ensure_initialized()` explicitly.
+
+        Idempotent — subsequent calls early-return in O(1). Not
+        thread-safe (each worker is single-threaded; main-thread
+        iteration with `num_workers=0` is also single-threaded).
+        """
+        if self._initialized:
+            return
+        t0 = time.monotonic()
+        self._scan_hf_datasets()
+        self._init_seconds = time.monotonic() - t0
+        self._initialized = True
+
+    def _scan_hf_datasets(self) -> None:
+        """Open one HF `datasets.Dataset` per (source, subset, split).
+
+        Builds the in-memory `{spk_id → [HfEntry, …]}` maps for the
+        target pool + the per-TYPE interference pools. Idempotent —
+        called once per worker process via `_ensure_initialized`. No
+        wavs are decoded here; every read at iteration time uses
+        `default_hf_wav_loader` so we pay FLAC decode only when an
+        utterance is actually picked.
+        """
         # ---- Target ----
-        # Layout: target/<spec_id>/<role>/<split>/<spk>/<utt>.wav
-        # `<spec_id>` is the HfSourceSpec.id of the target source —
-        # resolved dynamically from `hp.target_sources[*]` so any
-        # configured target is accepted (no literal "librispeech"
-        # gate). `<role>` is `librispeech_role()` for LibriSpeech refs.
-        target_spec_ids: set[str] = set()
-        for ref in self.hp.target_sources:
-            try:
-                resolved = resolve_source(self.hp, ref)
-            except KeyError:
-                continue
-            target_spec_ids.add(resolved.id)
+        target_index, spk_to_spec_id = _build_target_index(
+            self.hp, self._datasets,
+        )
+        self._target_index = target_index
+        self._spk_to_spec_id = spk_to_spec_id
 
-        target_root = root / TARGET_TOP_SUBDIR
-        if target_root.is_dir():
-            for wav_path in target_root.rglob("*.wav"):
-                parts = wav_path.relative_to(target_root).parts
-                if len(parts) >= 5 and parts[0] in target_spec_ids:
-                    spk = parts[3]
-                    spec_id = parts[0]
-                else:
-                    continue
-                self._target_index.setdefault(spk, []).append(wav_path)
-                # Record the source for this speaker (used by DVectorCache
-                # to partition d-vectors per source — multi-source targets
-                # never collide on speaker ids).
-                self._spk_to_spec_id[spk] = spec_id
-            # Sort each speaker's wav list so the "first available
-            # utterance" reference choice is deterministic across runs
-            # (the d-vector cache uses `paths[0]` for ref-wav resolution).
-            for spk in self._target_index:
-                self._target_index[spk].sort()
+        # ---- Babble pool (config-driven) ----
+        babble_entries = _collect_babble_pool_entries(self.hp, self._datasets)
+        self._speech_pool = babble_entries
+        # Build speaker-keyed index for babble dedup (used to pick N
+        # distinct speakers without repetition). O(N) one-shot at scan.
+        for spk, entry in babble_entries:
+            self._spk_to_entries.setdefault(spk, []).append(entry)
 
-        # ---- Pool (per-source, shared across TYPEs) ----
-        # Layout: pool/<HfSourceSpec.id>/...  with two recognised shapes:
-        #   librispeech/<role>/<split>/<spk>/<utt}.wav  (role = clean|other)
-        #   musan/<subset>/{clip_id}.wav       (subset ∈ speech|noise|music)
-        # Babble is config-driven — see `_collect_babble_pool_paths`:
-        # walks `hp.interference.babble.sources[*]` and returns the union
-        # of (musan_speech__, librispeech_other__) paths. By default
-        # `babble.sources` only lists musan(speech); the user can extend
-        # to librispeech(other) (or anything else babble-eligible) without
-        # touching code. `noise` / `music` pools are musan-only at runtime
-        # (random 1 clip + crop) — librispeech references in those TYPEs
-        # are still baked by `prepare_dataset` and discoverable via
-        # `first_librispeech_other_source` for eval, but NOT consumed at
-        # training time.
-        pool_root = root / "pool"
-        if pool_root.is_dir():
-            babble_paths = _collect_babble_pool_paths(self.hp, root)
-            self._speech_pool = babble_paths
-            # Build speaker-keyed index for babble dedup (used to pick N
-            # distinct speakers without repetition). O(N) one-shot at scan.
-            for spk, p in babble_paths:
-                self._spk_to_paths.setdefault(spk, []).append(p)
-
-            # Noise / music pools: walk the TYPE's `sources[*]`, resolve
-            # each via `resolve_source(...)`, and union the matching
-            # `pool/<spec.id>/<subset>/` clips. No literal "musan" anywhere
-            # — change the HfSourceSpec.id and the scan follows.
-            self._noise_pool = _collect_passthrough_pool_paths(
-                self.hp, pool_root, "noise",
-            )
-            self._music_pool = _collect_passthrough_pool_paths(
-                self.hp, pool_root, "music",
-            )
+        # ---- Noise / music pools (musan-only at runtime) ----
+        self._noise_pool = _collect_passthrough_pool_entries(
+            self.hp, self._datasets, "noise",
+        )
+        self._music_pool = _collect_passthrough_pool_entries(
+            self.hp, self._datasets, "music",
+        )
 
         # Per-type INDEPENDENT inclusion probabilities: only types that
-        # are enabled + have `prob > 0` are eligible. The runtime filter
-        # on `prob>0 and pool non-empty` lives in `_sample_interference`
-        # (via `_type_has_clips`).
+        # are enabled + have `prob > 0` are eligible.
         for type_name, type_cfg in self.hp.interference_types.items():
             if not type_cfg.enabled or type_cfg.prob <= 0:
                 continue
             self._interference_type_probs[type_name] = float(type_cfg.prob)
 
         # ---- D-vector cache (lazy fill) ----
-        # Always constructed (even if `_target_index` is empty) so the
-        # dataset exposes the same surface area across runs; the cache
-        # itself refuses to compute without a reference wav and falls
-        # back to zeros.
+        # Always constructed (even when `_target_index` is empty) so
+        # the dataset exposes the same surface area across runs; the
+        # cache itself refuses to compute without a reference entry
+        # and falls back to zeros.
         self._dvec_cache = DVectorCache(
-            self.hp, root, self._target_index,
+            self.hp,
+            self._target_index,
             spk_to_spec_id=self._spk_to_spec_id,
         )
-
-        manifest_path = root / MANIFEST_FILENAME
-        manifest = json.loads(manifest_path.read_text()) if manifest_path.is_file() else {}
-        total_prob = sum(self._interference_type_probs.values())
-        # Count on-disk d-vectors across every target source's partition
-        # (`dvectors/<spec_id>/*.npy`). With the default paper.yaml this
-        # is exactly one partition (`dvectors/librispeech/`); multi-source
-        # targets add one partition per source.
-        on_disk_dvecs = 0
-        dvec_root = root / DVEC_TOP_SUBDIR
-        if dvec_root.is_dir():
-            for spec_id in target_spec_ids:
-                sub = dvec_root / spec_id
-                if sub.is_dir():
-                    on_disk_dvecs += sum(1 for _ in sub.glob("*.npy"))
-        # Babble source breakdown for the scan summary (musan vs librispeech
-        # identities are kept distinct by their `spk_id` prefix).
-        babble_n_musan = sum(
-            1 for spk, _ in self._speech_pool if spk.startswith("musan_speech__")
-        )
-        babble_n_libri = sum(
-            1 for spk, _ in self._speech_pool if spk.startswith("librispeech_other__")
-        )
-        babble_breakdown = (
-            f"{babble_n_musan} musan-speech, {babble_n_libri} librispeech-other"
-        )
-        # (Dataset scan summary was previously printed here. Removed per
-        # training-log-only policy — keep training output on-device or in CI
-        # quiet; inspect `len(self._target_index)` / `len(self._speech_pool)`
-        # from Python if a sanity check is needed.)
 
     # ---- Pool eligibility per TYPE ----
 
     def _type_has_clips(self, type_name: str) -> bool:
-        """True iff the underlying pool for `type_name` is non-empty.
-
-        Used by the weighted TYPE sampler to skip types whose backing
-        pool is missing/empty (a fully silent interference would train
-        a degenerate "always suppress everything" model).
-        """
+        """True iff the underlying pool for `type_name` is non-empty."""
         if type_name == "babble":
-            # babble needs >= 1 speaker; n_min can shrink to fit.
-            return bool(self._spk_to_paths)
+            return bool(self._spk_to_entries)
         if type_name == "noise":
             return bool(self._noise_pool)
         if type_name == "music":
             return bool(self._music_pool)
         return False
 
-    # ---- Per-TYPE interference synthesis ----
-
-    def _load_and_crop(
-        self,
-        path: Path,
-        sample_len: int,
-    ) -> torch.Tensor:
-        """Read one wav from disk, downmix to mono, random-crop to `sample_len`."""
-        wav, _ = sf.read(str(path), dtype="float32")
-        if wav.ndim > 1:
-            wav = wav.mean(axis=1)
-        wav_t = torch.from_numpy(wav.astype(np.float32))
-        return random_crop(wav_t, sample_len)
-
     # ---- Iteration ----
 
     def __iter__(self) -> Iterator[Sample]:
+        # Lazy one-shot scan per worker process. With `dataloader_workers > 0`,
+        # each fork'd worker runs its own scan on first `__iter__` in
+        # parallel — see `_ensure_initialized` for the rationale.
+        self._ensure_initialized()
+
         from voicefilter_lite.audio import make_mel_basis
         if self._mel is None:
             self._mel = make_mel_basis(self.hp, device=torch.device("cpu"))
@@ -1622,42 +2048,39 @@ class LocalTripletStream(IterableDataset):
         target_speakers = list(self._target_index.keys())
         if not target_speakers:
             raise RuntimeError(
-                "[LocalTripletStream] no target utterances found; "
+                "[HfTripletStream] no target utterances found; "
                 "did `voicefilter-cli dataset prepare` finish?"
             )
 
         while True:
             # ---- 1. Pick target speaker + utterance ----
             tgt_spk = rng.choice(target_speakers)
-            tgt_utt_paths = self._target_index[tgt_spk]
-            if len(tgt_utt_paths) < 2:
+            tgt_utt_entries = self._target_index[tgt_spk]
+            if len(tgt_utt_entries) < 2:
                 # Single-utterance speaker: ref must be self.
-                tgt_path = tgt_utt_paths[0]
-                ref_path = tgt_path
+                tgt_entry = tgt_utt_entries[0]
+                ref_entry = tgt_entry
             else:
-                tgt_path = rng.choice(tgt_utt_paths)
+                tgt_entry = rng.choice(tgt_utt_entries)
                 # ---- 3. Pick ref: 70% same-speaker (different utt), 30% self ----
                 if rng.random() < 0.7:
-                    others = [p for p in tgt_utt_paths if p != tgt_path]
+                    others = [e for e in tgt_utt_entries if e != tgt_entry]
                     if others:
-                        ref_path = rng.choice(others)
+                        ref_entry = rng.choice(others)
                     else:
-                        ref_path = tgt_path
+                        ref_entry = tgt_entry
                 else:
-                    ref_path = tgt_path
+                    ref_entry = tgt_entry
 
             # ---- 4. Read target + ref wavs (BEFORE interference synthesis) ----
             # We need `target_power` (= mean of target wav²) to compute
             # the interference energy budget `target_power / 10^(snr/10)`,
             # which `_sample_interference` uses to allocate per-component
-            # RMS² via Dirichlet sampling on the simplex. Reading +
-            # cropping the target first lets us pass a real `target_power`
-            # to the interference mixer (no placeholder → no post-hoc
-            # rebalance that would amplify already-allocated noise).
+            # RMS² via Dirichlet sampling on the simplex.
             try:
-                tgt_wav, _ = sf.read(str(tgt_path), dtype="float32")
-                ref_wav, _ = sf.read(str(ref_path), dtype="float32")
-            except Exception as e:
+                tgt_wav_np = default_hf_wav_loader(tgt_entry, hp.sample_rate)
+                ref_wav_np = default_hf_wav_loader(ref_entry, hp.sample_rate)
+            except Exception:
                 _skipped = getattr(self, "_read_fail_count", 0) + 1
                 self._read_fail_count = _skipped
                 # (Per-failure WARN removed per training-log-only policy.
@@ -1666,9 +2089,8 @@ class LocalTripletStream(IterableDataset):
                 # bad sample is silently dropped from training.)
                 continue
 
-            # Mono
-            tgt_wav_t = torch.from_numpy(tgt_wav if tgt_wav.ndim == 1 else tgt_wav.mean(axis=1))
-            ref_wav_t = torch.from_numpy(ref_wav if ref_wav.ndim == 1 else ref_wav.mean(axis=1))
+            tgt_wav_t = torch.from_numpy(tgt_wav_np)
+            ref_wav_t = torch.from_numpy(ref_wav_np)
 
             # ---- 5–8. WAV-level synthesis (random crop, interference,
             # silent flags, activity bursts, snr_mix) — delegated to the
@@ -1680,7 +2102,7 @@ class LocalTripletStream(IterableDataset):
                 rng,
                 target_wav_full=tgt_wav_t,
                 ref_wav_full=ref_wav_t,
-                babble_spk_to_paths=self._spk_to_paths,
+                babble_spk_to_entries=self._spk_to_entries,
                 noise_pool=self._noise_pool,
                 music_pool=self._music_pool,
                 type_probs=self._interference_type_probs,
@@ -1713,7 +2135,7 @@ class LocalTripletStream(IterableDataset):
             # ---- 10. Get-or-compute d-vector ----
             # `DVectorCache` returns the on-disk `.npy` if present, else
             # computes via the SpeakerEncoder + saves atomically. On any
-            # failure path (no ref wav, encoder missing) it returns
+            # failure path (no ref entry, encoder missing) it returns
             # zeros + a one-shot WARN. See `DVectorCache.get_or_compute`.
             ref_dvec_np = self._dvec_cache.get_or_compute(tgt_spk)
             ref_dvec = torch.from_numpy(ref_dvec_np).float()
@@ -1753,55 +2175,3 @@ def collate_triplets(batch: list[Sample]) -> dict:
         "ref_dvecs": ref_dvecs,
         "ref_spk_ids": ref_spk_ids,
     }
-
-
-# ---- HF audio-decode monkey-patch + cast helper ---------------------------
-#
-# `datasets.features.Audio.decode_example` is invoked automatically by HF's
-# `Dataset.map` / generator wrapper on every batch, which would force a
-# full FLAC decode of LibriSpeech *before* we have a chance to feed the
-# bytes through our own `soundfile` pipeline. These two helpers suppress
-# that: `_disable_hf_audio_decode` patches the class once; `_cast_audio_no_decode`
-# flips `Audio.decode = False` on each column so the generator keeps the
-# raw dict-with-bytes payload and lets the caller decode.
-# Originally in scripts/prepare_dataset.py; lifted into `dataset` so
-# `verify_dvec.py`, `evaluate.py`, `diag_mask.py` (and any other
-# stream-HF-then-decode-locally consumer) can import them from here too.
-
-
-_HF_AUDIO_DECODE_PATCHED = False
-
-
-def _disable_hf_audio_decode() -> None:
-    """Idempotently monkey-patch HF `Audio.decode_example` to never decode."""
-    global _HF_AUDIO_DECODE_PATCHED
-    if _HF_AUDIO_DECODE_PATCHED:
-        return
-    from datasets.features import audio as _hf_audio
-    _orig_decode_example = _hf_audio.Audio.decode_example
-
-    def _passthrough_decode_example(self, value, token_per_repo_id=None):
-        if value is None:
-            return None
-        if isinstance(value, dict):
-            return value
-        return _orig_decode_example(self, value, token_per_repo_id)
-
-    _hf_audio.Audio.decode_example = _passthrough_decode_example
-    _HF_AUDIO_DECODE_PATCHED = True
-
-
-def _cast_audio_no_decode(ds):
-    """Return a copy of `ds` with every `Audio` column set to `decode=False`."""
-    from datasets import Audio, Features
-    new_features = Features(
-        {k: (Audio(decode=False) if k == "audio" else v) for k, v in ds.features.items()}
-    )
-    try:
-        ds = ds.cast_features(new_features)
-    except Exception:
-        ds.features.update(new_features)
-    for k, v in ds.features.items():
-        if isinstance(v, Audio):
-            v.decode = False
-    return ds
