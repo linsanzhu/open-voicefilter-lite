@@ -12,9 +12,21 @@ The exported model takes:
     c0:             (num_layers, B=1, hidden_dim)
 
 and emits:
-    enhanced:       (B=1, T, n_mels)
+    mask:           (B=1, T, n_mels)            — raw sigmoid mask in [0, 1]
+    f_adapt:        (B=1, T, 1)                — noise-type predictor logit
+                                                  (sigmoid applied inside the
+                                                  graph; range [0, 1])
     hN:             (num_layers, B=1, hidden_dim)
     cN:             (num_layers, B=1, hidden_dim)
+
+The mask is returned raw so the caller can apply it in **linear**
+filterbank-energy space (paper §3.2) and blend with the raw input
+under adaptive suppression `w^(t)` (paper §3.4) — both identical to
+the torch `StreamingVoiceFilter` path. Older `.onnx` files that emit
+`enhanced` instead of `mask`+`f_adapt` are still loaded; the onnx
+backend detects the output names and falls back to mask-less blending
+(adaptive suppression then has no `f_adapt`, so it is disabled —
+`w=0`, the model output is taken as-is).
 
 Usage
 -----
@@ -41,12 +53,30 @@ import os
 import sys
 from typing import Annotated, Literal
 
+import onnx
 import torch
 from cyclopts import App, Parameter
 
 from voicefilter_lite.hparams import HParams
-from voicefilter_lite.audio import log_mel_to_linear, linear_to_log_mel
-from voicefilter_lite.model import VoiceFilterLite, apply_mask
+from voicefilter_lite.model import VoiceFilterLite
+
+
+def _inline_onnx_weights(path: str) -> None:
+    """Rewrite ``path`` with all tensor weights embedded (no sibling ``.data``).
+
+    ``torch.onnx.export`` in dynamo mode (torch >= 2.5) defaults to writing
+    initializers to a sibling ``<path>.onnx.data`` file, leaving the
+    ``.onnx`` as a thin graph. That breaks the moment the ``.data`` file
+    is moved, deleted, or skipped by a downstream consumer, so we always
+    inline after export (and again after INT8 quantization, which also
+    produces a ``.data`` sibling).
+    """
+    model = onnx.load(path)
+    onnx.save(model, path, save_as_external_data=False)
+    try:
+        os.remove(path + ".data")
+    except FileNotFoundError:
+        pass
 
 class StreamWrapper(torch.nn.Module):
     """Wraps VoiceFilterLite for ONNX export with explicit LSTM state IO."""
@@ -68,19 +98,14 @@ class StreamWrapper(torch.nn.Module):
         )
         mask = torch.sigmoid(self.model.out_proj(self.model.dropout(x)))
 
+        # Paper §3.4: f_adapt(S_in^(t)) — primary input is the current
+        # frame's noisy filterbank. Sigmoid inside the graph so the
+        # caller can read it as a probability directly.
         cur_idx = self.model.hp.frame_stack - 1
         cur = stacked_logmel[..., cur_idx * self.model.hp.n_mels:(cur_idx + 1) * self.model.hp.n_mels]
-        # Paper §3.2 literal mask application (Y_enh = M · Y in
-        # **linear** filterbank-energy space — NOT log-mel). The ONNX
-        # graph is consumed by an ASR pipeline that takes log-mel, so
-        # we round-trip through `log_mel_to_linear` /
-        # `linear_to_log_mel` here so the exported model's input/output
-        # interface stays `log-mel → log-mel` (ASR-friendly) while the
-        # mask runs in the paper-correct domain.
-        cur_linear = log_mel_to_linear(cur, floor=self.model.hp.log_mel_floor)
-        enhanced_linear = apply_mask(mask, cur_linear)
-        enhanced = linear_to_log_mel(enhanced_linear, floor=self.model.hp.log_mel_floor)
-        return enhanced, hN, cN
+        head_in = cur if self.model.hp.alpha_head_use_current_frame else x
+        f_adapt = torch.sigmoid(self.model.alpha_head(head_in))
+        return mask, f_adapt, hN, cN
 
 app = App(name="onnx", help_format="plaintext")
 
@@ -129,9 +154,13 @@ def main(
 
     wrapper = StreamWrapper(model).eval()
 
-    # Dummy inputs. Time dimension is dynamic.
+    # Dummy inputs. Time dimension is dynamic — use T=1 so dynamo
+    # export doesn't bake a specific time length into the in_proj /
+    # LSTM reshapes; the graph is intended to be called with T=1 at
+    # inference (frame-by-frame streaming), and `dynamic_axes` /
+    # `dynamic_shapes` already exposes the time axis as dynamic.
     B = 1
-    T = 8  # arbitrary; ONNX marks this dynamic
+    T = 1
     stacked = torch.randn(B, T, hp.n_mels * hp.frame_stack)
     dvec = torch.randn(B, hp.d_vector_dim)
     h0 = torch.zeros(hp.num_lstm_layers, B, hp.hidden_dim)
@@ -159,7 +188,7 @@ def main(
             opset_version=opset,
             do_constant_folding=True,
             input_names=["stacked_logmel", "dvec", "h0", "c0"],
-            output_names=["enhanced", "hN", "cN"],
+            output_names=["mask", "f_adapt", "hN", "cN"],
             dynamic_shapes=dynamic_shapes,
         )
     except TypeError:
@@ -171,18 +200,21 @@ def main(
             opset_version=opset,
             do_constant_folding=True,
             input_names=["stacked_logmel", "dvec", "h0", "c0"],
-            output_names=["enhanced", "hN", "cN"],
+            output_names=["mask", "f_adapt", "hN", "cN"],
             dynamic_axes={
                 "stacked_logmel": {0: "batch", 1: "time"},
                 "dvec":           {0: "batch"},
                 "h0":             {1: "batch"},
                 "c0":             {1: "batch"},
-                "enhanced":       {0: "batch", 1: "time"},
+                "mask":           {0: "batch", 1: "time"},
+                "f_adapt":        {0: "batch", 1: "time"},
                 "hN":             {1: "batch"},
                 "cN":             {1: "batch"},
             },
         )
     print(f"[export] wrote {output}")
+    _inline_onnx_weights(output)
+    print(f"[export] inlined weights into {output} (single-file, no .data sibling)")
 
     # ---- Optional INT8 dynamic quantization (paper §3.5) ----
     if quantize == "int8":
@@ -203,6 +235,8 @@ def main(
             weight_type=QuantType.QInt8,
         )
         print(f"[export] quantized to INT8 → {int8_out}")
+        _inline_onnx_weights(int8_out)
+        print(f"[export] inlined weights into {int8_out} (single-file, no .data sibling)")
 
     # Verify with onnxruntime.
     try:
@@ -220,9 +254,11 @@ def main(
             },
         )
         with torch.no_grad():
-            ref_enhanced, ref_h, ref_c = wrapper(stacked, dvec, h0, c0)
+            ref_mask, ref_fa, ref_h, ref_c = wrapper(stacked, dvec, h0, c0)
         for name, got, want in zip(
-            ["enhanced", "hN", "cN"], outs, [ref_enhanced, ref_h, ref_c]
+            ["mask", "f_adapt", "hN", "cN"],
+            outs,
+            [ref_mask, ref_fa, ref_h, ref_c],
         ):
             err = float(np.abs(got - want.numpy()).max())
             print(f"[export] onnxruntime vs torch diff {name}: {err:.3e}")

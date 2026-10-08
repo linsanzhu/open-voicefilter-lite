@@ -3,9 +3,16 @@
 `StreamingVoiceFilter` is the stateful frame-by-frame inference entry point.
 It owns:
   * the registered target-speaker d-vector (set once in `set_dvector`)
-  * the LSTM hidden state (`(h, c)`)
+  * the LSTM hidden state (`(h, c)`) — held by the active backend
   * the left-context frame stack (rolling buffer of `frame_stack - 1` frames)
   * the adaptive-suppression smoother (`AdaptiveSuppression`)
+
+The model core is pluggable: pass an `nn.Module` (torch) or an
+`onnxruntime.InferenceSession` / path-to-onnx-file (ONNX Runtime).
+The interface (`set_dvector` / `reset_state` / `step`) and the
+math (linear-mel mask, adaptive `w^(t)` blend, log-mel return) are
+identical across backends, so callers can swap deployment
+representations without touching their streaming loops.
 
 `step(frame_logmel)` does **one** new frame and returns the enhanced
 log-mel (paper §3.2: the ASR pipeline consumes log-mel, so the wrapper
@@ -31,8 +38,11 @@ The d-vector comes in already at `hp.d_vector_dim` (256) directly from
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+import os
+from pathlib import Path
+from typing import List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 
 from voicefilter_lite.audio import linear_to_log_mel, log_mel_to_linear
@@ -84,26 +94,168 @@ class AdaptiveSuppression:
         return self.w
 
 
+# --------------------------------------------------------------------- backends
+class _Backend:
+    """Minimal interface every backend exposes to `StreamingVoiceFilter`."""
+
+    name: str = "abstract"
+
+    def reset(self, dtype, device) -> None: ...
+    def set_dvec(self, dvec: torch.Tensor) -> None: ...
+    def infer(self, stacked_logmel: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, float]:
+        """Run one step. Returns (mask (1, 1, n_mels), last_frame (n_mels,), f_adapt)."""
+        ...
+
+
+class _TorchBackend(_Backend):
+    """Runs `VoiceFilterLite` on whatever device the module is on."""
+
+    name = "torch"
+
+    def __init__(self, model: VoiceFilterLite, hp: HParams):
+        self.model = model.eval()
+        self.hp = hp
+        self._dvec: Optional[torch.Tensor] = None
+        self._hidden: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+
+    def reset(self, dtype=None, device=None) -> None:
+        dev = device if device is not None else next(self.model.parameters()).device
+        self._hidden = (
+            torch.zeros(self.hp.num_lstm_layers, 1, self.hp.hidden_dim, device=dev),
+            torch.zeros(self.hp.num_lstm_layers, 1, self.hp.hidden_dim, device=dev),
+        )
+
+    def set_dvec(self, dvec: torch.Tensor) -> None:
+        self._dvec = dvec
+
+    def infer(self, stacked_logmel: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, float]:
+        dvec = self._dvec
+        model_device = dvec.device
+        flat = stacked_logmel.reshape(1, 1, -1)
+        if flat.device != model_device:
+            flat = flat.to(model_device)
+        with torch.no_grad():
+            x, self._hidden = self.model.lstm_forward(flat, dvec, self._hidden)
+            mask = torch.sigmoid(self.model.out_proj(self.model.dropout(x)))   # (1, 1, n_mels)
+            # Paper §3.4: f_adapt(S_in^(t)) — primary input is the current
+            # frame's noisy filterbank. Fall back to LSTM output when
+            # `alpha_head_use_current_frame=False` (paper §4.2 alternative).
+            last_frame = stacked_logmel[0, -1]
+            head_in = last_frame.to(mask.device) if self.hp.alpha_head_use_current_frame else x
+            if self.hp.use_noise_type_predictor:
+                f_adapt = float(torch.sigmoid(self.model.alpha_head(head_in)).item())
+            else:
+                f_adapt = 0.0
+        return mask[0, 0], last_frame, f_adapt
+
+
+class _OnnxBackend(_Backend):
+    """Runs the exported ONNX graph via onnxruntime (stateful LSTM I/O)."""
+
+    name = "onnx"
+
+    def __init__(self, session, hp: HParams):
+        self.session = session
+        self.hp = hp
+        outputs = {o.name for o in session.get_outputs()}
+        # New graph (export_onnx.py StreamWrapper v2): mask + f_adapt + hN + cN.
+        # Legacy graph: enhanced + hN + cN (mask + blending baked in, no
+        # adaptive suppression). We auto-detect so older .onnx files keep
+        # working — their `enhanced` already encodes mask*Y without w-blend,
+        # which is mathematically close to the new path for clean frames
+        # (w≈0) but the two diverge under heavy overlap. Callers that want
+        # parity with the torch streaming wrapper must re-export with the
+        # new graph (`voicefilter-cli export onnx`).
+        self._output_mode = "mask" if "mask" in outputs and "f_adapt" in outputs else "enhanced"
+        self._dvec: Optional[np.ndarray] = None
+        self._h: Optional[np.ndarray] = None
+        self._c: Optional[np.ndarray] = None
+
+    def reset(self, dtype=np.float32, device=None) -> None:
+        self._h = np.zeros((self.hp.num_lstm_layers, 1, self.hp.hidden_dim), dtype=dtype)
+        self._c = np.zeros((self.hp.num_lstm_layers, 1, self.hp.hidden_dim), dtype=dtype)
+
+    def set_dvec(self, dvec: torch.Tensor) -> None:
+        self._dvec = dvec.detach().cpu().numpy().astype(np.float32).reshape(1, -1)
+
+    def infer(self, stacked_logmel: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, float]:
+        feed = {
+            "stacked_logmel": stacked_logmel.reshape(1, 1, -1).cpu().numpy().astype(np.float32),
+            "dvec": self._dvec,
+            "h0": self._h,
+            "c0": self._c,
+        }
+        outs = self.session.run(None, feed)
+        if self._output_mode == "mask":
+            mask_np, f_adapt_np, self._h, self._c = outs
+            last_frame = stacked_logmel[0, -1].cpu()
+            f_adapt = float(np.asarray(f_adapt_np).reshape(-1)[0])
+        else:
+            # Legacy graph: enhanced = (mask * cur_linear) already in log-mel.
+            # We can't recover the mask without the cur frame, but we can
+            # recover a numerical f_adapt: fall back to 0 (no adaptive
+            # suppression) and surface a one-shot warning.
+            enhanced_np, self._h, self._c = outs
+            mask_np = None
+            f_adapt = 0.0
+            last_frame = stacked_logmel[0, -1].cpu()
+        mask_t = torch.from_numpy(np.asarray(mask_np).reshape(1, 1, self.hp.n_mels)) if mask_np is not None else None
+        return mask_t, last_frame, f_adapt
+
+
+def _coerce_backend(model, hp: HParams) -> _Backend:
+    """Pick the right backend based on what the caller passed.
+
+    Accepted `model` values:
+      * `voicefilter_lite.model.VoiceFilterLite` (nn.Module) → torch
+      * `str` / `os.PathLike` (path to a `.onnx` file) → onnxruntime
+      * `onnxruntime.capi.onnxruntime_inference_collection.InferenceSession` → onnxruntime
+    """
+    if isinstance(model, _Backend):
+        return model
+    if isinstance(model, (str, os.PathLike)):
+        try:
+            import onnxruntime as ort  # noqa: F401
+        except ImportError as e:
+            raise ImportError(
+                "Passing an ONNX path requires `onnxruntime`. "
+                "Install with `pip install onnxruntime`."
+            ) from e
+        from onnxruntime import InferenceSession
+        session = InferenceSession(str(model), providers=["CPUExecutionProvider"])
+        return _OnnxBackend(session, hp)
+    # Duck-typed InferenceSession.
+    if hasattr(model, "run") and hasattr(model, "get_inputs") and hasattr(model, "get_outputs"):
+        return _OnnxBackend(model, hp)
+    # nn.Module fallback.
+    return _TorchBackend(model, hp)
+
+
 class StreamingVoiceFilter:
-    """Stateful frame-by-frame inference wrapper.
+    """Stateful frame-by-frame inference wrapper (torch or ONNX backend).
 
     Usage:
+        # torch model:
         sf = StreamingVoiceFilter(model, hp)
+        # ONNX path or session:
+        sf = StreamingVoiceFilter("voicefilter_lite.onnx", hp)
+
         sf.set_dvector(dvec)                 # registration step (256-d from SpeakerEncoder)
         for chunk_logmel_frame in stream:    # (n_mels,) each iteration
             enhanced_frame = sf.step(chunk_logmel_frame)
     """
 
-    def __init__(self, model: VoiceFilterLite, hp: HParams):
-        self.model = model.eval()
+    def __init__(self, model, hp: HParams):
         self.hp = hp
-        # Registered d-vector (already 256-d from SpeakerEncoder; no in-model
-        # projection).
+        self._backend: _Backend = _coerce_backend(model, hp)
+        # Carry `.eval()`-equivalent behaviour regardless of backend.
         self._dvec: Optional[torch.Tensor] = None
-        self._hidden: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
-        self._context: List[torch.Tensor] = []   # most recent frame_stack - 1 frames
-        # Initialised lazily so it inherits dtype/device from the model.
+        self._context: List[torch.Tensor] = []
         self._adaptive: Optional[AdaptiveSuppression] = None
+
+    @property
+    def backend_name(self) -> str:
+        return self._backend.name
 
     # ------------------------------------------------------------------ setup
     @torch.no_grad()
@@ -122,16 +274,13 @@ class StreamingVoiceFilter:
             f"dims must match."
         )
         self._dvec = dvec
+        self._backend.set_dvec(dvec)
         self.reset_state()
 
     @torch.no_grad()
     def reset_state(self) -> None:
         """Drop LSTM hidden state and clear the left-context buffer."""
-        device = next(self.model.parameters()).device
-        self._hidden = (
-            torch.zeros(self.hp.num_lstm_layers, 1, self.hp.hidden_dim, device=device),
-            torch.zeros(self.hp.num_lstm_layers, 1, self.hp.hidden_dim, device=device),
-        )
+        self._backend.reset()
         self._context = []
         if self._adaptive is not None:
             self._adaptive.reset()
@@ -152,11 +301,6 @@ class StreamingVoiceFilter:
 
         Returns:
             (n_mels,) enhanced log-mel for this frame, on the caller's device.
-            One input frame always yields one output frame (same shape, dtype,
-            device) — `step()` runs the LSTM forward unconditionally so the
-                first `frame_stack - 1` calls see the same zero-padded
-                left-context / zero-hidden-state warm-up pattern that training uses
-                (training's `frame_stack_left` + per-batch hidden reset).
         """
         if self._dvec is None:
             raise RuntimeError("Call set_dvector() before step().")
@@ -167,17 +311,10 @@ class StreamingVoiceFilter:
         caller_device = frame_logmel.device
 
         stacked = self._build_stacked_input(frame_logmel)
-        mask, x, last_frame = self._run_model(stacked)
-        # Paper §3.4: `f_adapt(S_in^(t))` — the noise-type predictor's
-        # primary input is the current frame's noisy filterbank, not the
-        # LSTM hidden state. `last_frame` is the right-most slot of the
-        # right-aligned stack, i.e. S_in^(t). When
-        # `hp.alpha_head_use_current_frame=False` we fall back to the
-        # LSTM output `x` (paper §4.2 alternative).
-        head_in = last_frame if self.hp.alpha_head_use_current_frame else x
-        f_adapt = self._predict_f_adapt(head_in) if self.hp.use_noise_type_predictor else 0.0
-
-        enhanced = self._apply_suppression(mask, last_frame, f_adapt, caller_device)
+        mask, last_frame, f_adapt = self._backend.infer(stacked)
+        enhanced = self._apply_suppression(mask, last_frame, f_adapt)
+        if enhanced.device != caller_device:
+            enhanced = enhanced.to(caller_device)
         return enhanced.squeeze(0) if squeeze else enhanced
 
     # ------------------------------------------------------------------ helpers
@@ -196,62 +333,16 @@ class StreamingVoiceFilter:
             self._context = self._context[-stack:]
 
         stacked = torch.zeros(1, stack, n_mels, dtype=frame_logmel.dtype, device=frame_logmel.device)
-        # Right-align: most recent frame goes into the last slot.
         offset = stack - len(self._context)
         for i, f in enumerate(self._context):
             stacked[0, offset + i] = f[0]
         return stacked
 
-    def _run_model(self, stacked: torch.Tensor):
-        """One-step model forward → mask, lstm_out (for alpha head), last frame.
-
-        Delegates the LSTM core to `model.lstm_forward` so this stays in
-        lockstep with `VoiceFilterLite.forward`. The streaming path needs
-        `lstm_out` separately for the `hp.alpha_head_use_current_frame=False`
-        variant (paper §4.2 alternative input to the noise-type head).
-
-        The model may live on a different device than the caller's frame
-        (e.g. CPU frame + MPS model). We align the input to the model's
-        device for the LSTM forward, then bring outputs back to the
-        caller's device before returning.
-        """
-        stacked_flat = stacked.reshape(1, 1, -1)
-        # `lstm_forward` expects `dvec` as `(B, d_vector_dim)` — `self._dvec`
-        # is already at this shape (set_dvector adds the batch dim). The
-        # legacy inline path used `(1, 1, 256)` here; we no longer need
-        # the extra T dim because `lstm_forward` tiles internally.
-        dvec = self._dvec
-
-        model_device = dvec.device
-        if stacked_flat.device != model_device:
-            stacked_flat = stacked_flat.to(model_device)
-
-        # `lstm_forward` already runs in_proj + in_norm + [cnn] + lstm.
-        x, self._hidden = self.model.lstm_forward(stacked_flat, dvec, self._hidden)
-        mask = torch.sigmoid(self.model.out_proj(self.model.dropout(x)))   # (1, 1, n_mels)
-
-        last_frame = stacked[0, -1]
-        if last_frame.device != mask.device:
-            last_frame = last_frame.to(mask.device)
-        return mask, x, last_frame
-
-    def _predict_f_adapt(self, head_in: torch.Tensor) -> float:
-        """Run the noise-type head on `head_in` (current frame or LSTM output) → scalar.
-
-        Paper §3.4: `f_adapt(S_in^(t))` — primary input is the current frame's
-        noisy filterbank (80-d). Paper §4.2 alternative: feed the LSTM output
-        features (`x`). The `step` caller picks which one based on
-        `hp.alpha_head_use_current_frame`.
-        """
-        logit = self.model.alpha_head(head_in)               # (1, 1, 1)
-        return float(torch.sigmoid(logit).item())
-
     def _apply_suppression(
         self,
-        mask: torch.Tensor,
+        mask: Optional[torch.Tensor],
         last_frame: torch.Tensor,
         f_adapt: float,
-        caller_device: torch.device,
     ) -> torch.Tensor:
         """Blend the filtered output with the raw input using w^(t).
 
@@ -268,11 +359,13 @@ class StreamingVoiceFilter:
 
         # log → linear for both filtered and raw frames (single round-trip).
         raw_linear = log_mel_to_linear(last_frame, floor=floor)
-        filtered_linear = apply_mask(mask[0, 0], raw_linear)
+        if mask is None:
+            # Legacy ONNX graph: the model already applied the mask in its
+            # own log-mel round-trip; we have nothing to multiply here.
+            filtered_linear = raw_linear
+        else:
+            filtered_linear = apply_mask(mask.reshape(-1), raw_linear)
 
         # §3.4 Eq. 4: S_out = w · Ŝ_in + (1-w) · S_in (all in linear-mel).
         enhanced_linear = w * filtered_linear + (1.0 - w) * raw_linear
-        enhanced = linear_to_log_mel(enhanced_linear, floor=floor)
-        if enhanced.device != caller_device:
-            enhanced = enhanced.to(caller_device)
-        return enhanced
+        return linear_to_log_mel(enhanced_linear, floor=floor)

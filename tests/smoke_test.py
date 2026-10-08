@@ -22,6 +22,10 @@ These verify that:
         correct +1 / -1 rule given target + interference burst windows.
     12. `_sample_activity_burst` keeps `burst_end <= sample_len` across a
         wide seed range (regression for a 799-vs-800 training crash).
+    13. `losses.linear_mel_si_snr_per_sample` (per-bin SI-SNR in linear
+        mel, used by the train loop for the `train/si_snr_*` TB scalars)
+        hits the expected boundary values for identity / silence / noisy
+        inputs.
 
 Run with:
     python tests/smoke_test.py
@@ -41,6 +45,7 @@ from voicefilter_cli.losses import (
     AsymmetricL2Loss,
     build_loss,
     hinge_loss,
+    linear_mel_si_snr_per_sample,
 )
 from voicefilter_lite.audio import linear_to_log_mel
 from voicefilter_lite.model import VoiceFilterLite, apply_mask
@@ -366,6 +371,47 @@ def test_build_loss_factory(hp: HParams) -> None:
     assert isinstance(build_loss(hp), AsymmetricL2Loss)
 
 
+def test_linear_mel_si_snr_per_sample() -> None:
+    """Sanity for `losses.linear_mel_si_snr_per_sample`.
+
+    Three boundary cases:
+      * enhanced == target → SI-SNR very high (dB).
+      * enhanced == 0 (silence) → SI-SNR very negative.
+      * random enhanced vs random target → SI-SNR in a moderate band.
+    """
+    torch.manual_seed(0)
+    B, T, F = 2, 32, 16
+    # Strictly-positive linear-mel input (energies are non-negative).
+    target = torch.randn(B, T, F).abs() + 0.1
+
+    # enhanced == target → very high (DC-removed noise is ~0).
+    snr_same = linear_mel_si_snr_per_sample(target, target)
+    assert snr_same.mean().item() > 30.0, (
+        f"self-SI-SNR should be high, got {snr_same.tolist()}"
+    )
+
+    # enhanced == 0 → very negative (proj is 0, noise is the full ref).
+    zero = torch.zeros_like(target)
+    snr_zero = linear_mel_si_snr_per_sample(zero, target)
+    assert snr_zero.mean().item() < -20.0, (
+        f"zero-vs-target SI-SNR should be very negative, got {snr_zero.tolist()}"
+    )
+
+    # enhanced ≈ target + noise → moderate band (sanity that scales).
+    noisy_enh = target + 0.5 * torch.randn_like(target)
+    snr_mid = linear_mel_si_snr_per_sample(noisy_enh, target)
+    assert 0.0 < snr_mid.mean().item() < 30.0, (
+        f"moderate-SI-SNR out of band, got {snr_mid.tolist()}"
+    )
+
+    print(
+        f"  linear_mel_si_snr_per_sample: "
+        f"same={snr_same.mean().item():.2f} "
+        f"zero={snr_zero.mean().item():.2f} "
+        f"mid={snr_mid.mean().item():.2f} dB"
+    )
+
+
 def test_mask_apply_paper(hp: HParams, device: torch.device) -> None:
     """Paper §3.2 literal mask application: `Y_enh = M · Y` in linear-mel.
 
@@ -567,43 +613,46 @@ def main() -> None:
     device = _select_device()
     print(f"  device={device}")
 
-    print("[1/12] SpeakerEncoder construct-only (no weights load)")
+    print("[1/13] SpeakerEncoder construct-only (no weights load)")
     test_dvector_encoder_construct_only(hp)
 
-    print("[2/12] SpeakerEncoder is the only speaker encoder")
+    print("[2/13] SpeakerEncoder is the only speaker encoder")
     test_speaker_encoder_only(hp)
 
-    print("[3/12] audio.extract_dvec full pipeline (single + batched)")
+    print("[3/13] audio.extract_dvec full pipeline (single + batched)")
     test_extract_dvec_pipeline(hp, device)
 
-    print("[4/12] d_vector_dim fixed at 256 (no auto-derive)")
+    print("[4/13] d_vector_dim fixed at 256 (no auto-derive)")
     test_d_vector_dim_fixed(hp)
 
-    print("[5/12] param count")
+    print("[5/13] param count")
     test_param_count(hp)
 
-    print("[6/12] forward + backward")
+    print("[6/13] forward + backward")
     test_forward_backward(hp, device)
 
-    print("[7/12] streaming matches batched")
+    print("[7/13] streaming matches batched")
     test_streaming_matches_batched(hp, device)
 
-    print("[8/12] asymmetric loss sanity")
+    print("[8/13] asymmetric loss sanity")
     test_loss_sanity(hp)
 
-    print("[9/12] hinge loss sanity")
+    print("[9/13] hinge loss sanity")
     test_hinge_loss_sanity()
 
-    print("[10/12] build_loss factory")
+    print("[10/13] build_loss factory")
     test_build_loss_factory(hp)
 
-    print("[11/12] paper §3.2 mask apply (M·Y in log-mel) + optional CNN + overlap labels")
+    print("[11/13] paper §3.2 mask apply (M·Y in log-mel) + optional CNN + overlap labels")
     test_mask_apply_paper(hp, device)
     test_optional_cnn(hp, device)
     test_per_frame_overlap_labels()
 
-    print("[12/12] activity-burst bounds (regression for training crash)")
+    print("[12/13] activity-burst bounds (regression for training crash)")
     test_activity_burst_no_oob()
+
+    print("[13/13] linear_mel_si_snr_per_sample (TB metric sanity)")
+    test_linear_mel_si_snr_per_sample()
 
     print("== ALL SMOKE TESTS PASSED ==")
 

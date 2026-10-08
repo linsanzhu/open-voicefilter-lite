@@ -166,32 +166,24 @@ model:
     # already-trained checkpoints.
     alpha_head_use_current_frame: true
 
-  # ---- Loss (paper §3.3 — asymmetric L2, α = 10) ----
-  # g_asym(x, α) = α·x if x > 0 else x; loss = Σ_t Σ_f g_asym(...)² (paper §3.3
-  # Eq. 3 — literal sum, NOT per-element mean). Over-suppression errors
-  # (S_enh < S_cln) are amplified by α² = 100. Magnitude of L_asym is now
-  # ~T·F larger than the legacy mean() variant, so `noise_type_loss_weight` is
-  # calibrated down to ~1/(T·F) of the old default.
+  # ---- Loss (paper §3.3 — asymmetric L2, α = 10, FIXED) ----
+  # g_asym(x, α) = α·x if x > 0 else x; loss = Σ_t Σ_f g_asym(...)²
+  # (paper §3.3 Eq. 3 — literal sum, NOT per-element mean). Over-
+  # suppression errors (S_enh < S_cln) are amplified by α² = 100. Held
+  # at the paper-faithful constant value end-to-end — no annealing.
+  # The "always emit M≈1 to dodge α²" trap is mitigated downstream by
+  # the categorical interference distribution (model rarely sees a
+  # clean target, so the trivial pass-through strategy isn't free) +
+  # by the noise-type predictor's adaptive w^(t) (paper §3.4) when
+  # the predictor is enabled.
   loss:
     # g_asym(x, α) = α·x if x > 0 else x. Paper §3.3 α=10 → over-
-    # suppression errors amplified by α²=100.
+    # suppression errors amplified by α²=100. Constant end-to-end.
     alpha: 10
-    # α-schedule start value (step 0). With α_start=1.0 the early phase
-    # of training runs a plain MSE (no over-suppression preference) so
-    # the model first learns which mel-bins discriminate target vs
-    # interference; the ramp below then turns on the over-suppression
-    # penalty. This breaks the "always emit M≈1 to dodge α² penalty"
-    # trap the paper's constant-α form is prone to: by the time α
-    # climbs past 1.0 the model already has meaningful discrimination,
-    # so bias drift toward pass-through gets harder.
-    alpha_start: 1.0
-    # Number of steps to ramp α from `alpha_start` to `alpha` (linear).
-    # 0 = disable annealing (constant α end-to-end, paper-faithful).
-    # 20 000 = 10% of `total_steps=200 000` — enough to settle
-    # discrimination before the asymmetry kicks in, short enough that
-    # the paper's intended over-suppression preference still dominates
-    # the back half of training.
-    alpha_ramp_steps: 1
+    # α-schedule disabled — `alpha_start` is only consumed when
+    # `alpha_ramp_steps > 0`, so it has no effect here. Omit both
+    # fields to keep the legacy constant-α form (the default).
+    alpha_ramp_steps: 0
     # Weight on the noise-type predictor hinge loss. Paper §4.2
     # explicitly specifies hinge for the predictor's binary
     # classification. Calibrated against the Σ_t Σ_f asym term
@@ -219,17 +211,28 @@ model:
     # predictor and was held only because slides do not pin a numeric
     # value — adopt a=0.7, b=0.2 for the "always harmless, sometimes
     # helpful" production behaviour.
-    adaptive_w_a: 0.7
+    adaptive_w_a: 0.8
     # Linear transform intercept "b ≥ 0" applied to f_adapt (slides
     # §3.4 Eq. 5). b=0.2 sets w_min; see adaptive_w_a above for the
     # full derivation (a=0.7 + b=0.2 maps [0,1] → [0.2, 0.9]).
-    adaptive_w_b: 0.2
+    adaptive_w_b: 0.1
+    # Extra direct penalty on the **raw mask** magnitude for silent-target
+    # frames (target_linear per-frame energy < 1e-3). The asym L2 only
+    # penalises a non-zero *enhanced* output — when both target and
+    # interference are quiet, `enhanced² ≈ 0` regardless of M, so the
+    # model has no gradient pushing M down. This term supplies that
+    # direct M→0 signal. 0 = disabled; 1e-3 is a paper-style starting
+    # point (the raw M² lives in [0, 1]). Pairs with the bumped
+    # `silent_target_prob=0.25` above — the term only fires on those
+    # ~25% of samples, so its gradient magnitude is well below the
+    # Σ_t Σ_f asym term without aggressive weighting.
+    silence_mask_weight: 1.0e-3
 
   # ---- EMA (exponential moving average of model weights) ----
   ema:
     # Enable EMA. Typically gives +0.5 dB SDR on validation; the
     # final ckpt saved by train.py uses EMA weights.
-    use: true
+    use: false
     # Decay rate: shadow = decay · shadow + (1-decay) · model.
     # 0.999 ≈ 1000-step effective memory.
     decay: 0.999
@@ -308,7 +311,11 @@ dataset:
   interference:
     babble:
       enabled: true
-      prob: 0.8 # independent Bernoulli prob of inclusion per sample
+      # `prob` is now legacy / ignored by the v3 sampler (the categorical
+      # distribution lives under `mixture.interference_*` below). Kept at 1.0
+      # so the field still parses as "enabled". Eligibility for the
+      # babble bucket is gated by `enabled: true` + a non-empty pool.
+      prob: 1.0
       sources:
         # Runtime babble source — every ref here IS consumed at training
         # time. To restrict babble to musan speech only, leave this list
@@ -325,7 +332,7 @@ dataset:
       gain_max: 1.2
     noise:
       enabled: true
-      prob: 0.3 # independent Bernoulli prob of inclusion per sample
+      prob: 1.0
       sources:
         # Runtime noise = musan `noise` passthrough. The librispeech
         # `other` ref below is baked by `prepare_dataset` and is
@@ -338,7 +345,7 @@ dataset:
           splits: [train.other.500]
     music:
       enabled: true
-      prob: 0.3 # independent Bernoulli prob of inclusion per sample
+      prob: 1.0
       sources:
         - source: musan
           subset: music
@@ -357,10 +364,64 @@ dataset:
     # Upper bound on training SNR (dB). Paper §3.2: 10 dB.
     snr_max_db: 10.0
     # Probability that the target wav is replaced by silence.
-    # Trains the "do nothing" pass-through mode.
-    silent_target_prob: 0.10
+    # Trains the "do nothing" pass-through mode. Bumped from 0.10 to
+    # 0.25 so the model sees the "fully suppress" branch ~2.5× more
+    # often — pairs with `loss.silence_mask_weight` to give a direct
+    # M→0 gradient on those samples.
+    silent_target_prob: 0.25
     # Probability that the interference wav is replaced by silence.
     silent_interference_prob: 0.10
+    # Per-sample target RMS norm target (dBFS). After the burst-masked
+    # crop, scale the target so its RMS = 10^(target_rms_norm_db / 20).
+    # This pins the interference energy budget to a constant per drawn
+    # SNR (the budget is `target_power / 10^(snr/10)`), so the asym L2
+    # Σ_t Σ_f term stops swinging with LibriSpeech loudness variance.
+    # -20.0 → RMS = 0.1. Set to null to disable (raw natural RMS, the
+    # pre-fix behaviour). Skipped on silent / near-silent samples.
+    target_rms_norm_db: -20.0
+
+    # ---- Interference distribution (v3 categorical sampler) ----
+    # The dataset draws ONE bucket per sample from the 3-way categorical
+    # (`none` / `single` / `mixed`), then synthesises the picked TYPE(s)
+    # via `_sample_interference_v3` + `_mix_babble_simple` /
+    # `_mix_passthrough_simple`. The four fields below MUST sum to 1.0
+    # in the post-warmup target distribution. Old `interference.<type>.prob`
+    # fields above are now gating flags (TYPE eligibility) rather than
+    # per-sample inclusion probabilities.
+    #
+    # Target distribution:
+    #   10% no interference         (interference_none_weight)
+    #   40% pure babble             (interference_single_weights.babble)
+    #   10% pure music              (interference_single_weights.music)
+    #   10% pure noise              (interference_single_weights.noise)
+    #   30% multi-type composite    (interference_mixed_weight)
+    #
+    # Interference placement is also simplified — interference ALWAYS
+    # starts at sample 0 of the target and lasts the full `sample_len_sec`
+    # window. No random segment offset / length / burst fades. Target keeps
+    # its burst-mask (predictor labels need it).
+    interference_none_weight: 0.10
+    interference_single_weights:
+      babble: 0.40
+      noise: 0.10
+      music: 0.10
+    interference_mixed_weight: 0.30
+    # Curriculum on the multi-type bucket. At step 0 the mixed bucket
+    # has weight 0 (model trains on single-type interference only). Over
+    # `multi_type_warmup_steps` the effective multi-type weight linearly
+    # ramps from `multi_type_start_prob * interference_mixed_weight` to
+    # `multi_type_end_prob * interference_mixed_weight`; the freed mass
+    # is redistributed onto the single-type buckets so the no-interference
+    # fraction stays fixed across the ramp.
+    #
+    # 30 000 = 30% of `total_steps=100 000` — long enough for the model
+    # to master single-type babble (the dominant case) before facing
+    # composites, short enough that the back half of training still has
+    # the full target mixed distribution. Set to 0 to disable the ramp
+    # (mixed weight held at `interference_mixed_weight` from step 0).
+    multi_type_warmup_steps: 30000
+    multi_type_start_prob: 0.0
+    multi_type_end_prob: 1.0
 
   # ---- Per-frame activity bursts (paper §4.2 / deviation 5) ----
   # The noise-type predictor's per-frame label is +1 where BOTH target
@@ -372,7 +433,7 @@ dataset:
     # Lower bound on burst duration (s).
     burst_min_sec: 0.5
     # Upper bound on burst duration (s).
-    burst_max_sec: 4.0
+    burst_max_sec: 2
     # Fade-in / fade-out length (ms) at burst edges.
     fade_ms: 50.0
 
@@ -383,12 +444,6 @@ dataset:
     # a bounded max instead of the longest batch utterance (some
     # LibriSpeech speakers are ~30 s — caps prevent OOM).
     max_sec: 6.0
-    # Reserved for future streaming buffers; not currently used by
-    # LocalTripletStream (d-vectors are pre-baked).
-    buffer_max_per_spk: 4
-    # Reserved for future streaming buffers; not currently used by
-    # LocalTripletStream (d-vectors are pre-baked).
-    buffer_max_speakers: 512
 
   # ---- Local-dataset output (output of `scripts/prepare_dataset.py`) ----
   # The baked wav / npy / manifest.json tree. Per-source HF arrow caches

@@ -175,7 +175,7 @@ model:
   loss:
     # g_asym(x, α) = α·x if x > 0 else x. Paper §3.3 α=10 → over-
     # suppression errors amplified by α²=100.
-    alpha: 2
+    alpha: 10
     # α-schedule start value (step 0). With α_start=1.0 the early phase
     # of training runs a plain MSE (no over-suppression preference) so
     # the model first learns which mel-bins discriminate target vs
@@ -383,12 +383,6 @@ dataset:
     # a bounded max instead of the longest batch utterance (some
     # LibriSpeech speakers are ~30 s — caps prevent OOM).
     max_sec: 6.0
-    # Reserved for future streaming buffers; not currently used by
-    # LocalTripletStream (d-vectors are pre-baked).
-    buffer_max_per_spk: 4
-    # Reserved for future streaming buffers; not currently used by
-    # LocalTripletStream (d-vectors are pre-baked).
-    buffer_max_speakers: 512
 
   # ---- Local-dataset output (output of `scripts/prepare_dataset.py`) ----
   # The baked wav / npy / manifest.json tree. Per-source HF arrow caches

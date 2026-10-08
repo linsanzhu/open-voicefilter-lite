@@ -51,7 +51,7 @@ from torch.utils.data import DataLoader
 
 from voicefilter_cli.dataset import HfTripletStream, collate_triplets
 from voicefilter_cli.hf import apply_hf_endpoint
-from voicefilter_cli.losses import build_loss
+from voicefilter_cli.losses import build_loss, linear_mel_si_snr_per_sample
 from voicefilter_lite.audio import log_mel_to_linear
 from voicefilter_lite.config import load_and_apply
 from voicefilter_lite.hparams import HParams
@@ -406,11 +406,34 @@ def train(hp: HParams, args: "TrainArgs") -> None:
         print(f"[train] EMA enabled (decay={hp.ema_decay}, warmup={hp.ema_warmup_steps})")
 
     # ---- Data ----
+    # Shared-memory handle for the curriculum-controlled
+    # `multi_type_prob` scalar. Created in the main thread BEFORE the
+    # DataLoader forks its workers, so every fork'd worker holds a
+    # handle on the same `multiprocessing.Value`; updates via
+    # `.value = ...` in the main thread propagate to the workers without
+    # any further IPC. `0.0` initially — the loop writes the ramped
+    # value each `log_every` window.
+    import torch.multiprocessing as _tmp
+    multi_type_prob_value = _tmp.Value("f", float(hp.multi_type_start_prob))
+    if hp.multi_type_warmup_steps > 0:
+        print(
+            f"[train] interference curriculum: multi_type_p "
+            f"{hp.multi_type_start_prob:.3f} → {hp.multi_type_end_prob:.3f} "
+            f"over {hp.multi_type_warmup_steps} steps "
+            f"({hp.multi_type_warmup_steps / max(1, hp.total_steps):.0%} of total)"
+        )
+    else:
+        print(
+            f"[train] interference curriculum: disabled "
+            f"(multi_type_prob fixed at {hp.multi_type_end_prob:.3f})"
+        )
+
     train_ds = HfTripletStream(
         hp=hp,
         worker_id=0,
         num_workers=1,
         seed=hp.seed,
+        multi_type_prob_value=multi_type_prob_value,
     )
     train_loader = DataLoader(
         train_ds,
@@ -472,6 +495,10 @@ def train(hp: HParams, args: "TrainArgs") -> None:
     running_loss_asym_over = torch.zeros((), device=device)
     running_loss_asym_under = torch.zeros((), device=device)
     running_loss_noise_type = torch.zeros((), device=device)
+    # Opt-in raw-mask penalty on silent-target frames. Always accumulated
+    # so the TB curve is stable when the term is turned on; stays at 0
+    # when `silence_mask_weight=0` (the loss returns the zero scalar).
+    running_loss_silence = torch.zeros((), device=device)
     # Noise-type predictor diagnostics — hinge loss can drop while the
     # classifier cheats (e.g. predicting all-pass when pos_rate ≈ 0).
     # `noise_type_acc` tracks window-mean binary accuracy;
@@ -488,6 +515,13 @@ def train(hp: HParams, args: "TrainArgs") -> None:
     running_mask_min = torch.full((), float("inf"), device=device)
     running_mask_max = torch.full((), float("-inf"), device=device)
     running_grad_norm = torch.zeros((), device=device)
+    # SI-SNR diagnostics — per-bin linear-mel SI-SNR averaged across F,
+    # see `losses.linear_mel_si_snr_per_sample`. Tracks "is the model
+    # recovering the target's spectral envelope?" through training;
+    # pairs with loss_asym so a falling loss with flat SI-SNR flags a
+    # collapse (model dodging the α² penalty via M≈1, paper §3.3 trap).
+    running_si_snr_in = torch.zeros((), device=device)
+    running_si_snr_out = torch.zeros((), device=device)
     running_count = 0
 
     # First-batch visibility: the iterable dataset pulls a full batch of
@@ -566,6 +600,7 @@ def train(hp: HParams, args: "TrainArgs") -> None:
             enhanced_linear, target_linear,
             frame_logits=frame_logits,
             frame_labels=overlap_labels,
+            mask=mask,
         )
         loss = comps["loss"]
 
@@ -578,6 +613,17 @@ def train(hp: HParams, args: "TrainArgs") -> None:
             running_mask_mean += m.mean()
             running_mask_min = torch.minimum(running_mask_min, m.min())
             running_mask_max = torch.maximum(running_mask_max, m.max())
+            # SI-SNR accumulation. Per-sample means are averaged across
+            # the window so the TB curve isn't dominated by outlier
+            # batches. Done under no_grad because this is a metric —
+            # gradients would waste backward work. `enhanced_linear` is
+            # already detached inside this no_grad block.
+            si_snr_in_t = linear_mel_si_snr_per_sample(cur_linear, target_linear)
+            si_snr_out_t = linear_mel_si_snr_per_sample(
+                enhanced_linear, target_linear,
+            )
+            running_si_snr_in += si_snr_in_t.mean()
+            running_si_snr_out += si_snr_out_t.mean()
             # Noise-type predictor accuracy + positive-rate. Hinge loss
             # can fall while the classifier cheats; per-window accuracy is
             # the cheap, direct read on whether the predictor is learning
@@ -622,6 +668,7 @@ def train(hp: HParams, args: "TrainArgs") -> None:
         running_loss_asym_over += comps["loss_asym_over"]
         running_loss_asym_under += comps["loss_asym_under"]
         running_loss_noise_type += comps["loss_noise_type"]
+        running_loss_silence += comps["loss_silence"]
         running_count += 1
         step += 1
 
@@ -651,6 +698,20 @@ def train(hp: HParams, args: "TrainArgs") -> None:
             # resolution (5 steps) which is well below any meaningful
             # α-change granularity (ramp is 10% of `total_steps`).
             alpha_now = loss_fn.set_step(step)
+            # Refresh the interference-distribution curriculum knob
+            # (multi_type_prob ∈ [start, end] over `multi_type_warmup_steps`).
+            # The shared Value is read by every fork'd DataLoader worker
+            # at iteration time; updates propagate via shared memory
+            # without any further IPC. When `multi_type_warmup_steps == 0`
+            # the knob is held at the end value end-to-end.
+            if hp.multi_type_warmup_steps > 0 and step <= hp.multi_type_warmup_steps:
+                frac = step / float(hp.multi_type_warmup_steps)
+                multi_type_prob_value.value = float(
+                    hp.multi_type_start_prob
+                    + (hp.multi_type_end_prob - hp.multi_type_start_prob) * frac
+                )
+            else:
+                multi_type_prob_value.value = float(hp.multi_type_end_prob)
             # ONE sync point for the whole log window — multiple GPU tensors
             # reduce to floats in sequential `.item()`s, but the kernels
             # before them are dispatched back-to-back so only the first
@@ -660,17 +721,23 @@ def train(hp: HParams, args: "TrainArgs") -> None:
             avg_loss_asym_over_t = running_loss_asym_over / count
             avg_loss_asym_under_t = running_loss_asym_under / count
             avg_loss_noise_type_t = running_loss_noise_type / count
+            avg_loss_silence_t = running_loss_silence / count
             avg_grad_norm_t = running_grad_norm / count
             avg_noise_type_acc_t = running_noise_type_acc / count
             avg_noise_type_pos_rate_t = running_noise_type_pos_rate / count
+            avg_si_snr_in_t = running_si_snr_in / count
+            avg_si_snr_out_t = running_si_snr_out / count
             avg_loss = avg_loss_t.item()
             avg_loss_asym = avg_loss_asym_t.item()
             avg_loss_asym_over = avg_loss_asym_over_t.item()
             avg_loss_asym_under = avg_loss_asym_under_t.item()
             avg_loss_noise_type = avg_loss_noise_type_t.item()
+            avg_loss_silence = avg_loss_silence_t.item()
             avg_grad_norm = avg_grad_norm_t.item()
             avg_noise_type_acc = avg_noise_type_acc_t.item()
             avg_noise_type_pos_rate = avg_noise_type_pos_rate_t.item()
+            avg_si_snr_in = avg_si_snr_in_t.item()
+            avg_si_snr_out = avg_si_snr_out_t.item()
             # mask stats: mean is window-mean (sum / count). min/max are
             # window-extrema — they catch the instant the mask saturates
             # to all-pass (max → 1) or all-zero (min → 0) within the log
@@ -697,6 +764,7 @@ def train(hp: HParams, args: "TrainArgs") -> None:
                 f"[train] {wallclock} step={step}/{hp.total_steps} "
                 f"loss={avg_loss:.4f} "
                 f"lr={cur_lr:.2e} samples/s={sps:.1f} "
+                f"multi_type_p={multi_type_prob_value.value:.2f} "
                 f"elapsed={elapsed_total:.1f}s"
             )
             if writer is not None:
@@ -710,10 +778,24 @@ def train(hp: HParams, args: "TrainArgs") -> None:
                 writer.add_scalar("train/loss_asym", avg_loss_asym, step)
                 writer.add_scalar("train/loss_alpha", alpha_now, step)
                 writer.add_scalar("train/lr", cur_lr, step)
+                writer.add_scalar("train/si_snr_in", avg_si_snr_in, step)
+                writer.add_scalar("train/si_snr_out", avg_si_snr_out, step)
+                writer.add_scalar(
+                    "train/si_snri", avg_si_snr_out - avg_si_snr_in, step,
+                )
+                writer.add_scalar(
+                    "train/multi_type_prob", multi_type_prob_value.value, step,
+                )
                 if hp.use_noise_type_predictor:
                     writer.add_scalar("train/loss_noise_type", avg_loss_noise_type, step)
                     writer.add_scalar("train/noise_type_acc", avg_noise_type_acc, step)
                     writer.add_scalar("train/noise_type_pos_rate", avg_noise_type_pos_rate, step)
+                # Only log the silence-mask term when it's actually doing
+                # work — keeps the TB graph clean in the default config
+                # (`silence_mask_weight=0` would otherwise pin a flat
+                # zero line forever).
+                if hp.silence_mask_weight > 0.0:
+                    writer.add_scalar("train/loss_silence", avg_loss_silence, step)
             # In-place zero on the same tensor (no new allocation, unlike
             # `running_loss = torch.zeros(...)`).
             running_loss.zero_()
@@ -721,6 +803,7 @@ def train(hp: HParams, args: "TrainArgs") -> None:
             running_loss_asym_over.zero_()
             running_loss_asym_under.zero_()
             running_loss_noise_type.zero_()
+            running_loss_silence.zero_()
             running_mask_mean.zero_()
             # Min/max use ±inf sentinels — `.zero_()` would corrupt them
             # (min-of-zeroes would no longer be a true window-minimum).
@@ -729,6 +812,8 @@ def train(hp: HParams, args: "TrainArgs") -> None:
             running_grad_norm.zero_()
             running_noise_type_acc.zero_()
             running_noise_type_pos_rate.zero_()
+            running_si_snr_in.zero_()
+            running_si_snr_out.zero_()
             running_count = 0
             last_log = now
 

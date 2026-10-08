@@ -176,6 +176,18 @@ class LossConfig:
     # (~T·F larger than legacy mean-asym); sample_length=3s, hop=10ms,
     # n_mels=128 → 1/(T·F) ≈ 3e-5.
     noise_type_loss_weight: float = 1e-5
+    # Extra penalty on the **raw mask** magnitude (not on the filtered
+    # output) for frames where the target speaker is silent (label < 0).
+    # The asymmetric L2 term already penalises a non-zero enhanced
+    # output when the target is silent, but only indirectly
+    # (enhanced = mask · cur; when `cur` is also tiny, the squared error
+    # ≈ 0 regardless of mask). This term is a direct gradient on `M → 0`
+    # for silent-target frames, so the model learns the
+    # "if no target, fully suppress" branch even on quiet segments.
+    # Default 0 = disabled (paper doesn't have this term; opt-in).
+    # Recommended starting value: 1e-3 to 1e-2; the raw mask² is in
+    # [0, 1] so this is a per-frame L2 in that range.
+    silence_mask_weight: float = 0.0
     # Paper §4.4 last-row description (the 2.2 MB Table 2 entry):
     # "If we use adaptive suppression strength with a moving average
     # coefficient of 0.4, ... we observe almost no WER degradation on
@@ -573,7 +585,7 @@ class DatasetInterferenceConfig:
 
 @dataclass
 class DatasetMixtureConfig:
-    """SNR / silence / segment-length knobs for the mixture stage."""
+    """SNR / silence / segment-length / interference-distribution knobs."""
 
     # Training segment length (s). Paper Fig 2: 3.0 s. Halve to
     # 1.5-2.0 s for memory-constrained configs (smaller T → smaller
@@ -590,6 +602,50 @@ class DatasetMixtureConfig:
     # Probability that the interference wav is replaced by silence.
     # Trains the silent-side branches of the noise-type predictor.
     silent_interference_prob: float = 0.10
+    # Per-sample target RMS normalisation, expressed in dBFS
+    # (20·log10(RMS / 1.0)). After the burst-masked crop, scale the
+    # target wav so its RMS = 10^(target_rms_norm_db / 20). The
+    # interference-energy budget (`target_power / 10^(snr/10)`) then
+    # becomes a constant per drawn SNR, so every sample has the same
+    # target + interference energy and the asym L2 Σ_t Σ_f term stops
+    # swinging with LibriSpeech loudness variance (which can span 1-2
+    # orders of magnitude). `None` = disabled (raw natural RMS, the
+    # pre-existing behaviour). Typical value: -20.0 dBFS (RMS = 0.1).
+    # Silent-target / very-low-RMS samples are skipped automatically
+    # (no divide-by-zero; the silent-target branch zeroes the wav
+    # downstream regardless).
+    target_rms_norm_db: Optional[float] = None
+
+    # ---- Interference distribution (categorical, replaces the old
+    #   independent-Bernoulli `interference.{babble,noise,music}.prob`
+    #   sampler — see dataset.py::_sample_interference_v3) ----
+    # Weight of the "no interference" bucket. Together with the single-
+    # type buckets + the mixed bucket these MUST sum to 1.0.
+    interference_none_weight: float = 0.10
+    # Weight of each single-type bucket. Keys must be one of
+    # "babble" / "noise" / "music". Missing keys default to weight 0
+    # (i.e. that TYPE is never sampled as a pure-single bucket).
+    interference_single_weights: dict[str, float] = field(
+        default_factory=lambda: {"babble": 0.40, "noise": 0.10, "music": 0.10},
+    )
+    # Weight of the "multi-type" bucket. When this is the rolled-up
+    # bucket, the dataset samples 2-3 distinct TYPES and stacks them
+    # under the energy-budget allocator.
+    interference_mixed_weight: float = 0.30
+    # Number of optimisation steps over which the multi-type bucket's
+    # effective weight ramps from `multi_type_start_prob *
+    # interference_mixed_weight` to `multi_type_end_prob *
+    # interference_mixed_weight`. The single-type buckets are
+    # proportionally up-weighted to keep the total distribution = 1.
+    # 0 = disabled (multi-type weight is fixed at `interference_mixed_weight`).
+    multi_type_warmup_steps: int = 30_000
+    # Initial scale on the multi-type bucket (0 = no multi-type samples
+    # in early training; the model first masters single-type interference
+    # before facing composites). Final scale is `multi_type_end_prob`.
+    multi_type_start_prob: float = 0.0
+    # Final scale on the multi-type bucket (1.0 = full target
+    # `interference_mixed_weight` once the warmup completes).
+    multi_type_end_prob: float = 1.0
 
 
 @dataclass
@@ -978,6 +1034,13 @@ class HParams:
     def noise_type_loss_weight(self, v: float) -> None: self.model.loss.noise_type_loss_weight = v
 
     @property
+    def silence_mask_weight(self) -> float:
+        return self.model.loss.silence_mask_weight
+    @silence_mask_weight.setter
+    def silence_mask_weight(self, v: float) -> None:
+        self.model.loss.silence_mask_weight = v
+
+    @property
     def adaptive_w_beta(self) -> float: return self.model.loss.adaptive_w_beta
     @adaptive_w_beta.setter
     def adaptive_w_beta(self, v: float) -> None: self.model.loss.adaptive_w_beta = v
@@ -986,11 +1049,6 @@ class HParams:
     def adaptive_w_a(self) -> float: return self.model.loss.adaptive_w_a
     @adaptive_w_a.setter
     def adaptive_w_a(self, v: float) -> None: self.model.loss.adaptive_w_a = v
-
-    @property
-    def adaptive_w_b(self) -> float: return self.model.loss.adaptive_w_b
-    @adaptive_w_b.setter
-    def adaptive_w_b(self, v: float) -> None: self.model.loss.adaptive_w_b = v
 
     @property
     def adaptive_w_b(self) -> float: return self.model.loss.adaptive_w_b
@@ -1074,6 +1132,61 @@ class HParams:
     @silent_interference_prob.setter
     def silent_interference_prob(self, v: float) -> None:
         self.dataset.mixture.silent_interference_prob = v
+
+    @property
+    def target_rms_norm_db(self) -> Optional[float]:
+        """Per-sample target RMS norm target in dBFS, or `None` to disable.
+
+        See `DatasetMixtureConfig.target_rms_norm_db` for the full
+        rationale. Flat accessor so callers can write `hp.target_rms_norm_db`
+        without reaching through `hp.dataset.mixture.*`.
+        """
+        return self.dataset.mixture.target_rms_norm_db
+    @target_rms_norm_db.setter
+    def target_rms_norm_db(self, v: Optional[float]) -> None:
+        self.dataset.mixture.target_rms_norm_db = v
+
+    @property
+    def interference_none_weight(self) -> float:
+        return self.dataset.mixture.interference_none_weight
+    @interference_none_weight.setter
+    def interference_none_weight(self, v: float) -> None:
+        self.dataset.mixture.interference_none_weight = v
+
+    @property
+    def interference_single_weights(self) -> dict[str, float]:
+        return self.dataset.mixture.interference_single_weights
+    @interference_single_weights.setter
+    def interference_single_weights(self, v: dict[str, float]) -> None:
+        self.dataset.mixture.interference_single_weights = v
+
+    @property
+    def interference_mixed_weight(self) -> float:
+        return self.dataset.mixture.interference_mixed_weight
+    @interference_mixed_weight.setter
+    def interference_mixed_weight(self, v: float) -> None:
+        self.dataset.mixture.interference_mixed_weight = v
+
+    @property
+    def multi_type_warmup_steps(self) -> int:
+        return self.dataset.mixture.multi_type_warmup_steps
+    @multi_type_warmup_steps.setter
+    def multi_type_warmup_steps(self, v: int) -> None:
+        self.dataset.mixture.multi_type_warmup_steps = v
+
+    @property
+    def multi_type_start_prob(self) -> float:
+        return self.dataset.mixture.multi_type_start_prob
+    @multi_type_start_prob.setter
+    def multi_type_start_prob(self, v: float) -> None:
+        self.dataset.mixture.multi_type_start_prob = v
+
+    @property
+    def multi_type_end_prob(self) -> float:
+        return self.dataset.mixture.multi_type_end_prob
+    @multi_type_end_prob.setter
+    def multi_type_end_prob(self, v: float) -> None:
+        self.dataset.mixture.multi_type_end_prob = v
 
     # Dataset.activity
     @property
@@ -1435,6 +1548,7 @@ _LEGACY_FLAT_TO_NESTED: dict[str, tuple[str, str, str]] = {
     "loss_alpha_start": ("model", "loss", "alpha_start"),
     "loss_alpha_ramp_steps": ("model", "loss", "alpha_ramp_steps"),
     "noise_type_loss_weight": ("model", "loss", "noise_type_loss_weight"),
+    "silence_mask_weight": ("model", "loss", "silence_mask_weight"),
     "adaptive_w_beta": ("model", "loss", "adaptive_w_beta"),
     "adaptive_w_a": ("model", "loss", "adaptive_w_a"),
     "adaptive_w_b": ("model", "loss", "adaptive_w_b"),
@@ -1451,6 +1565,13 @@ _LEGACY_FLAT_TO_NESTED: dict[str, tuple[str, str, str]] = {
     "snr_max_db": ("dataset", "mixture", "snr_max_db"),
     "silent_target_prob": ("dataset", "mixture", "silent_target_prob"),
     "silent_interference_prob": ("dataset", "mixture", "silent_interference_prob"),
+    "target_rms_norm_db": ("dataset", "mixture", "target_rms_norm_db"),
+    "interference_none_weight": ("dataset", "mixture", "interference_none_weight"),
+    "interference_single_weights": ("dataset", "mixture", "interference_single_weights"),
+    "interference_mixed_weight": ("dataset", "mixture", "interference_mixed_weight"),
+    "multi_type_warmup_steps": ("dataset", "mixture", "multi_type_warmup_steps"),
+    "multi_type_start_prob": ("dataset", "mixture", "multi_type_start_prob"),
+    "multi_type_end_prob": ("dataset", "mixture", "multi_type_end_prob"),
     # dataset.activity
     "activity_burst_min_sec": ("dataset", "activity", "burst_min_sec"),
     "activity_burst_max_sec": ("dataset", "activity", "burst_max_sec"),

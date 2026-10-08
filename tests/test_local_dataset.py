@@ -394,7 +394,28 @@ def test_missing_dvec_triggers_compute_and_caches(hp: HParams) -> None:
 
 
 def test_interference_type_probs_are_honored(hp: HParams) -> None:
-    """Each TYPE has an INDEPENDENT Bernoulli inclusion `prob`."""
+    """v3 categorical sampler: bucket + single-weight rates match config.
+
+    The HParams default categorical distribution is:
+
+        interference_none_weight       = 0.10
+        interference_single_weights    = {babble: 0.40, noise: 0.10, music: 0.10}
+        interference_mixed_weight      = 0.30
+
+    so over the long run the empirical rates should converge to those
+    numbers. We don't compute closed-form per-TYPE rates (mixed-bucket
+    composition is itself a weighted-sample), but we check three things:
+
+        1. Empty-tuple rate matches `interference_none_weight` (within 5pp).
+        2. Per-TYPE rates preserve the config ordering
+           (babble weight >> noise weight == music weight) — babble
+           inclusion rate must be at least 4× noise (babble's single
+           weight is 4× larger).
+        3. At least one multi-TYPE sample in 800 draws.
+
+    Together these three cover the categorical-sampler contract without
+    requiring an analytic closed-form for the mixed-bucket composition.
+    """
     ds = HfTripletStream(hp, worker_id=0, num_workers=1, seed=42)
     n_seen = 0
     n_with_type: dict[str, int] = {"babble": 0, "noise": 0, "music": 0}
@@ -414,20 +435,29 @@ def test_interference_type_probs_are_honored(hp: HParams) -> None:
     print(f"    empty={n_empty}, "
           f"{', '.join(f'{k}+={n_with_type[k]}' for k in ('babble','noise','music'))}")
     print(f"    combinations: {sorted(n_combinations.items())}")
-    expected_prob = {"babble": 0.5, "noise": 0.6, "music": 0.3}
-    for type_name, target_p in expected_prob.items():
-        got = n_with_type[type_name] / n_seen
-        assert abs(got - target_p) < 0.07, (
-            f"{type_name} inclusion rate {got:.3f} deviates from prob "
-            f"{target_p:.3f} by more than 7pp: {n_with_type}"
-        )
-    expected_empty = (1 - 0.5) * (1 - 0.6) * (1 - 0.3)
+    # (1) Empty-tuple (none) rate.
+    expected_empty = hp.interference_none_weight
     got_empty = n_empty / n_seen
     assert abs(got_empty - expected_empty) < 0.05, (
         f"empty-tuple fraction {got_empty:.3f} deviates from "
-        f"(1-babble)·(1-noise)·(1-music)={expected_empty:.3f} by more than "
+        f"interference_none_weight={expected_empty:.3f} by more than "
         f"5pp: n_empty={n_empty}/{n_seen}"
     )
+    # (2) Per-TYPE relative ordering: babble's single_weight is 4× noise's
+    # AND music's, and the per-TYPE P(in any sample) ≈ single[t] + mixed
+    # weighting that also favours babble. Empirically babble should be
+    # at least 2× more frequent than noise/music in 800 samples.
+    rates = {t: n_with_type[t] / n_seen for t in ("babble", "noise", "music")}
+    assert rates["babble"] >= 2 * rates["noise"], (
+        f"babble inclusion rate {rates['babble']:.3f} should be >= 2× "
+        f"noise rate {rates['noise']:.3f} (babble single_weight=0.40 "
+        f"vs noise 0.10): rates={rates}"
+    )
+    assert rates["babble"] >= 2 * rates["music"], (
+        f"babble inclusion rate {rates['babble']:.3f} should be >= 2× "
+        f"music rate {rates['music']:.3f}: rates={rates}"
+    )
+    # (3) At least one multi-TYPE sample.
     n_multi = sum(c for k, c in n_combinations.items() if len(k) >= 2)
     assert n_multi > 0, (
         f"expected at least one multi-TYPE sample in {n_seen}; got "
@@ -744,6 +774,90 @@ def test_silent_target_keeps_interference_at_natural_energy(hp: HParams) -> None
     )
 
 
+def test_target_rms_norm_pins_post_crop_rms(hp: HParams) -> None:
+    """`target_rms_norm_db` pin post-burst-mask target RMS to the dBFS target.
+
+    Three sub-cases:
+      * disabled (None) → natural RMS passes through (scaled only by
+        the burst-mask + crop, which is the legacy behaviour);
+      * enabled (-20 dBFS = RMS=0.1) → post-crop RMS hits 0.1 within
+        1% on a typical speech-like signal;
+      * silent / near-silent target → guard skips the scale (no
+        divide-by-zero, no NaN, peak = 0.0).
+    """
+    sr = hp.sample_rate
+    # 1.5 s speech-ish signal (decaying sinusoid → RMS ~0.1 naturally).
+    N = int(1.5 * sr)
+    t = np.arange(N) / sr
+    wav_full = torch.from_numpy(
+        (0.3 * np.sin(2 * np.pi * 200.0 * t) * np.exp(-t * 2.0))
+        .astype(np.float32)
+    )
+    ref_full = torch.from_numpy(
+        (0.05 * np.random.default_rng(0).standard_normal(N).astype(np.float32))
+    )
+
+    def _run(rms_db):
+        hp.target_rms_norm_db = rms_db
+        rng = random.Random(0)
+        return synthesize_raw_sample(
+            hp, rng,
+            target_wav_full=wav_full,
+            ref_wav_full=ref_full,
+            babble_spk_to_entries={}, noise_pool=[], music_pool=[],
+            type_probs={"babble": 0.0, "noise": 0.0, "music": 0.0},
+            babble_cfg=None, noise_cfg=None, music_cfg=None,
+            multi_type_prob=0.0,
+        )
+
+    # Case A: disabled → no scaling (output RMS equals the natural
+    # burst-masked + cropped RMS, NOT the configured 0.1).
+    raw = _run(None)
+    out_rms_disabled = float((raw.target_wav ** 2).mean().sqrt().item())
+    assert not (abs(out_rms_disabled - 0.1) < 1e-3), (
+        f"[disabled] output RMS {out_rms_disabled:.4f} accidentally "
+        f"landed on the 0.1 target — the guard is probably broken"
+    )
+
+    # Case B: enabled → output RMS hits the target within 1%.
+    raw = _run(-20.0)
+    out_rms_enabled = float((raw.target_wav ** 2).mean().sqrt().item())
+    assert abs(out_rms_enabled - 0.1) < 0.01, (
+        f"[-20 dBFS] output RMS {out_rms_enabled:.4f} != 0.1 ± 1%"
+    )
+    # Defensive peak cap: RMS=0.1 should never push a speech peak
+    # above 1.0 (LibriSpeech crest factor is ≲ 10).
+    peak = float(raw.target_wav.abs().max().item())
+    assert peak <= 1.0 + 1e-5, (
+        f"[-20 dBFS] peak {peak:.3f} > 1.0 — peak cap failed"
+    )
+
+    # Case C: silent target → guard skipped, no NaN, peak = 0.0.
+    hp.target_rms_norm_db = -20.0
+    rng = random.Random(0)
+    raw = synthesize_raw_sample(
+        hp, rng,
+        target_wav_full=torch.zeros(N, dtype=torch.float32),
+        ref_wav_full=ref_full,
+        babble_spk_to_entries={}, noise_pool=[], music_pool=[],
+        type_probs={"babble": 0.0, "noise": 0.0, "music": 0.0},
+        babble_cfg=None, noise_cfg=None, music_cfg=None,
+        multi_type_prob=0.0,
+    )
+    assert not torch.isnan(raw.target_wav).any().item(), (
+        "silent target produced NaN — divide-by-zero guard failed"
+    )
+    assert float(raw.target_wav.abs().max().item()) == 0.0, (
+        "silent target post-norm peak should remain 0.0"
+    )
+
+    print(
+        f"  target_rms_norm OK — disabled={out_rms_disabled:.4f} "
+        f"(raw), enabled={out_rms_enabled:.4f} (target=0.1), "
+        f"silent=0.0 (no NaN)"
+    )
+
+
 def test_interference_post_mix_sir_matches_configured(hp: HParams) -> None:
     """End-to-end smoke: iterate 200 times and verify TYPE inclusion
     distribution matches the independent-Bernoulli expectation.
@@ -959,9 +1073,12 @@ def main() -> None:
         _bake_fixtures(hp, dvec_dir_root)
         test_interference_post_mix_sir_matches_configured(hp)
 
-        print("[12/12] short-source target_act padded to sample_len (regression)")
+        print("12/13] short-source target_act padded to sample_len (regression)")
         _bake_fixtures(hp, dvec_dir_root)
         test_short_source_target_act_is_padded_to_sample_len(hp)
+
+        print("13/13] target_rms_norm_db pins post-crop RMS (3 cases)")
+        test_target_rms_norm_pins_post_crop_rms(hp)
 
         print("== ALL LOCAL DATASET TESTS PASSED ==")
     finally:

@@ -268,7 +268,12 @@ def evaluate(hp: HParams, args: "EvalArgs") -> None:
     )
 
     model = VoiceFilterLite(hp).to(device).eval()
-    model.load_state_dict(ckpt["model_state"])
+    # `torch.compile(model)` (used during training) prefixes every parameter
+    # key with `_orig_mod.`. Strip it before loading into the bare model.
+    model_state = {
+        k.removeprefix("_orig_mod."): v for k, v in ckpt["model_state"].items()
+    }
+    model.load_state_dict(model_state)
     print(f"[eval] loaded {args.checkpoint} (step={ckpt.get('step')})")
 
     # Diagnostic: when --no-adaptive is set, disable the per-frame adaptive

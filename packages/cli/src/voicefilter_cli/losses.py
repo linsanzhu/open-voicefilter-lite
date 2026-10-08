@@ -1,13 +1,17 @@
 """Losses for VoiceFilter-Lite.
 
 The combined objective is paper §3.3 (asymmetric L2) + §4.2 (per-frame
-hinge loss for the noise-type predictor):
+hinge loss for the noise-type predictor) + an **opt-in** raw-mask
+penalty on silent-target frames:
 
-    L_total = L_asym + hp.noise_type_loss_weight · L_noise_type
+    L_total = L_asym
+            + hp.noise_type_loss_weight · L_noise_type
+            + hp.silence_mask_weight      · L_silence_mask
 
-    The asymmetric L2 (paper §3.3) is the only mask-supervision term; the
-    noise-type predictor is the second term. There is no auxiliary
-    regulariser on `M`.
+    The asymmetric L2 (paper §3.3) is the primary mask-supervision term;
+    the noise-type predictor is the second term. The third term is an
+    additional direct gradient on the raw mask `M` for frames where
+    the target is silent — see `_silence_mask_loss` for rationale.
 
 `L_asym` is the literal paper-Eq.3 form `Σ_t Σ_f g_asym(S_cln − S_enh, α)²`
 with `g_asym(x, α) = α·x if x > 0 else x` and α = 10 (paper Tables 1 & 2).
@@ -32,6 +36,53 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from voicefilter_lite.hparams import HParams
+
+
+def linear_mel_si_snr_per_sample(
+    estimate: torch.Tensor,
+    target: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Per-bin SI-SNR (dB), DC-removed across T, averaged across F.
+
+    Returns a `(B,)` tensor of per-sample SI-SNR values in dB. Each
+    element is the mean across mel-channels of the BSS-eval-style SI-SNR
+    computed **per mel bin** (DC-removed across the time axis, optimal
+    scalar `α` projection, then `10·log10(‖proj‖²/‖noise‖²)`). The math is
+    the batched parallel of `evaluate.py::log_mel_snr._snr_db` (the
+    inner `_snr_db` there operates on `(T, F)`; this version operates
+    on `(B, T, F)` along the batch axis).
+
+    Why linear-mel, not log-mel: the asymmetric L2 loss (paper §3.3)
+    and the model's mask (`M · S_in`, paper §3.2) both operate on
+    **linear** filterbank energies. Tracking SI-SNR in the same domain
+    keeps loss / metric comparable — a falling `L_asym` with flat
+    `si_snr_out` flags the paper §3.3 collapse (model dodging the α²
+    penalty by emitting M≈1).
+
+    Inputs MUST be in linear filterbank-energy space, not log-mel —
+    `cur_linear` / `target_linear` / `enhanced_linear` produced by
+    `voicefilter_lite.audio.log_mel_to_linear` are exactly that.
+
+    Args:
+        estimate: (B, T, F) — predicted enhanced linear-mel (`M · S_in`).
+        target:   (B, T, F) — clean target linear-mel.
+        eps:      floor for the log division; 1e-8 matches
+                  `evaluate.py::log_mel_snr`.
+
+    Returns:
+        (B,) tensor. Each entry is one sample's per-bin-mean SI-SNR
+        in dB. Higher = better.
+    """
+    est_c = estimate - estimate.mean(dim=1, keepdim=True)
+    ref_c = target - target.mean(dim=1, keepdim=True)
+    alpha = (est_c * ref_c).sum(dim=1) / (ref_c.pow(2).sum(dim=1) + eps)
+    proj = alpha.unsqueeze(1) * ref_c
+    noise = est_c - proj
+    per_bin_db = 10.0 * torch.log10(
+        proj.pow(2).sum(dim=1) / (noise.pow(2).sum(dim=1) + eps) + eps
+    )
+    return per_bin_db.mean(dim=1)
 
 
 def asymmetric_l2_loss(
@@ -126,10 +177,61 @@ def hinge_loss(
     return elementwise.mean()
 
 
-class AsymmetricL2Loss(nn.Module):
-    """Paper §3.3 asymmetric L2 + per-frame hinge (§4.2).
+def _silence_mask_loss(
+    mask: torch.Tensor,
+    target_linear: torch.Tensor,
+    threshold: float = 1e-3,
+) -> torch.Tensor:
+    """Per-frame L2 on the raw mask `M` for silent-target frames.
 
-    Total loss = L_asym + hp.noise_type_loss_weight · L_noise_type
+    Why this exists: paper §3.3's asymmetric L2 already penalises a
+    non-zero enhanced output (`M · S_in`) when the target is silent,
+    but **indirectly** — when `S_in` is also tiny (no interference),
+    `enhanced² ≈ 0` regardless of `M`, so the model has no gradient
+    pushing `M` down. This term supplies a direct `M → 0` gradient on
+    silent-target frames so the "if no target, fully suppress" branch
+    is learned even on quiet segments.
+
+    "Silent-target" is detected per frame from `target_linear` itself
+    (per-frame mel-energy sum below `threshold`). This is more robust
+    than carrying a separate `target_silent` flag through the dataset:
+    it adapts to whichever frames the dataset actually muted (so it
+    generalises to per-frame activity patterns), and it costs nothing
+    extra in the dataloader.
+
+    Args:
+        mask:          (B, T, F) raw mask from the model, in [0, 1]
+                       (sigmoid of `out_proj` output).
+        target_linear: (B, T, F) clean target linear-mel.
+        threshold:     per-frame energy below this counts as silent.
+                       1e-3 in linear-mel comfortably skips real speech
+                       (target_linear sum is typically ≫ 1) and catches
+                       the dataset's silent-target samples.
+
+    Returns:
+        Scalar loss = `mean( (M²) · silent )` over (B, T, F). Lives in
+        [0, 1] for sane mask ranges.
+    """
+    if mask.shape != target_linear.shape:
+        raise ValueError(
+            f"[_silence_mask_loss] shape mismatch: mask {tuple(mask.shape)} "
+            f"vs target {tuple(target_linear.shape)}"
+        )
+    # Per-frame energy: sum of linear-mel across the F axis. (B, T)
+    target_energy = target_linear.sum(dim=-1)
+    # Broadcast back to (B, T, 1) for element-wise multiply with mask.
+    silent = (target_energy < threshold).to(dtype=mask.dtype).unsqueeze(-1)
+    return ((mask ** 2) * silent).mean()
+
+
+class AsymmetricL2Loss(nn.Module):
+    """Paper §3.3 asymmetric L2 + per-frame hinge (§4.2) + opt-in
+    silent-target mask penalty.
+
+    Total loss =
+        L_asym
+      + hp.noise_type_loss_weight · L_noise_type
+      + hp.silence_mask_weight     · L_silence_mask
 
     `L_asym` amplifies over-suppression errors (model's enhanced < target)
     by `α²` so the model errs on the side of passing input through when
@@ -143,7 +245,17 @@ class AsymmetricL2Loss(nn.Module):
     predictor — see `hinge_loss` docstring.
 
     When `hp.use_noise_type_predictor=False`, the hinge term is skipped
-    (the predictor is not trained) and the loss reduces to `L_asym` alone.
+    (the predictor is not trained) and the loss reduces to `L_asym` plus
+    the optional `L_silence_mask`.
+
+    **`L_silence_mask`** is an opt-in extra term (default weight 0 =
+    disabled). It supplies a direct `M → 0` gradient on silent-target
+    frames, complementing the asym L2 which only penalises a non-zero
+    *enhanced* output — when both target and interference are quiet
+    the asym term gives no signal. The training loop must pass the
+    **raw mask** (B, T, F) in addition to the enhanced output; when
+    `silence_mask_weight=0` or no mask is supplied, the term is
+    skipped. See `_silence_mask_loss` for the per-frame definition.
 
     **α annealing** (paper §3.3 trap mitigation). The constant-α form is
     prone to the "always emit M≈1 to dodge α² penalty" collapse (paper
@@ -173,6 +285,11 @@ class AsymmetricL2Loss(nn.Module):
         self.alpha_ramp_steps = hp.loss_alpha_ramp_steps  # 0 = disabled
         self.use_noise_type_predictor = hp.use_noise_type_predictor
         self.noise_type_loss_weight = hp.noise_type_loss_weight
+        # Opt-in direct penalty on the raw mask for silent-target frames.
+        # 0 = disabled; raises the cost of leaving `M` large on frames
+        # where the target is silent (which the asym L2 only catches
+        # indirectly via `M · S_in`).
+        self.silence_mask_weight = hp.silence_mask_weight
         # Step-aware α. The training loop calls `set_step(step)` per log
         # window; before the first call, α stays at `alpha_start` so
         # pre-training smoke tests / debug forwards behave consistently.
@@ -222,8 +339,21 @@ class AsymmetricL2Loss(nn.Module):
         target: torch.Tensor,
         frame_logits: Optional[torch.Tensor] = None,
         frame_labels: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Compute total loss."""
+        """Compute total loss.
+
+        Args:
+            pred:   (B, T, F) enhanced linear-mel (`M · S_in`).
+            target: (B, T, F) clean target linear-mel.
+            frame_logits: (B, T) raw scores from `alpha_head`, or None
+                when the noise-type predictor is disabled.
+            frame_labels: (B, T) per-frame labels in {-1, +1}, or None
+                when the noise-type predictor is disabled.
+            mask:   (B, T, F) raw mask from the model (pre-`M · S_in`),
+                in [0, 1]. Required when `silence_mask_weight > 0`;
+                pass None to disable the silence-mask term.
+        """
         loss_asym = asymmetric_l2_loss(pred, target, alpha=self._alpha_current)
 
         loss_noise_type = pred.new_zeros(())
@@ -234,7 +364,15 @@ class AsymmetricL2Loss(nn.Module):
         ):
             loss_noise_type = hinge_loss(frame_logits, frame_labels)
 
-        return loss_asym + self.noise_type_loss_weight * loss_noise_type
+        loss_silence = pred.new_zeros(())
+        if self.silence_mask_weight > 0.0 and mask is not None:
+            loss_silence = _silence_mask_loss(mask, target)
+
+        return (
+            loss_asym
+            + self.noise_type_loss_weight * loss_noise_type
+            + self.silence_mask_weight * loss_silence
+        )
 
     def forward_with_components(
         self,
@@ -242,6 +380,7 @@ class AsymmetricL2Loss(nn.Module):
         target: torch.Tensor,
         frame_logits: Optional[torch.Tensor] = None,
         frame_labels: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
         """Like `forward` but returns each component for logging.
 
@@ -250,6 +389,12 @@ class AsymmetricL2Loss(nn.Module):
         the ratio helps detect when the model collapses to pass-through:
         if `over >> under` for many steps it's because the model is avoiding
         the α² penalty by emitting M≈1 (the trap paper §3.3 warns about).
+
+        The opt-in `loss_silence` term is the per-frame L2 on the raw
+        mask for silent-target frames (see `_silence_mask_loss`). It is
+        reported only when `silence_mask_weight > 0` AND `mask` is
+        supplied; otherwise the entry is the zero scalar (kept so
+        TensorBoard log-keys stay stable across configs).
         """
         alpha = self._alpha_current
         diff = target - pred
@@ -272,13 +417,22 @@ class AsymmetricL2Loss(nn.Module):
         ):
             loss_noise_type = hinge_loss(frame_logits, frame_labels)
 
-        total = loss_asym + self.noise_type_loss_weight * loss_noise_type
+        loss_silence = pred.new_zeros(())
+        if self.silence_mask_weight > 0.0 and mask is not None:
+            loss_silence = _silence_mask_loss(mask, target)
+
+        total = (
+            loss_asym
+            + self.noise_type_loss_weight * loss_noise_type
+            + self.silence_mask_weight * loss_silence
+        )
         return {
             "loss": total,
             "loss_asym": loss_asym.detach(),
             "loss_asym_over": loss_asym_over.detach(),
             "loss_asym_under": loss_asym_under.detach(),
             "loss_noise_type": loss_noise_type.detach(),
+            "loss_silence": loss_silence.detach(),
         }
 
 

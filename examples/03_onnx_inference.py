@@ -53,7 +53,7 @@ from open_voicefilter_lite.audio import (  # noqa: E402
     wav_to_log_mel,
 )
 from open_voicefilter_lite.hparams import HParams  # noqa: E402
-from open_voicefilter_lite.model import VoiceFilterLite, apply_mask  # noqa: E402
+from open_voicefilter_lite.model import VoiceFilterLite, StreamingVoiceFilter  # noqa: E402
 from open_voicefilter_lite.speaker_encoder import (  # noqa: E402
     SpeakerEncoder,
 )
@@ -119,62 +119,6 @@ def _compute_dvec(
     return dvec.cpu()
 
 
-class ONNXStreamingVoiceFilter:
-    """Stateful ONNX runtime wrapper mirroring StreamingVoiceFilter's API.
-
-    The ONNX graph expects:
-        stacked_logmel: (1, T, n_mels * frame_stack)
-        dvec:           (1, d_vector_dim)
-        h0, c0:         (num_lstm_layers, 1, hidden_dim)
-    and produces the next hidden state as well. We feed T=1 each call so
-    inference cost is independent of stream length.
-    """
-
-    def __init__(self, session, hp: HParams):
-        self.session = session
-        self.hp = hp
-        self._dvec: torch.Tensor | None = None
-        self._h = np.zeros((hp.num_lstm_layers, 1, hp.hidden_dim), dtype=np.float32)
-        self._c = np.zeros((hp.num_lstm_layers, 1, hp.hidden_dim), dtype=np.float32)
-        self._ctx: list[np.ndarray] = []
-
-    def set_dvector(self, dvec: torch.Tensor) -> None:
-        self._dvec = dvec.unsqueeze(0).numpy().astype(np.float32)  # (1, d_vector_dim)
-        self.reset_state()
-
-    def reset_state(self) -> None:
-        self._h[:] = 0.0
-        self._c[:] = 0.0
-        self._ctx = []
-
-    def step(self, frame_logmel: torch.Tensor) -> torch.Tensor:
-        if self._dvec is None:
-            raise RuntimeError("Call set_dvector() before step().")
-
-        f = frame_logmel.numpy().astype(np.float32).reshape(-1)        # (n_mels,)
-        self._ctx.append(f)
-        if len(self._ctx) > self.hp.frame_stack:
-            self._ctx = self._ctx[-self.hp.frame_stack:]
-
-        stack = self.hp.frame_stack
-        n_mels = self.hp.n_mels
-        stacked = np.zeros((1, 1, stack * n_mels), dtype=np.float32)
-        for i, fr in enumerate(self._ctx):
-            stacked[0, 0, (stack - len(self._ctx) + i) * n_mels:(stack - len(self._ctx) + i + 1) * n_mels] = fr
-
-        outs = self.session.run(
-            None,
-            {
-                "stacked_logmel": stacked,
-                "dvec": self._dvec,
-                "h0": self._h,
-                "c0": self._c,
-            },
-        )
-        enhanced, self._h, self._c = outs[0], outs[1], outs[2]
-        return torch.from_numpy(enhanced[0, 0])
-
-
 def run_onnx(
     session,
     hp: HParams,
@@ -187,7 +131,9 @@ def run_onnx(
     mel_fn = make_mel_basis(hp, device=torch.device("cpu"))
     log_mel = wav_to_log_mel(mixed, hp, mel_fn)                       # (T, 80)
 
-    onnx_sf = ONNXStreamingVoiceFilter(session, hp)
+    # Library class auto-detects the ORT session and routes through the
+    # ONNX backend, including the paper-§3.4 adaptive suppression blend.
+    onnx_sf = StreamingVoiceFilter(session, hp)
     onnx_sf.set_dvector(dvec)
 
     enhanced_frames = []
@@ -215,14 +161,12 @@ def verify_against_pytorch(
     This is a one-shot check on a short prefix — full sequence parity is
     guaranteed by determinism of both engines given identical init state.
     """
-    from open_voicefilter_lite.model import StreamingVoiceFilter
-
     device = next(model.parameters()).device
     pyt_sf = StreamingVoiceFilter(model, hp)
     pyt_sf.set_dvector(dvec.to(device))
 
     onnx_sess = _load_onnx_from_model(hp, model)
-    onnx_sf = ONNXStreamingVoiceFilter(onnx_sess, hp)
+    onnx_sf = StreamingVoiceFilter(onnx_sess, hp)
     onnx_sf.set_dvector(dvec.to(device).cpu())
 
     n_check = min(64, mixed_logmel.shape[0])
@@ -241,30 +185,33 @@ def verify_against_pytorch(
 
 
 def _load_onnx_from_model(hp: HParams, model: VoiceFilterLite):
-    """Re-export in-memory for the verify path (no disk write)."""
+    """Re-export in-memory for the verify path (no disk write).
+
+    Output names match the production exporter (`mask`, `f_adapt`, `hN`,
+    `cN`) so the `StreamingVoiceFilter` ONNX backend picks the mask path.
+    """
     import io
     import onnxruntime as ort
 
-    B, T = 1, 4
+    B, T = 1, 1  # streaming wrapper drives the graph one frame at a time
     stacked = torch.randn(B, T, hp.n_mels * hp.frame_stack)
     dvec = torch.randn(B, hp.d_vector_dim)
     h0 = torch.zeros(hp.num_lstm_layers, B, hp.hidden_dim)
     c0 = torch.zeros(hp.num_lstm_layers, B, hp.hidden_dim)
 
-    # Mirror StreamWrapper from scripts/export_onnx.py
     class _Wrap(torch.nn.Module):
         def __init__(self, m):
             super().__init__()
             self.model = m
 
         def forward(self, slm, dv, h0, c0):
-            # Shared LSTM core (in_proj + in_norm + [cnn] + lstm).
             x, (hN, cN) = self.model.lstm_forward(slm, dv, (h0, c0))
             mask = torch.sigmoid(self.model.out_proj(self.model.dropout(x)))
             cur_idx = self.model.hp.frame_stack - 1
             cur = slm[..., cur_idx * self.model.hp.n_mels:(cur_idx + 1) * self.model.hp.n_mels]
-            # Paper §3.2 literal mask application (Y_enh = M · Y in log-mel).
-            return apply_mask(mask, cur), hN, cN
+            head_in = cur if self.model.hp.alpha_head_use_current_frame else x
+            f_adapt = torch.sigmoid(self.model.alpha_head(head_in))
+            return mask, f_adapt, hN, cN
 
     wrap = _Wrap(model).eval()
     buf = io.BytesIO()
@@ -273,7 +220,7 @@ def _load_onnx_from_model(hp: HParams, model: VoiceFilterLite):
             wrap, (stacked, dvec, h0, c0), buf,
             opset_version=17, do_constant_folding=True,
             input_names=["stacked_logmel", "dvec", "h0", "c0"],
-            output_names=["enhanced", "hN", "cN"],
+            output_names=["mask", "f_adapt", "hN", "cN"],
             dynamic_shapes={
                 "stacked_logmel": {0: "batch", 1: "time"},
                 "dvec":           {0: "batch"},
@@ -288,13 +235,14 @@ def _load_onnx_from_model(hp: HParams, model: VoiceFilterLite):
             wrap, (stacked, dvec, h0, c0), buf,
             opset_version=17, do_constant_folding=True,
             input_names=["stacked_logmel", "dvec", "h0", "c0"],
-            output_names=["enhanced", "hN", "cN"],
+            output_names=["mask", "f_adapt", "hN", "cN"],
             dynamic_axes={
                 "stacked_logmel": {0: "batch", 1: "time"},
                 "dvec":           {0: "batch"},
                 "h0":             {1: "batch"},
                 "c0":             {1: "batch"},
-                "enhanced":       {0: "batch", 1: "time"},
+                "mask":           {0: "batch", 1: "time"},
+                "f_adapt":        {0: "batch", 1: "time"},
                 "hN":             {1: "batch"},
                 "cN":             {1: "batch"},
             },

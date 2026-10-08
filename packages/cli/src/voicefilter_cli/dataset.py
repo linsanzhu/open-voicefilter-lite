@@ -1187,6 +1187,401 @@ def _mix_passthrough_v2(
     return random_crop(wav_t, sample_len)
 
 
+# ============================================================ #
+# Simplified mix helpers (v3)                                     #
+# ============================================================ #
+# These replace the old `_mix_babble_from_picks` /
+# `_mix_passthrough_v2` for the categorical-distribution code path
+# (`_sample_interference_v3`). Both helpers:
+#   * produce a wav of EXACTLY `sample_len` samples;
+#   * start at the first sample (no random offset within the target);
+#   * keep a random offset WITHIN the source wav for per-batch diversity.
+# No burst windows, no segment placement, no activity fades.
+
+
+def _mix_babble_simple(
+    rng: random.Random,
+    sample_len: int,
+    sr: int,
+    picks: list[tuple[str, HfEntry]],
+    gain_min: float,
+    gain_max: float,
+    wav_loader=default_hf_wav_loader,
+) -> torch.Tensor:
+    """Babble mixer for the v3 path: N picked speakers, full-length output.
+
+    For each `(spk, entry)`:
+      1. Load the wav via `wav_loader(entry, sr)`.
+      2. Pick a random start within the source wav; take `sample_len`
+         samples (zero-pad if shorter).
+      3. Multiply by a uniform-random gain in `[gain_min, gain_max]`.
+      4. Sum into the output buffer (the babble "speech-like" content
+         of every speaker fills the whole window from sample 0).
+
+    Output is always `(sample_len,)` float32 — no random offset inside
+    the target window, no segment-length variation. The dataset is
+    still diverse because each pick's source-wav offset varies.
+
+    Empty `picks` → silence (matches `_mix_babble_from_picks`).
+    """
+    out = np.zeros(sample_len, dtype=np.float32)
+    if not picks:
+        return torch.from_numpy(out)
+    for _spk, entry in picks:
+        try:
+            wav = wav_loader(entry, sr)
+        except Exception:
+            continue
+        wav = np.asarray(wav, dtype=np.float32)
+        if wav.ndim > 1:
+            wav = wav.mean(axis=1)
+        if wav.size == 0:
+            continue
+        if wav.size >= sample_len:
+            start = rng.randint(0, wav.size - sample_len)
+            seg = wav[start : start + sample_len]
+        else:
+            seg = np.pad(wav, (0, sample_len - wav.size))
+        gain = float(rng.uniform(gain_min, gain_max))
+        out += seg * gain
+    return torch.from_numpy(out)
+
+
+def _mix_passthrough_simple(
+    rng: random.Random,
+    sample_len: int,
+    pool: list[HfEntry],
+    target_sr: int,
+    wav_loader=default_hf_wav_loader,
+) -> torch.Tensor:
+    """`noise` / `music` mixer for the v3 path: 1 random clip, full-length.
+
+    Picks a random entry from `pool`, then a random start within the
+    source wav, takes `sample_len` samples (zero-pad if shorter), and
+    returns. Output always occupies `[0, sample_len]` of the target
+    window — no `random_crop` placement choice (the helper simplified away
+    from the v2 random_crop helper).
+
+    Empty pool → silence (defensive; the v3 sampler guards against
+    this before calling).
+    """
+    if not pool:
+        return torch.zeros(sample_len, dtype=torch.float32)
+    entry = rng.choice(pool)
+    wav_np = wav_loader(entry, target_sr)
+    wav = np.asarray(wav_np, dtype=np.float32)
+    if wav.ndim > 1:
+        wav = wav.mean(axis=1)
+    if wav.size == 0:
+        return torch.zeros(sample_len, dtype=torch.float32)
+    if wav.size >= sample_len:
+        start = rng.randint(0, wav.size - sample_len)
+        seg = wav[start : start + sample_len]
+    else:
+        seg = np.pad(wav, (0, sample_len - wav.size))
+    return torch.from_numpy(seg)
+
+
+# ============================================================ #
+# Categorical interference sampler (v3)                            #
+# ============================================================ #
+
+
+def _draw_interference_category(
+    none_weight: float,
+    single_weights: dict[str, float],
+    mixed_weight: float,
+    rng: random.Random,
+) -> tuple[str, tuple[str, ...]]:
+    """Draw one bucket from the categorical interference distribution.
+
+    Returns `(bucket_label, included_kinds)`:
+      * `("none", ())`                       — no interference (silent).
+      * `("single", ("babble",))`            — pure single TYPE.
+      * `("mixed", ("babble", "noise"))`     — 2+ TYPES stacked under
+                                               the energy-budget allocator.
+
+    The `included_kinds` tuple is in canonical order (`babble`, `noise`,
+    `music`) so test assertions and per-bucket summaries stay stable.
+
+    Distribution contract (caller's responsibility): the four weight
+    arguments must sum to 1.0 (we renormalise defensively to keep the
+    behaviour well-defined if a config drifts). Empty single_weights
+    with a non-zero `none_weight + mixed_weight` is allowed (silently
+    routes the freed weight to the others).
+    """
+    total = float(none_weight) + float(sum(single_weights.values())) + float(mixed_weight)
+    if total <= 0:
+        # Degenerate config: collapse to "no interference".
+        return ("none", ())
+    # Renormalise (defensive — see contract above).
+    p_none = max(0.0, float(none_weight)) / total
+    p_single_total = max(0.0, float(sum(single_weights.values()))) / total
+    p_mixed = max(0.0, float(mixed_weight)) / total
+
+    u = rng.random()
+    if u < p_none:
+        return ("none", ())
+    if u < p_none + p_mixed:
+        # Mixed bucket — defer TYPE picking to the caller (it needs the
+        # pool sizes + the multi-type_prob curriculum knob to decide how
+        # many TYPES to draw). Here we only mark the bucket.
+        return ("mixed", ())
+    # Single bucket — pick one TYPE proportional to its weight.
+    bucket: list[str] = []
+    weights: list[float] = []
+    for name, weight in single_weights.items():
+        if weight <= 0:
+            continue
+        bucket.append(name)
+        weights.append(float(weight))
+    if not bucket:
+        # No singles eligible → fall back to "none". Caller can detect
+        # via the ("none", ()) return.
+        return ("none", ())
+    s = sum(weights)
+    pick = rng.choices(bucket, weights=[w / s for w in weights], k=1)[0]
+    return ("single", (pick,))
+
+
+def _draw_mixed_kinds(
+    single_weights: dict[str, float],
+    rng: random.Random,
+    *,
+    eligible: dict[str, bool],
+) -> tuple[str, ...]:
+    """Draw a fixed-size composite bucket from `eligible` TYPEs.
+
+    Always returns 2 or 3 TYPES (never 1 — single-type is a separate
+    bucket). `eligible[name]` says whether TYPE `name` has a non-empty
+    pool (skip silently otherwise). TYPEs with `single_weights[name] <= 0`
+    are also skipped.
+
+    IMPORTANT: this uses **weighted sampling WITHOUT replacement**, so
+    the returned TYPEs are always distinct. (`rng.choices(..., k=n)`
+    samples with replacement and produces duplicates for high-weight
+    TYPEs — e.g. babble weighted 4× noise/music gets picked twice in a
+    2-draw with prob ~44%, and `set()`-dedup would silently downgrade
+    a "mixed" pick to a single. The bug this left — babble single rate
+    inflated, mixed rate deflated — was visible in the v3 smoke test
+    empirical distribution; we now do weighted reservoir sampling
+    inline.)
+
+    Returns kinds in canonical order (`babble`, `noise`, `music`) so the
+    tuple is directly usable as the `noise_kind` tag.
+    """
+    bucket: list[str] = []
+    weights: list[float] = []
+    for name in (NOISE_KIND_BABBLE, NOISE_KIND_NOISE, NOISE_KIND_MUSIC):
+        if not eligible.get(name, False):
+            continue
+        w = float(single_weights.get(name, 0.0))
+        if w <= 0:
+            continue
+        bucket.append(name)
+        weights.append(w)
+    if len(bucket) < 2:
+        # Fallback: not enough eligible TYPES for a composite. Caller
+        # should re-roll — returning the singleton here lets the caller
+        # detect this without a separate return channel.
+        return tuple(bucket)
+
+    # Weighted sampling without replacement via sequential inverse-CDF.
+    # For each pick, draw u ~ Uniform(0, sum_w) and find the bucket whose
+    # cumulative weight crosses u; remove it and continue. Costs O(n * K)
+    # for n picks over K bucket entries — fine for n ∈ {2, 3}, K ≤ 3.
+    n = rng.randint(2, min(3, len(bucket)))
+    remaining_names = list(bucket)
+    remaining_weights = list(weights)
+    picks: list[str] = []
+    for _ in range(n):
+        total = sum(remaining_weights)
+        if total <= 0:
+            break  # Defensive — shouldn't happen given the pre-filter.
+        target = rng.random() * total
+        cumsum = 0.0
+        chosen_idx = len(remaining_weights) - 1  # default to last on FP edge
+        for i, w in enumerate(remaining_weights):
+            cumsum += w
+            if cumsum >= target:
+                chosen_idx = i
+                break
+        picks.append(remaining_names[chosen_idx])
+        del remaining_names[chosen_idx]
+        del remaining_weights[chosen_idx]
+
+    canonical = {NOISE_KIND_BABBLE: 0, "noise": 1, "music": 2}
+    return tuple(sorted(set(picks), key=lambda k: canonical[k]))
+
+
+def _sample_interference_v3(
+    hp: HParams,
+    rng: random.Random,
+    sample_len: int,
+    target_power: float,
+    snr_db: float,
+    *,
+    babble_spk_to_entries: dict[str, list[HfEntry]],
+    noise_pool: list[HfEntry],
+    music_pool: list[HfEntry],
+    babble_cfg,
+    noise_cfg,
+    music_cfg,
+    multi_type_prob: float,
+    wav_loader=default_hf_wav_loader,
+) -> tuple[torch.Tensor, tuple[str, ...]]:
+    """Categorical sampler with curriculum-controlled mixed weight.
+
+    Replacement for `_sample_interference_v2` — instead of independent
+    per-TYPE Bernoullis, the sampler draws ONE bucket from a 3-way
+    categorical (`none` / `single` / `mixed`), then:
+
+        * `none`  → zeros.
+        * `single`→ draw one TYPE proportional to its single-weight;
+                     mix its full-length component (no random segment
+                     placement) at the energy budget.
+        * `mixed` → draw 2-3 distinct TYPES proportional to their single
+                     weights; stack them via `_allocate_interference_budget`
+                     (peak-clip per component, Dirichlet split across the
+                     K components, tanh soft-clip of the aggregate).
+
+    `multi_type_prob` (∈ [0, 1]) is the curriculum knob for the mixed
+    bucket. The sampler linearly blends:
+
+        effective_mixed = mixed_weight * multi_type_prob
+        effective_singles = single_weights × (1 - effective_mixed)
+                                       / (1 - mixed_weight)
+
+    so that at `multi_type_prob=0` the mixed bucket is fully suppressed
+    (mass redistributed onto the singles, keeping the no-interference
+    fraction fixed), and at `multi_type_prob=1` the distribution
+    matches the config. Single-type mass is preserved across the
+    curriculum so early training still shows the model a balanced
+    single-type diet.
+
+    The TYPE iteration order for both single picking and mixed picking is
+    fixed (`babble`, `noise`, `music`) so test assertions / per-bucket
+    summaries stay reproducible across runs given the same RNG seed.
+    """
+    none_w = float(hp.interference_none_weight)
+    singles = {k: float(v) for k, v in hp.interference_single_weights.items()}
+    mixed_w = float(hp.interference_mixed_weight)
+
+    # Curriculum: scale the mixed bucket by `multi_type_prob`. The freed
+    # mass is added to the singles proportionally (so the no-interference
+    # fraction stays fixed across the curriculum).
+    mtp = max(0.0, min(1.0, float(multi_type_prob)))
+    effective_mixed = mixed_w * mtp
+    if mixed_w > 0:
+        scale = (mixed_w - effective_mixed) / mixed_w  # mass to redistribute
+    else:
+        scale = 0.0
+    for k in singles:
+        singles[k] = singles[k] + singles[k] * scale  # = singles[k] / (1 - mtp) if mixed_w > 0
+
+    # Eligibility check (skip TYPES with empty pools in v3 — they would
+    # just produce silence and waste a Bernoulli roll).
+    has_babble = bool(babble_spk_to_entries) and babble_cfg is not None and babble_cfg.enabled
+    has_noise = bool(noise_pool) and noise_cfg is not None and noise_cfg.enabled
+    has_music = bool(music_pool) and music_cfg is not None and music_cfg.enabled
+
+    # Suppress ineligible TYPES from the sampler (silently zero their
+    # weight so the categorical falls back to the eligible alternatives).
+    eligible = {
+        NOISE_KIND_BABBLE: has_babble,
+        NOISE_KIND_NOISE: has_noise,
+        NOISE_KIND_MUSIC: has_music,
+    }
+    if not has_babble:
+        singles[NOISE_KIND_BABBLE] = 0.0
+    if not has_noise:
+        singles[NOISE_KIND_NOISE] = 0.0
+    if not has_music:
+        singles[NOISE_KIND_MUSIC] = 0.0
+
+    # If the curriculum fully suppresses the mixed bucket AND no singles
+    # are eligible, the sampler collapses to "none" — return zeros.
+    any_single = any(singles[k] > 0 for k in singles)
+    if effective_mixed <= 0 and not any_single:
+        return torch.zeros(sample_len, dtype=torch.float32), ()
+
+    # Renormalise the effective weights (defensive — config drift).
+    total = none_w + sum(singles.values()) + effective_mixed
+    if total <= 0:
+        return torch.zeros(sample_len, dtype=torch.float32), ()
+    p_none = none_w / total
+    p_mixed = effective_mixed / total
+
+    u = rng.random()
+    if u < p_none:
+        return torch.zeros(sample_len, dtype=torch.float32), ()
+    if u < p_none + p_mixed:
+        # Mixed bucket — pick 2-3 TYPES.
+        kinds = _draw_mixed_kinds(
+            singles, rng, eligible=eligible,
+        )
+        if len(kinds) < 2:
+            # Fallback: not enough eligible TYPES → re-roll as a single.
+            kinds = (kinds[0],) if kinds else ()
+    else:
+        # Single bucket — pick one TYPE.
+        pool = [(k, w) for k, w in singles.items() if w > 0]
+        if not pool:
+            return torch.zeros(sample_len, dtype=torch.float32), ()
+        names = [p[0] for p in pool]
+        weights = [p[1] / sum(p[1] for p in pool) for p in pool]
+        kind = rng.choices(names, weights=weights, k=1)[0]
+        kinds = (kind,)
+
+    if not kinds:
+        return torch.zeros(sample_len, dtype=torch.float32), ()
+
+    # ---- Synthesise the picked TYPES ----
+    components: list[torch.Tensor] = []
+    for kind in kinds:
+        if kind == NOISE_KIND_BABBLE:
+            picks = _pick_babble_speakers(
+                rng=rng,
+                spk_to_entries=babble_spk_to_entries,
+                n_speakers_min=babble_cfg.n_speakers_min,
+                n_speakers_max=babble_cfg.n_speakers_max,
+            )
+            component = _mix_babble_simple(
+                rng=rng,
+                sample_len=sample_len,
+                sr=hp.sample_rate,
+                picks=picks,
+                gain_min=babble_cfg.gain_min,
+                gain_max=babble_cfg.gain_max,
+                wav_loader=wav_loader,
+            )
+        elif kind == NOISE_KIND_NOISE:
+            component = _mix_passthrough_simple(
+                rng, sample_len, noise_pool, hp.sample_rate, wav_loader,
+            )
+        elif kind == NOISE_KIND_MUSIC:
+            component = _mix_passthrough_simple(
+                rng, sample_len, music_pool, hp.sample_rate, wav_loader,
+            )
+        else:
+            continue
+        components.append(component)
+
+    K = len(components)
+    if K == 0:
+        return torch.zeros(sample_len, dtype=torch.float32), ()
+
+    apply_budget = target_power > 1e-9
+    interference_wav = _allocate_interference_budget(
+        components=components,
+        target_power=target_power,
+        snr_db=snr_db,
+        rng=rng,
+        apply_budget=apply_budget,
+    )
+    return interference_wav, tuple(kinds)
+
+
 def _sample_interference_v2(
     hp: HParams,
     rng: random.Random,
@@ -1323,66 +1718,66 @@ def synthesize_raw_sample(
     babble_cfg,
     noise_cfg,
     music_cfg,
+    multi_type_prob: float = 1.0,
     wav_loader=default_hf_wav_loader,
 ) -> RawSample:
     """One end-to-end per-sample WAV synthesis — mirrors `HfTripletStream.__iter__`.
 
-    The caller picks the target speaker/utterance and the reference
-    utterance (training does this from a pre-baked index;
+    v3 path. The caller picks the target speaker/utterance and the
+    reference utterance (training does this from a pre-baked index;
     `examples/04_*` does this from an HF stream). This function takes
     those two pre-loaded wav tensors + the pool structures and returns
     the WAV-level outputs the training iterator would feed into the
     log-mel pipeline.
 
+    Simplifications vs. the v2 path (kept here for backward compat in
+    the docstring; v2 still exists for tests but is no longer called by
+    the training iterator):
+      * Interference fills `[0, sample_len]` from sample 0 — no random
+        placement, no segment-length choice, no activity burst on the
+        interference side.
+      * Interference category is drawn from the categorical
+        `interference_distribution` (none / single / mixed) by
+        `_sample_interference_v3`. The `multi_type_prob` curriculum knob
+        smoothly ramps the mixed-bucket weight from `multi_type_start_prob`
+        to `multi_type_end_prob` over `multi_type_warmup_steps` so
+        early training shows the model only single-type interference.
+      * Target keeps its burst-mask (predictor labels need the
+        structure). Interference has no burst (it always covers the
+        whole window).
+      * `type_probs` is kept for backward-compat signature symmetry
+        but is no longer used (the categorical distribution replaces the
+        independent-Bernoulli sampler).
+
     Steps (in order — same RNG semantics as training):
       1. Sample activity burst on the **FULL target audio** and apply
          it, then crop to `sample_len` at a position that **OVERLAPS
-         with the burst**. This is the deviation 5 fix vs. the old
-         "burst on cropped sample" logic: for a long LibriSpeech
-         utterance, both the random crop and the uniform burst were
-         sampled independently of the audio energy — they could both
-         land on the same silent segment, making the burst capture
-         silence and target.wav nearly inaudible. Sampling the burst
-         on the full source guarantees the burst overlaps with actual
-         voice; constraining the crop to overlap with the burst keeps
-         the burst window in the final 3 s crop. Burst mask stays
-         sparse (never collapses to 1).
+         with the burst** (deviation 5 fix — burst always lands on real
+         audio energy). Burst mask stays sparse (never collapses to 1).
       2. Cap `ref_wav_full` at `hp.ref_max_sec * sample_rate` samples
          (left-truncate, no random offset — matches training).
-      3. `target_power = mean(target²)` on the **burst-masked crop**,
-         eps-clamped to 1e-12. Computing on the post-mask crop keeps
-         the interference energy budget consistent with the actual
-         energy the model will see during the active burst window.
+      3. `target_power = mean(target²)` on the burst-masked crop,
+         eps-clamped to 1e-12.
       4. Draw `snr_db ∈ [snr_min_db, snr_max_db]` UNCONDITIONALLY
-         (silent flags are rolled AFTER synthesis so the Bernoulli
-         inclusion draws land on the same RNG state regardless of the
-         silent outcome).
-      5. `_sample_interference_v2(...)` — Dirichlet-budget allocation
-         across the K included TYPES (peak-clip per component, tanh
-         soft-clip of the aggregate; see `_allocate_interference_budget`).
-      6. Roll silent flags (target_silent / interference_silent). When
-         `interference_silent=True`, override the synthesised wav with
-         zeros; `included_kinds` still reports what the rolls SAID.
-         Target_silent forces the post-mask target down to zero in the
-         defensive-zero step below.
-      7. Sample interference activity burst and apply (target burst was
-         already applied at step 1). Skipped when the corresponding
-         silent flag fired.
+         (silent flags are rolled AFTER synthesis so the categorical
+         draw lands on the same RNG state regardless of the silent
+         outcome).
+      5. `_sample_interference_v3(...)` — categorical draw; for
+         non-none buckets, synthesise each picked TYPE (v3 simplified
+         helpers: `_mix_babble_simple` / `_mix_passthrough_simple`)
+         and stack via `_allocate_interference_budget`.
+      6. Roll silent flags (target_silent / interference_silent).
+         `interference_silent=True` overrides the synthesised wav with
+         zeros; `included_kinds` still reports the categorical draw.
+      7. No interference activity burst (v3 always full-length). Set
+         `interference_act = ones` so downstream `_per_frame_overlap_label`
+         computes the labels purely from `target_act`.
       8. Defensive zero-out when silent.
       9. `snr_mix` branch:
             both silent         → zeros
             target_silent       → interference.clone()
             interference_silent → target.clone()
             else                → snr_mix(target, interference, snr)
-
-    The signature takes the TYPE configs (`babble_cfg` etc.) explicitly
-    rather than reading `hp.interference_types` here so callers can
-    override / filter without mutating `hp`. Training and example 04
-    both pull them from `hp.interference_types` at the call site.
-
-    `type_probs` is currently unused by this function (the configs
-    carry their own `prob`); accepted for forward-compat and to make
-    the signature symmetric with `HfTripletStream._sample_interference`.
 
     Returns a `RawSample` carrying the wavs, activity masks, ref wav,
     snr draw, included kinds, and the silent flags.
@@ -1393,18 +1788,14 @@ def synthesize_raw_sample(
     # Deviation 5 fix: sample the burst on the FULL source first so the
     # burst always overlaps with real audio energy. Then sample a crop
     # start that lies inside the burst's overlap range, so the cropped
-    # 3 s window still contains that voice. This avoids the failure
-    # mode where a uniform random crop and a uniform random burst on
-    # the cropped window both land on a silent stretch of a long
-    # LibriSpeech utterance — making target.wav nearly inaudible even
-    # though the burst mask itself is correctly sparse.
+    # window still contains that voice. Burst mask stays sparse.
     T_full = int(target_wav_full.shape[-1])
     target_act_full = _sample_activity_burst(T_full, hp, rng)
     target_wav_full_masked = target_wav_full * target_act_full
 
     if T_full <= sample_len:
         # Source shorter than (or equal to) sample_len: keep the whole
-        # source, zero-pad to sample_len. random_crop does the same.
+        # source, zero-pad to sample_len.
         crop_start = 0
         if T_full < sample_len:
             pad = torch.zeros(
@@ -1417,32 +1808,43 @@ def synthesize_raw_sample(
             target_wav = target_wav_full_masked
             target_act = target_act_full
     else:
-        # Source longer than sample_len: sample crop_start within the
-        # burst's overlap range so [crop_start, crop_start + sample_len]
-        # intersects the high-energy burst plateau.
         burst_active = (target_act_full > 0.5).nonzero(as_tuple=True)[0]
         if burst_active.numel() == 0:
-            # Defensive fallback (shouldn't happen given burst_min >= 1
-            # sample and the guard in `_sample_activity_burst`).
             crop_start = 0
         else:
             burst_start_full = int(burst_active[0].item())
             burst_end_full = int(burst_active[-1].item()) + 1
-            # crop_min: latest crop start that still keeps the burst's
-            # tail inside the crop. crop_max: earliest crop start that
-            # still keeps the burst's head inside the crop.
             crop_min = max(0, burst_end_full - sample_len)
             crop_max = min(T_full - sample_len, burst_start_full)
-            # `rng.randint` is inclusive on both ends; clamp so lower
-            # bound never exceeds upper bound (degenerate when the
-            # burst length >= sample_len — crop_max then equals
-            # crop_min, which is fine).
             crop_start = rng.randint(crop_min, max(crop_min, crop_max))
         target_wav = target_wav_full_masked[crop_start : crop_start + sample_len]
         target_act = target_act_full[crop_start : crop_start + sample_len]
 
-    # ---- 2. Cap ref_wav at `ref_max_sec` samples (matches training:
-    # `ref_wav_t[..., :ref_max_len]` — left-truncate, no random offset).
+    # ---- 1b. Per-sample target RMS normalisation (opt-in) ----
+    # `target_rms_norm_db` is None → pass-through (legacy behaviour).
+    # When enabled, scale the (burst-masked) crop so its RMS hits the
+    # configured dBFS target. This makes the downstream interference
+    # energy budget `target_power / 10^(snr/10)` a constant per drawn
+    # SNR, eliminating the 1-2 order-of-magnitude per-batch loss
+    # variance that comes from raw LibriSpeech loudness.
+    #   * Skipped when the wav is silent / near-silent (current_rms ≤
+    #     1e-4) so the silent-target branch (step 5) keeps working
+    #     without divide-by-zero.
+    #   * Defensive peak-cap at 1.0 if RMS norm pushed a transient
+    #     over 1.0 (very-low-RMS LibriSpeech samples can have spikey
+    #     transients; 0.1 RMS × 10 crest factor → peak ~1.0 normally).
+    #   * Does NOT touch `target_act` (the activity mask drives the
+    #     per-frame overlap label downstream).
+    if hp.target_rms_norm_db is not None and target_wav.numel() > 0:
+        cur_rms = float(target_wav.pow(2).mean().sqrt().item())
+        if cur_rms > 1e-4:
+            tgt_rms = float(10.0 ** (hp.target_rms_norm_db / 20.0))
+            target_wav = target_wav * (tgt_rms / cur_rms)
+            peak = float(target_wav.abs().max().item())
+            if peak > 1.0:
+                target_wav = target_wav / peak
+
+    # ---- 2. Cap ref_wav at `ref_max_sec` samples (matches training).
     ref_max_len = int(hp.ref_max_sec * hp.sample_rate)
     if ref_wav_full.shape[-1] > ref_max_len:
         ref_wav_capped = ref_wav_full[..., :ref_max_len]
@@ -1450,19 +1852,11 @@ def synthesize_raw_sample(
         ref_wav_capped = ref_wav_full
 
     # ---- 3. target_power on burst-masked crop ----
-    # Computing on the post-mask crop keeps the interference energy
-    # budget consistent with the energy the model actually sees during
-    # the burst window — a sparser burst (smaller active fraction)
-    # yields lower post-mask RMS², so the interference budget shrinks
-    # accordingly and post-mix SIR still matches `snr_db`.
     target_power = max(1e-12, float((target_wav ** 2).mean().item()))
 
-    # ---- 4. SNR draw + interference synthesis ----
-    # Drawn UNCONDITIONALLY (before silent flags) so the TYPE-inclusion
-    # Bernoulli draws happen on the same RNG state regardless of the
-    # silent outcome.
+    # ---- 4. SNR draw + interference synthesis (v3 categorical) ----
     snr_db = float(rng.uniform(hp.snr_min_db, hp.snr_max_db))
-    interference_wav, included_kinds = _sample_interference_v2(
+    interference_wav, included_kinds = _sample_interference_v3(
         hp, rng, sample_len, target_power, snr_db,
         babble_spk_to_entries=babble_spk_to_entries,
         noise_pool=noise_pool,
@@ -1470,6 +1864,7 @@ def synthesize_raw_sample(
         babble_cfg=babble_cfg,
         noise_cfg=noise_cfg,
         music_cfg=music_cfg,
+        multi_type_prob=multi_type_prob,
         wav_loader=wav_loader,
     )
 
@@ -1479,19 +1874,20 @@ def synthesize_raw_sample(
     if interference_silent:
         interference_wav = torch.zeros(sample_len, dtype=torch.float32)
 
-    # ---- 6. Activity bursts (target already applied above; interference
-    # burst is skipped when silent flag fired) ----
+    # ---- 6. Activity bursts (target applied above; v3 interference has no burst) ----
     if target_silent:
-        # Target was burst-masked at step 1; reset the mask to zeros so
-        # downstream `_per_frame_overlap_label` and the per-sample
-        # summary see "no activity" (matches the old behaviour).
+        # Target was burst-masked at step 1; reset to zeros so downstream
+        # `_per_frame_overlap_label` sees no activity.
         target_act = torch.zeros(sample_len, dtype=target_wav.dtype)
 
-    if not interference_silent:
-        interference_act = _sample_activity_burst(sample_len, hp, rng)
-        interference_wav = interference_wav * interference_act
-    else:
+    # v3: interference always full-length → `interference_act = ones`.
+    # (Or zeros if the silent flag fired.) The `+ 1.0 / - 1.0` tags the
+    # state so `_per_frame_overlap_label` can detect "interference
+    # silent" without scanning `interference_silent` separately.
+    if interference_silent:
         interference_act = torch.zeros(sample_len, dtype=interference_wav.dtype)
+    else:
+        interference_act = torch.ones(sample_len, dtype=interference_wav.dtype)
 
     # ---- 7. Defensive zero-out (silent flag fired → wav still carries
     # pre-burst values; zero it explicitly). ----
@@ -1500,7 +1896,7 @@ def synthesize_raw_sample(
     if interference_silent:
         interference_wav = torch.zeros_like(interference_wav)
 
-    # ---- 9. SNR mix (silent-side bypasses) ----
+    # ---- 8. SNR mix (silent-side bypasses) ----
     if target_silent and interference_silent:
         mixed_wav = torch.zeros_like(target_wav)
     elif target_silent:
@@ -1854,12 +2250,23 @@ class HfTripletStream(IterableDataset):
         worker_id: int = 0,
         num_workers: int = 1,
         seed: Optional[int] = None,
+        multi_type_prob_value: Any = None,
     ):
         super().__init__()
         self.hp = hp
         self.worker_id = worker_id
         self.num_workers = num_workers
         self._seed = seed if seed is not None else hp.seed
+
+        # Shared-memory handle (torch.multiprocessing.Value) for the
+        # curriculum-controlled `multi_type_prob` scalar. The main
+        # training loop updates this each `log_every` window via the
+        # value's `.value = ...` setter; fork'd workers read it
+        # transparently (the underlying smp float is shared, only the
+        # Python handle is CoW). When `None`, the iterator uses the
+        # config-time final value (`multi_type_end_prob`) and skips the
+        # curriculum (useful for `examples/04_*` and tests).
+        self._multi_type_prob_value = multi_type_prob_value
 
         # Mel basis built lazily on first `__iter__` (per worker).
         self._mel = None
@@ -2097,6 +2504,15 @@ class HfTripletStream(IterableDataset):
             # shared module-level `synthesize_raw_sample` so the
             # training iterator and offline audition scripts
             # (`examples/04_*`) consume the SAME per-sample logic.
+            # Read the current `multi_type_prob` from the shared handle
+            # (the training loop writes the ramped value once per
+            # `log_every` window). Fall back to the config-time end prob
+            # when no shared handle was supplied (audition scripts +
+            # tests).
+            if self._multi_type_prob_value is not None:
+                multi_type_prob = float(self._multi_type_prob_value.value)
+            else:
+                multi_type_prob = float(hp.multi_type_end_prob)
             raw = synthesize_raw_sample(
                 hp,
                 rng,
@@ -2109,6 +2525,7 @@ class HfTripletStream(IterableDataset):
                 babble_cfg=self.hp.interference_types.get(NOISE_KIND_BABBLE),
                 noise_cfg=self.hp.interference_types.get(NOISE_KIND_NOISE),
                 music_cfg=self.hp.interference_types.get(NOISE_KIND_MUSIC),
+                multi_type_prob=multi_type_prob,
             )
             target_wav = raw.target_wav
             interference_wav = raw.interference_wav

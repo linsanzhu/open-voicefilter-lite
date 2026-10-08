@@ -166,10 +166,26 @@ def _save_wav(path: str, wav: torch.Tensor, sample_rate: int) -> None:
 def _logmel_to_wav(log_mel: torch.Tensor, hp: HParams, n_iter: int = 16) -> torch.Tensor:
     """Inverse log-mel → waveform via Griffin-Lim (audition only).
 
-    Same helper as `examples/01_offline_separation.py`. The 80-bin HTK
-    mel basis is rank-deficient (rank 75), so we use the Moore-Penrose
-    pseudo-inverse rather than torchaudio's `InverseMelScale` (which
-    raises `LinAlgError: input matrix does not have full rank`).
+    `hp` is the HParams restored from the loaded checkpoint's `hparams`
+    dict (see `main()` — `ckpt["hparams"]` was serialized at training
+    time from whichever `--config` the model was trained with, e.g.
+    `configs/paper.yaml` → `n_mels=128, n_fft=1200`). All audio params
+    used in this function — `n_mels`, `n_fft`, `hop_length`,
+    `win_length`, `sample_rate`, `log_mel_floor` — are read from `hp`,
+    so this helper tracks the training config with no hard-coded
+    mel-bin counts. Same end-to-end inverse as
+    `examples/01_offline_separation.py` and
+    `examples/02_streaming_inference.py`, modulo the inverse operator.
+
+    Uses the Moore-Penrose pseudo-inverse of the configured mel basis
+    rather than `torchaudio.transforms.InverseMelScale`: the pseudo-
+    inverse is a one-shot least-squares solve (no `max_iter` knob to
+    tune), and it degrades gracefully if the basis is rank-deficient
+    (which can happen when a config sets `n_mels` close to or above
+    `1 + n_fft // 2`). `examples/01/02` use `InverseMelScale` instead
+    — both produce audibly equivalent waveforms for the paper.yaml
+    config (`n_mels=128, n_fft=1200`); the choice here is just cheaper
+    and more explicit.
     """
     import torchaudio
 
@@ -188,7 +204,7 @@ def _logmel_to_wav(log_mel: torch.Tensor, hp: HParams, n_iter: int = 16) -> torc
             1, linear.shape[1], needed_frames - linear.shape[-1],
             dtype=linear.dtype, device=linear.device,
         )
-        linear = torch.cat([linear, pad], dim=-2)
+        linear = torch.cat([linear, pad], dim=-1)
 
     griffin = torchaudio.transforms.GriffinLim(
         n_fft=hp.n_fft,
@@ -309,10 +325,13 @@ def build_one_sample(
 
     # 3) Synthesize the WAV-level sample using the SAME module-level
     #    function the training iterator calls. `synthesize_raw_sample`
-    #    does random_crop_target, interference synthesis (TYPE-inclusion
-    #    Bernoulli + Dirichlet energy budget), silent flags, activity
-    #    bursts, and the snr_mix branch — all with the training RNG
-    #    semantics.
+    #    does the v3 categorical interference synthesis (full-length
+    #    interference from sample 0, no random segment placement) +
+    #    silent flags + target activity burst + snr_mix — all with the
+    #    training RNG semantics. `multi_type_prob=1.0` here disables the
+    #    curriculum for the offline audition script (we want the FULL
+    #    target mixed distribution immediately so the audition wav
+    #    matches the post-warmup training distribution).
     raw = synthesize_raw_sample(
         hp,
         rng,
@@ -325,6 +344,7 @@ def build_one_sample(
         babble_cfg=babble_cfg,
         noise_cfg=noise_cfg,
         music_cfg=music_cfg,
+        multi_type_prob=1.0,
     )
     target_wav = raw.target_wav
     interference_wav = raw.interference_wav
