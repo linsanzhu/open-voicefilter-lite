@@ -38,12 +38,7 @@ from voicefilter_cli.dataset import (
     _disable_hf_audio_decode,
     _cast_audio_no_decode,
 )
-from voicefilter_cli.local_pool import (
-    DEFAULT_POOL_ROOT,
-    LocalLibriSpeechPool,
-    has_local_pool,
-)
-from voicefilter_lite.hparams import HParams
+from voicefilter_lite.hparams import HParams, resolve_source
 from voicefilter_lite.audio import extract_dvec, pad_or_trim
 from voicefilter_lite.speaker_encoder import SpeakerEncoder
 
@@ -82,8 +77,7 @@ def select_device(arg: str) -> torch.device:
     return torch.device(arg)
 
 def run(num_speakers: int, num_utts_per_speaker: int, seed: int, device: str,
-        results_json: Optional[str], hf_endpoint: Optional[str], hf_transfer: Optional[bool],
-        use_local_pool: bool, pool_root: str, pool_split: str) -> None:
+        results_json: Optional[str], hf_endpoint: Optional[str], hf_transfer: Optional[bool]) -> None:
     hp = HParams()
     apply_hf_endpoint(
         hp,
@@ -96,51 +90,48 @@ def run(num_speakers: int, num_utts_per_speaker: int, seed: int, device: str,
     by_spk: dict[str, list] = {}
     rng = random.Random(seed)
 
-    if use_local_pool:
-        # ---- Read from the baked pool ----
-        pool_path = Path(pool_root)
-        if not has_local_pool(root=pool_path, role="clean", split=pool_split):
-            raise FileNotFoundError(
-                f"[verify-dvl] --use-local-pool requested but no wavs under "
-                f"{pool_path}/target/librispeech/clean/{pool_split}/. "
-                f"Run `python scripts/prepare_dataset.py --config configs/paper.yaml` "
-                f"first, or drop --use-local-pool to stream from HF."
+    # ---- Stream from HF directly ----
+    # Read the first declared target source (`hp.target_sources[0]`).
+    # Resolve via `resolve_source` so the cache_dir + repo come from
+    # `HfSourceSpec` (paper.yaml → openslr/librispeech_asr → data/librispeech).
+    if not hp.target_sources:
+        raise RuntimeError("[verify-dvec] hp.target_sources is empty")
+    resolved = resolve_source(hp, hp.target_sources[0])
+    assert resolved.is_librispeech(), (
+        f"verify-dvec target must be a LibriSpeech source; got {resolved}"
+    )
+
+    _disable_hf_audio_decode()
+
+    def _load_kwargs(cache_dir: str) -> dict:
+        kw: dict = {"streaming": hp.streaming}
+        if not hp.streaming:
+            kw["cache_dir"] = cache_dir or "data/librispeech"
+        return kw
+
+    target_iter = iter(
+        _cast_audio_no_decode(
+            load_dataset(
+                resolved.repo, "all",
+                split=resolved.splits[0],
+                **_load_kwargs(resolved.cache_dir),
             )
-        clean_pool = LocalLibriSpeechPool(
-            root=pool_path, role="clean", splits=(pool_split,), seed=seed,
         )
-        dvecs_raw = clean_pool.sample_by_speaker(
-            num_speakers=num_speakers,
-            num_utts_per_speaker=num_utts_per_speaker,
-            seed=seed,
-        )
-        for spk, wavs in dvecs_raw.items():
-            # Decode was already done in sample_by_speaker — convert to
-            # the legacy `dict[spk] -> [wav_tensor]` shape used downstream.
-            by_spk[spk] = [{"audio": {"array": w.numpy(), "sampling_rate": hp.sample_rate}} for w in wavs]
-        speakers = list(by_spk.keys())[:n_speakers]
-        print(f"[verify] using local pool at {pool_path} (role=clean, split={pool_split})")
-        print(f"Speakers: {speakers}\n")
-    else:
-        # ---- Stream from HF (legacy behaviour) ----
-        _disable_hf_audio_decode()
-        ds = load_dataset("openslr/librispeech_asr", "clean", split="train.360", streaming=True)
-        ds = _cast_audio_no_decode(ds)
+    )
 
-        it = iter(ds)
-        while len(by_spk) < n_speakers:
-            try:
-                ex = next(it)
-            except StopIteration:
-                break
-            spk = str(ex.get("speaker_id", "?"))
-            by_spk.setdefault(spk, [])
-            if len(by_spk[spk]) < target_per_speaker:
-                by_spk[spk].append(ex)
+    while len(by_spk) < n_speakers:
+        try:
+            ex = next(target_iter)
+        except StopIteration:
+            break
+        spk = str(ex.get("speaker_id", "?"))
+        by_spk.setdefault(spk, [])
+        if len(by_spk[spk]) < target_per_speaker:
+            by_spk[spk].append(ex)
 
-        speakers = list(by_spk.keys())[:n_speakers]
-        print(f"[verify] streaming from HF (set --use-local-pool to read from data/processed/)")
-        print(f"Speakers: {speakers}\n")
+    speakers = list(by_spk.keys())[:n_speakers]
+    print(f"[verify] streaming from HF (target: {resolved.repo} split={resolved.splits[0]})")
+    print(f"Speakers: {speakers}\n")
 
     device = select_device(device)
     enc = SpeakerEncoder(hp).to(device).eval()
@@ -262,41 +253,14 @@ def main(
         ),
     ] = "auto",
     results_json: Annotated[
-        Optional[str],
-        Parameter(name="--results-json", help="Write the verification results to this JSON file path."),
+        Optional[str], Parameter(name="--results-json", help="Write the verification results to this JSON file path.")
     ] = None,
     hf_endpoint: Annotated[
-        Optional[str],
-        Parameter(name="--hf-endpoint", help="Override HF Hub base URL (e.g. https://hf-mirror.com)."),
+        Optional[str], Parameter(name="--hf-endpoint", help="Override HF Hub base URL (e.g. https://hf-mirror.com).")
     ] = None,
     hf_transfer: Annotated[
-        Optional[bool],
-        Parameter(negative="--no-hf-transfer", help="Force-enable HF hf_transfer protocol."),
+        Optional[bool], Parameter(negative="--no-hf-transfer", help="Force-enable HF hf_transfer protocol.")
     ] = None,
-    use_local_pool: Annotated[
-        bool,
-        Parameter(
-            name="--use-local-pool",
-            help="Read wavs from the baked pool at <pool-root>/target/librispeech/"
-                 "clean/<pool-split>/ (faster, no HF traffic). Requires "
-                 "`prepare_dataset.py` to have baked the clean role.",
-        ),
-    ] = True,
-    pool_root: Annotated[
-        str,
-        Parameter(
-            name="--pool-root",
-            help="Root dir of the baked pool (default: data/processed).",
-        ),
-    ] = str(DEFAULT_POOL_ROOT),
-    pool_split: Annotated[
-        str,
-        Parameter(
-            name="--pool-split",
-            help="LibriSpeech split to sample from when --use-local-pool is set "
-                 "(default: train.clean.360 — matches paper.yaml).",
-        ),
-    ] = "train.clean.360",
 ) -> None:
     """Verify d-vector speaker consistency.
 
@@ -312,9 +276,6 @@ def main(
         results_json=results_json,
         hf_endpoint=hf_endpoint,
         hf_transfer=hf_transfer,
-        use_local_pool=use_local_pool,
-        pool_root=pool_root,
-        pool_split=pool_split,
     )
 
 

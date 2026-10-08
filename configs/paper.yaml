@@ -321,8 +321,8 @@ dataset:
       n_speakers_max: 3
       babble_seg_min_sec: 1
       babble_seg_max_sec: 4.0
-      gain_min: 0.3
-      gain_max: 1.0
+      gain_min: 0.6
+      gain_max: 1.2
     noise:
       enabled: true
       prob: 0.5 # independent Bernoulli prob of inclusion per sample
@@ -431,8 +431,6 @@ train:
   grad_clip_norm: 2.0
   # Print training heartbeat every N steps.
   log_every: 5
-  # Run evaluation every N steps (0 = disabled).
-  eval_every: 1000
   # Save a checkpoint every N steps. Last 3 ckpts are kept.
   ckpt_every: 1000
   # Call torch.{mps,cuda}.empty_cache() every N steps (0 = disabled).

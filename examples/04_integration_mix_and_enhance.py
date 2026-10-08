@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """Example 04 — Integration test using the SAME per-sample synthesis as training.
 
-Synthesises `--num-samples` mixed clips from the locally-baked
-LibriSpeech + MUSAN pools under `hp.processed_dir` (typically
-`data/processed/`) and runs the trained VoiceFilter-Lite model on
-them so you can audition the result directly. The synthesis path is
-the module-level `synthesize_raw_sample` from `voicefilter_cli.dataset`
-— i.e. the exact same code the training iterator runs — so the
-audition samples have the same interference statistics as training:
+Synthesises `--num-samples` mixed clips from the HF arrow cache that
+`voicefilter-cli dataset prepare` populated and runs the trained
+VoiceFilter-Lite model on them so you can audition the result
+directly. The synthesis path is the module-level `synthesize_raw_sample`
+from `voicefilter_cli.dataset` — i.e. the exact same code the training
+iterator runs — so the audition samples have the same interference
+statistics as training:
 
-  * target picked from LibriSpeech `target/<spec_id>/clean/<split>/...`,
-    random-cropped to `hp.sample_length_samples`.
+  * target picked from LibriSpeech (first declared target source,
+    `hp.target_sources[0]`); random-cropped to `hp.sample_length_samples`.
   * reference utterance picked 70% same-spk-different-utt, 30% self
-    (matches `LocalTripletStream.__iter__`); capped at
-    `hp.ref_max_sec * hp.sample_size`.
+    (matches `HfTripletStream.__iter__`); capped at
+    `hp.ref_max_sec * sample_rate`.
   * SNR drawn unconditionally from `[snr_min_db, snr_max_db]`.
   * TYPE-inclusion Bernoulli rolls (babble / noise / music) with the
     `prob` from `hp.interference_types`.
@@ -31,22 +31,20 @@ Then runs the model frame-by-frame via `StreamingVoiceFilter.step`
 exactly the way a production ASR frontend would consume it, and
 reconstructs the waveform with Griffin-Lim.
 
-Data is read directly from the on-disk pool that
-`scripts/prepare_dataset.py` baked under `hp.processed_dir` — no HF
-download at runtime, no tmp bake dir. The training's module-level
-pool builders (`_collect_babble_pool_paths` /
-`_collect_passthrough_pool_paths`) are pointed at `hp.processed_dir`
-directly.
+Data is read directly from the HF arrow cache that `voicefilter-cli
+dataset prepare` populated — there are no wav files baked on disk.
+Audio is decoded on-the-fly per sample via `default_hf_wav_loader`
+(reads `{"bytes": ...}` payload and decodes via `soundfile`, with
+librosa resampling when source_sr differs from `hp.sample_rate`).
 
 Prerequisite
 ------------
-Run once before the first invocation so the local pool exists:
+Run once before the first invocation so the HF cache exists:
 
-    python scripts/prepare_dataset.py --config configs/paper.yaml
+    voicefilter-cli dataset prepare --config configs/paper.yaml
 
-This bakes `target/librispeech/clean/<split>/<spk>/<utt>.wav`,
-`pool/librispeech/other/<split>/<spk>/<utt>.wav`, and
-`pool/musan/{speech,noise,music}/<clip>.wav` under `data/processed/`.
+This populates `<cache_dir>/` for every configured `HfSourceSpec`
+(default: `data/librispeech/` and `data/musan/` for paper.yaml).
 
 Output layout (one folder per sample, plus a summary):
 
@@ -117,11 +115,13 @@ from voicefilter_lite.streaming import (  # noqa: E402
     StreamingVoiceFilter,
 )
 from voicefilter_cli.dataset import (  # noqa: E402
-    _collect_babble_pool_paths,
-    _collect_passthrough_pool_paths,
+    HfEntry,
+    _build_target_index,
+    _collect_babble_pool_entries,
+    _collect_passthrough_pool_entries,
+    default_hf_wav_loader,
     synthesize_raw_sample,
 )
-from voicefilter_cli.local_pool import LocalLibriSpeechPool  # noqa: E402
 
 
 # ---- TYPE name constants (mirror HParams.interference_types keys) ----
@@ -166,10 +166,26 @@ def _save_wav(path: str, wav: torch.Tensor, sample_rate: int) -> None:
 def _logmel_to_wav(log_mel: torch.Tensor, hp: HParams, n_iter: int = 16) -> torch.Tensor:
     """Inverse log-mel → waveform via Griffin-Lim (audition only).
 
-    Same helper as `examples/01_offline_separation.py`. The 80-bin HTK
-    mel basis is rank-deficient (rank 75), so we use the Moore-Penrose
-    pseudo-inverse rather than torchaudio's `InverseMelScale` (which
-    raises `LinAlgError: input matrix does not have full rank`).
+    `hp` is the HParams restored from the loaded checkpoint's `hparams`
+    dict (see `main()` — `ckpt["hparams"]` was serialized at training
+    time from whichever `--config` the model was trained with, e.g.
+    `configs/paper.yaml` → `n_mels=128, n_fft=1200`). All audio params
+    used in this function — `n_mels`, `n_fft`, `hop_length`,
+    `win_length`, `sample_rate`, `log_mel_floor` — are read from `hp`,
+    so this helper tracks the training config with no hard-coded
+    mel-bin counts. Same end-to-end inverse as
+    `examples/01_offline_separation.py` and
+    `examples/02_streaming_inference.py`, modulo the inverse operator.
+
+    Uses the Moore-Penrose pseudo-inverse of the configured mel basis
+    rather than `torchaudio.transforms.InverseMelScale`: the pseudo-
+    inverse is a one-shot least-squares solve (no `max_iter` knob to
+    tune), and it degrades gracefully if the basis is rank-deficient
+    (which can happen when a config sets `n_mels` close to or above
+    `1 + n_fft // 2`). `examples/01/02` use `InverseMelScale` instead
+    — both produce audibly equivalent waveforms for the paper.yaml
+    config (`n_mels=128, n_fft=1200`); the choice here is just cheaper
+    and more explicit.
     """
     import torchaudio
 
@@ -202,88 +218,6 @@ def _logmel_to_wav(log_mel: torch.Tensor, hp: HParams, n_iter: int = 16) -> torc
 
 
 # --------------------------------------------------------------------------- #
-# Local MUSAN pool reader (mirror of LocalLibriSpeechPool for MUSAN)          #
-# --------------------------------------------------------------------------- #
-
-
-class _LocalMusanPool:
-    """Lazy reader over the baked MUSAN wavs under
-    `<processed_dir>/pool/<spec_id>/<subset>/<clip>.wav`.
-
-    The local LibriSpeech reader (`voicefilter_cli.local_pool.LocalLibriSpeechPool`)
-    already covers the LibriSpeech side; this class mirrors it for
-    MUSAN (flat under `pool/<spec_id>/<subset>/`, no spk subdir — each
-    clip is its own "identity" for babble's per-clip dedup).
-
-    Audio is loaded on-demand via `soundfile.read`.
-
-    Args:
-        processed_dir: path to `data/processed` (or override root).
-        spec_id: MUSAN source spec id (typically `"musan"` per
-            `configs/paper.yaml`); the pool lives at
-            `<processed_dir>/pool/<spec_id>/<subset>/`.
-
-    Raises `FileNotFoundError` if the spec_id tree is missing entirely;
-    individual missing subsets are recorded as empty lists (and surface
-    as RuntimeError when `random_wav(subset, ...)` is called).
-    """
-
-    def __init__(self, processed_dir: Path, spec_id: str = "musan"):
-        self.processed_dir = processed_dir
-        self.spec_id = spec_id
-        self.pool_root = processed_dir / "pool" / spec_id
-
-        by_subset: dict[str, list[Path]] = {}
-        if self.pool_root.is_dir():
-            for subset_dir in sorted(self.pool_root.iterdir()):
-                if not subset_dir.is_dir():
-                    continue
-                clips = sorted(subset_dir.glob("*.wav"))
-                if clips:
-                    by_subset[subset_dir.name] = clips
-
-        if not self.pool_root.is_dir():
-            raise FileNotFoundError(
-                f"[musan-pool] no MUSAN pool under {self.pool_root}. "
-                "Did `python scripts/prepare_dataset.py --config configs/paper.yaml` "
-                "bake MUSAN? (It writes `pool/<spec_id>/<subset>/<clip>.wav`.)"
-            )
-
-        self.by_subset: dict[str, list[Path]] = by_subset
-        if by_subset:
-            summary = ", ".join(
-                f"{s}={len(v)}" for s, v in sorted(by_subset.items())
-            )
-        else:
-            summary = "(no clips found)"
-        print(f"[musan-pool] spec_id={spec_id}: {summary} (root={self.pool_root})")
-
-    def random_wav(self, subset: str, rng: random.Random) -> torch.Tensor:
-        """Pick one random clip from `subset` and read it as a 1-D tensor."""
-        clips = self.by_subset.get(subset)
-        if not clips:
-            raise RuntimeError(
-                f"[musan-pool] no clips for subset={subset!r} under "
-                f"{self.pool_root}. Did `prepare_dataset.py` bake it?"
-            )
-        path = rng.choice(clips)
-        return _read_wav(path)
-
-
-def _read_wav(path: Path) -> torch.Tensor:
-    """Read a baked 16 kHz mono wav → (T,) float32 tensor.
-
-    Mirrors `voicefilter_cli.local_pool._read_wav`. The local pool is
-    always 16 kHz mono (enforced by `prepare_dataset.py`'s decode step),
-    so no resampling is needed.
-    """
-    data, _sr = sf.read(str(path), dtype="float32")
-    if data.ndim > 1:
-        data = data.mean(axis=1)
-    return torch.from_numpy(data)
-
-
-# --------------------------------------------------------------------------- #
 # Per-sample construction                                                     #
 # --------------------------------------------------------------------------- #
 
@@ -293,12 +227,11 @@ class SampleSummary:
     """Per-sample metadata persisted to `summary.txt` and `summary.json`."""
     index: int
     target_speaker: str
-    target_path: str
-    enrollment_path: str
+    target_utt_id: str
+    enrollment_utt_id: str
     # `tuple[str, ...]` of TYPE names actually mixed (in canonical order).
     interference_kind: tuple[str, ...]
     interference_detail: str
-    interference_path: str
     snr_db: float
     mixed_path: str
     enhanced_path: str
@@ -309,39 +242,30 @@ class SampleSummary:
 
 def _pick_enrollment_training_style(
     rng: random.Random,
-    target_pool: LocalLibriSpeechPool,
-    target_path: Path,
-    spk: str,
-) -> Optional[torch.Tensor]:
-    """Pick the enrollment clip following `LocalTripletStream.__iter__` rules.
+    spk_entries: list[HfEntry],
+    target_entry: HfEntry,
+) -> Optional[HfEntry]:
+    """Pick the enrollment entry following `HfTripletStream.__iter__` rules.
 
     Mirrors the training logic:
       * 70% same-spk different-utt (if available)
-      * 30% self (use the target clip — caller falls back to target wav)
-
-    Reads from the local LibriSpeech pool (`target_pool.by_spk[spk]`) so
-    there is no HF traffic at runtime. The wav is returned full-length;
-    `synthesize_raw_sample` will cap it at `ref_max_sec * sample_rate`
-    (no random offset pick, matching training's `ref_wav_t[..., :cap]`
-    truncation).
+      * 30% self (use the target entry — caller falls back to target wav)
 
     Returns None iff the speaker has only one utterance OR the 30%
-    self-roll came up "self". Caller treats None as "fall back to a
-    sub-clip of target".
+    self-roll came up "self". Caller treats None as "fall back to the
+    target entry's wav".
     """
-    candidates = target_pool.by_spk.get(spk, [])
+    candidates = spk_entries
     if len(candidates) < 2:
         # Single-utt speaker: training always uses self.
         return None
     if rng.random() < 0.7:
-        # Try to pick a different utt.
         for _ in range(20):
-            p = rng.choice(candidates)
-            if p != target_path:
-                return _read_wav(p)
+            e = rng.choice(candidates)
+            if e != target_entry:
+                return e
         # Couldn't find a different utt in 20 tries — fall through.
         return None
-    # 30% self-roll.
     return None
 
 
@@ -352,9 +276,9 @@ def build_one_sample(
     target_spk: str,
     target_wav_full: torch.Tensor,
     enroll_wav: Optional[torch.Tensor],
-    babble_spk_to_paths: dict[str, list[Path]],
-    noise_pool: list[Path],
-    music_pool: list[Path],
+    babble_spk_to_entries: dict[str, list[HfEntry]],
+    noise_pool: list[HfEntry],
+    music_pool: list[HfEntry],
     babble_cfg,
     noise_cfg,
     music_cfg,
@@ -369,9 +293,10 @@ def build_one_sample(
 
     `target_wav_full` is the full (uncropped) LibriSpeech utterance for
     the picked target. `enroll_wav` is the full reference (None means
-    "use target_wav_full"). The interference pools come from the local
-    `data/processed/pool/` tree (already on disk — `synthesize_raw_sample`
-    reads them directly).
+    "use target_wav_full"). The interference pools come from the HF
+    arrow cache (`babble_spk_to_entries`, `noise_pool`, `music_pool`);
+    `synthesize_raw_sample` decodes via `default_hf_wav_loader` and
+    resamples MUSAN entries from 44.1 kHz to `hp.sample_rate`.
 
     Returns a `SampleSummary` with paths to the per-sample WAVs.
     """
@@ -409,7 +334,7 @@ def build_one_sample(
         rng,
         target_wav_full=target_wav_full,
         ref_wav_full=enroll_full,
-        babble_spk_to_paths=babble_spk_to_paths,
+        babble_spk_to_entries=babble_spk_to_entries,
         noise_pool=noise_pool,
         music_pool=music_pool,
         type_probs=type_probs,
@@ -444,26 +369,19 @@ def build_one_sample(
 
     # 6) Persist WAVs.
     tag = f"{idx:02d}"
-    target_path = out_dir / f"{tag}_target.wav"
-    enroll_path = out_dir / f"{tag}_enrollment.wav"
-    interference_path = out_dir / f"{tag}_interference.wav"
     mixed_path = out_dir / f"{tag}_mixed.wav"
     enhanced_path = out_dir / f"{tag}_enhanced.wav"
 
-    _save_wav(str(target_path), target_wav, hp.sample_rate)
-    _save_wav(str(enroll_path), enroll_for_dvec, hp.sample_rate)
-    _save_wav(str(interference_path), interference_wav, hp.sample_rate)
     _save_wav(str(mixed_path), mixed_wav, hp.sample_rate)
     _save_wav(str(enhanced_path), enhanced_wav, hp.sample_rate)
 
     return SampleSummary(
         index=idx,
         target_speaker=target_spk,
-        target_path=str(target_path.name),
-        enrollment_path=str(enroll_path.name),
+        target_utt_id="",  # filled by main
+        enrollment_utt_id="",  # filled by main
         interference_kind=noise_kind,
         interference_detail=detail,
-        interference_path=str(interference_path.name),
         snr_db=float(snr_db),
         mixed_path=str(mixed_path.name),
         enhanced_path=str(enhanced_path.name),
@@ -491,8 +409,6 @@ def main() -> None:
     p.add_argument("--device", default="auto", help="auto | mps | cuda | cpu")
     p.add_argument("--gl-iter", type=int, default=16,
                    help="Griffin-Lim iterations for waveform reconstruction")
-    p.add_argument("--processed-dir", default=None,
-                   help="Override hp.processed_dir (default: use checkpoint's)")
     args = p.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -507,10 +423,6 @@ def main() -> None:
     hp.device = str(device)
     if args.sample_length_sec is not None:
         hp.sample_length_sec = float(args.sample_length_sec)
-    if args.processed_dir is not None:
-        hp.processed_dir = args.processed_dir
-    processed_dir = Path(hp.processed_dir)
-    print(f"[example04] processed_dir={processed_dir}")
 
     rng = random.Random(args.seed)
     np.random.seed(args.seed)
@@ -539,93 +451,36 @@ def main() -> None:
     print(f"[example04] d_vector_dim={hp.d_vector_dim}")
     mel_fn = make_mel_basis(hp, device=torch.device("cpu"))
 
-    # ---- Open LibriSpeech target (clean role) from local pool ----
+    # ---- Open LibriSpeech target + babble / noise / music pools ----
+    # Uses the training's module-level helpers — opens one HF
+    # `datasets.Dataset` per (source, subset, split) and builds the same
+    # `{spk_id → [HfEntry, …]}` maps as `HfTripletStream`. The cache_dir
+    # comes from the resolved spec.
     if not hp.target_sources:
         raise SystemExit(
             "[example04] hp.target_sources is empty; nothing to mix into target."
         )
-    target_resolved = resolve_source(hp, hp.target_sources[0])
-    if not target_resolved.is_librispeech():
+    dataset_cache: dict[str, object] = {}
+    target_index, _spk_to_spec_id = _build_target_index(hp, dataset_cache)
+    if not target_index:
         raise SystemExit(
-            f"[example04] target source {target_resolved.id!r} is not "
-            "LibriSpeech; example04 only supports LibriSpeech targets."
+            "[example04] target_index is empty; did `voicefilter-cli dataset "
+            "prepare` finish?"
         )
-    t_open = time.time()
-    print(f"[example04] opening LibriSpeech target (role=clean, "
-          f"splits={list(target_resolved.splits)}) from {processed_dir}")
-    target_pool = LocalLibriSpeechPool(
-        root=processed_dir, role="clean", splits=target_resolved.splits,
+    n_speakers = len(target_index)
+    n_target_utts = sum(len(v) for v in target_index.values())
+    print(
+        f"[example04] target pool: {n_target_utts:,} utts, "
+        f"{n_speakers:,} speakers"
     )
-    print(f"[example04]   target pool: {len(target_pool.wavs):,} wavs, "
-          f"{len(target_pool.by_spk):,} speakers "
-          f"(opened in {time.time() - t_open:.1f}s)")
-
-    # ---- Open LibriSpeech "other" pool from local pool ----
-    inter_resolved_list: list = []
-    seen_keys: set[tuple[str, tuple[str, ...]]] = set()
-    for type_cfg in hp.interference_types.values():
-        if not type_cfg.enabled or type_cfg.prob <= 0:
-            continue
-        for ref in type_cfg.sources:
-            resolved = resolve_source(hp, ref)
-            if resolved.librispeech_role() != "other":
-                continue
-            key = (resolved.librispeech_role() or "", tuple(resolved.splits))
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
-            inter_resolved_list.append(resolved)
-    if not inter_resolved_list:
-        raise SystemExit(
-            "[example04] no enabled LibriSpeech `other` source under "
-            "hp.interference — needed by the babble pool."
-        )
-    inter_resolved = inter_resolved_list[0]
-    t_open = time.time()
-    print(f"[example04] opening LibriSpeech other (role=other, "
-          f"splits={list(inter_resolved.splits)}) from {processed_dir}")
-    inter_pool = LocalLibriSpeechPool(
-        root=processed_dir, role="other", splits=inter_resolved.splits,
-    )
-    print(f"[example04]   other pool: {len(inter_pool.wavs):,} wavs, "
-          f"{len(inter_pool.by_spk):,} speakers "
-          f"(opened in {time.time() - t_open:.1f}s)")
-
-    # ---- Open MUSAN subsets referenced by enabled TYPEs from local pool ----
-    musan_subsets_needed: set[str] = set()
-    musan_spec_id: Optional[str] = None
-    for type_name, type_cfg in hp.interference_types.items():
-        if not type_cfg.enabled or type_cfg.prob <= 0:
-            continue
-        for ref in type_cfg.sources:
-            resolved = resolve_source(hp, ref)
-            if resolved.is_musan() and resolved.subset:
-                musan_subsets_needed.add(resolved.subset)
-                if musan_spec_id is None:
-                    musan_spec_id = resolved.id
-        if type_name == NOISE_KIND_BABBLE:
-            musan_subsets_needed.add("speech")
-    if not musan_subsets_needed:
-        raise SystemExit(
-            "[example04] no MUSAN subsets configured — babble / noise / music "
-            "all need at least one."
-        )
-    if musan_spec_id is None:
-        musan_spec_id = "musan"   # paper.yaml default
-    print(f"[example04] opening MUSAN pool (spec_id={musan_spec_id!r}, "
-          f"subsets={sorted(musan_subsets_needed)}) from {processed_dir}")
-    t_open = time.time()
-    musan_pool = _LocalMusanPool(processed_dir, spec_id=musan_spec_id)
-    print(f"[example04]   musan pool opened in {time.time() - t_open:.1f}s")
 
     # ---- Build the pool structures via the training's module-level helpers ----
-    # These walk `<hp.processed_dir>/pool/...` directly — no tmp bake dir.
-    babble_paths = _collect_babble_pool_paths(hp, processed_dir)
-    babble_spk_to_paths: dict[str, list[Path]] = {}
-    for spk_id, path in babble_paths:
-        babble_spk_to_paths.setdefault(spk_id, []).append(path)
-    noise_pool = _collect_passthrough_pool_paths(hp, processed_dir / "pool", NOISE_KIND_NOISE)
-    music_pool = _collect_passthrough_pool_paths(hp, processed_dir / "pool", NOISE_KIND_MUSIC)
+    babble_entries = _collect_babble_pool_entries(hp, dataset_cache)
+    babble_spk_to_entries: dict[str, list[HfEntry]] = {}
+    for spk_id, entry in babble_entries:
+        babble_spk_to_entries.setdefault(spk_id, []).append(entry)
+    noise_pool = _collect_passthrough_pool_entries(hp, dataset_cache, NOISE_KIND_NOISE)
+    music_pool = _collect_passthrough_pool_entries(hp, dataset_cache, NOISE_KIND_MUSIC)
     type_probs: dict[str, float] = {
         name: float(cfg.prob)
         for name, cfg in hp.interference_types.items()
@@ -635,20 +490,9 @@ def main() -> None:
     noise_cfg = hp.interference_types.get(NOISE_KIND_NOISE)
     music_cfg = hp.interference_types.get(NOISE_KIND_MUSIC)
     print(
-        f"[example04] pools ready: babble spks={len(babble_spk_to_paths)} "
+        f"[example04] pools ready: babble spks={len(babble_spk_to_entries)} "
         f"noise clips={len(noise_pool)} music clips={len(music_pool)}"
     )
-
-    # Quick sanity-check: every MUSAN subset the model needs is actually baked.
-    missing = sorted(
-        s for s in musan_subsets_needed if not musan_pool.by_subset.get(s)
-    )
-    if missing:
-        raise SystemExit(
-            f"[example04] MUSAN pool is missing baked subsets: {missing}. "
-            f"Run `python scripts/prepare_dataset.py --config configs/paper.yaml` "
-            "first (it bakes pool/<id>/<subset>/<clip>.wav)."
-        )
 
     # ---- Build N samples ----
     summaries: list[SampleSummary] = []
@@ -656,16 +500,24 @@ def main() -> None:
     for i in range(args.num_samples):
         ts = time.time()
         try:
-            # 1) Pick target speaker + utterance from local pool.
-            target_spk, target_path = target_pool.random_path(rng)
-            target_wav_full = _read_wav(target_path)
+            # 1) Pick target speaker + utterance from HF cache.
+            target_spk = rng.choice(list(target_index.keys()))
+            spk_entries = target_index[target_spk]
+            tgt_entry = rng.choice(spk_entries)
+            target_wav_full = torch.from_numpy(
+                default_hf_wav_loader(tgt_entry, hp.sample_rate)
+            )
 
             # 2) Pick enrollment (training's 70/30 rule).
-            enroll_wav = _pick_enrollment_training_style(
-                rng, target_pool, target_path, target_spk,
-            )
-            if enroll_wav is None:
+            enroll_entry = _pick_enrollment_training_style(rng, spk_entries, tgt_entry)
+            if enroll_entry is None:
                 enroll_wav = target_wav_full.clone()
+                enroll_utt_id = tgt_entry.utt_id
+            else:
+                enroll_wav = torch.from_numpy(
+                    default_hf_wav_loader(enroll_entry, hp.sample_rate)
+                )
+                enroll_utt_id = enroll_entry.utt_id
 
             # 3) Synthesize + enhance + persist via the shared
             #    module-level `synthesize_raw_sample`.
@@ -674,7 +526,7 @@ def main() -> None:
                 target_spk=target_spk,
                 target_wav_full=target_wav_full,
                 enroll_wav=enroll_wav,
-                babble_spk_to_paths=babble_spk_to_paths,
+                babble_spk_to_entries=babble_spk_to_entries,
                 noise_pool=noise_pool,
                 music_pool=music_pool,
                 babble_cfg=babble_cfg,
@@ -685,6 +537,8 @@ def main() -> None:
                 out_dir=out_dir,
                 gl_iter=args.gl_iter,
             )
+            summary.target_utt_id = tgt_entry.utt_id
+            summary.enrollment_utt_id = enroll_utt_id
         except Exception as e:
             print(f"[example04] sample {i:02d} FAILED: {type(e).__name__}: {e}")
             continue
@@ -708,25 +562,22 @@ def main() -> None:
         f.write("# Integration test summary\n")
         f.write(f"# generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"# checkpoint: {args.checkpoint}\n")
-        f.write(f"# processed_dir: {processed_dir}\n")
         f.write(f"# num_samples: {len(summaries)} (requested {args.num_samples})\n")
         f.write(f"# sample_length_sec: {hp.sample_length_sec}\n")
         f.write(f"# snr_range_db: [{hp.snr_min_db}, {hp.snr_max_db}]\n")
-        f.write(f"# musan_subsets: {sorted(musan_subsets_needed)}\n")
         f.write(f"# total_runtime_sec: {time.time() - t0:.1f}\n\n")
         for s in summaries:
             kind_str = (
                 "+".join(s.interference_kind) if s.interference_kind else "silence"
             )
             f.write(f"--- sample {s.index:02d} ---\n")
-            f.write(f"  target_speaker   : {s.target_speaker}\n")
+            f.write(f"  target_speaker    : {s.target_speaker}\n")
+            f.write(f"  target_utt_id     : {s.target_utt_id}\n")
+            f.write(f"  enrollment_utt_id : {s.enrollment_utt_id}\n")
             f.write(f"  interference      : {kind_str}  ({s.interference_detail})\n")
             f.write(f"  snr_db            : {s.snr_db:+.1f}\n")
             f.write(f"  target_silent     : {s.target_silent}\n")
             f.write(f"  interference_silent: {s.interference_silent}\n")
-            f.write(f"  target wav        : {s.target_path}\n")
-            f.write(f"  enrollment wav    : {s.enrollment_path}\n")
-            f.write(f"  interference wav  : {s.interference_path}\n")
             f.write(f"  mixed wav         : {s.mixed_path}\n")
             f.write(f"  enhanced wav      : {s.enhanced_path}\n")
             for note in s.notes:

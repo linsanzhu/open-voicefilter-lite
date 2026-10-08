@@ -43,12 +43,6 @@ from voicefilter_cli.dataset import (
     _cast_audio_no_decode,
     _disable_hf_audio_decode,
 )
-from voicefilter_cli.local_pool import (
-    DEFAULT_POOL_ROOT,
-    LocalLibriSpeechPool,
-    has_local_pool,
-    resolve_eval_pair,
-)
 from voicefilter_lite.hparams import HParams, resolve_source
 from voicefilter_lite.model import VoiceFilterLite
 from voicefilter_lite.streaming import StreamingVoiceFilter
@@ -147,98 +141,25 @@ def build_eval_pairs(
     hp: HParams,
     num_samples: int,
     seed: int,
-    use_local_pool: bool = True,
-    pool_root: str = str(DEFAULT_POOL_ROOT),
 ) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
     """Yield (mixed_wav, target_wav, ref_wav, interference_wav) tuples.
 
     target + ref come from the same speaker (ref for d-vector),
     interference is a different speaker from the other split.
 
-    When `use_local_pool=True` (default), reads wavs directly from
-    `<pool_root>/target/librispeech/clean/{split}/...` and
-    `<pool_root>/pool/librispeech/other/{split}/...` — the tree
-    produced by `scripts/prepare_dataset.py`. No HF traffic, ~0 ms
-    network overhead, identical fidelity to what training consumed.
-
-    Falls back to HF streaming when either pool is missing
-    (`use_local_pool=False` forces the legacy path).
+    Reads from the HF arrow cache directly (no wav-baked pool) — the
+    `voicefilter-cli dataset prepare` step populates this cache.
     """
     from datasets import load_dataset
     from itertools import chain
 
     # Resolve target + interference SourceRefs against the top-level
-    # `dataset.sources` declarations (used in the HF fallback).
+    # `dataset.sources` declarations.
     if not hp.target_sources:
         raise RuntimeError("[evaluate] hp.target_sources is empty")
     target_resolved = resolve_source(hp, hp.target_sources[0])
     inter_resolved = first_librispeech_other_source(hp)
 
-    # ---- Try local pool first ----
-    pool_path = Path(pool_root)
-    # paper.yaml sets target split = train.clean.360, interference = train.other.500
-    target_split = target_resolved.splits[0] if target_resolved.splits else "train.clean.360"
-    inter_split = (
-        inter_resolved.splits[0] if (inter_resolved and inter_resolved.splits) else "train.other.500"
-    )
-
-    use_pool = use_local_pool and (
-        has_local_pool(root=pool_path, role="clean", split=target_split)
-        and has_local_pool(root=pool_path, role="other", split=inter_split)
-    )
-    if use_local_pool and not use_pool:
-        print(
-            f"[evaluate] WARNING: --use-local-pool requested but the baked "
-            f"pool is missing under {pool_path}/. "
-            f"Falling back to HF streaming. (Run `scripts/prepare_dataset.py` "
-            f"to bake the pool.)"
-        )
-
-    rng = random.Random(seed)
-
-    if use_pool:
-        # ---- Local-pool path ----
-        target_pool, inter_pool = resolve_eval_pair(
-            pool_root=pool_path,
-            target_role="clean",
-            target_split=target_split,
-            inter_role="other",
-            inter_split=inter_split,
-        )
-        spk_buf: dict[str, list[torch.Tensor]] = {}
-
-        n = 0
-        # We over-pull from both pools until we have `num_samples` mixed
-        # wavs. The legacy HF path consumed one row from each per
-        # sample; the pool equivalent is two random picks (target,
-        # interference) plus a separate ref pick from the same speaker.
-        while n < num_samples:
-            tgt_spk, tgt_path = target_pool.random_path(rng)
-            buf = spk_buf.setdefault(tgt_spk, [])
-            if len(buf) < 4:
-                buf.append(tgt_path)
-                continue
-            ref_path = rng.choice(buf)
-            _, intf_path = inter_pool.random_path(rng)
-            try:
-                # Re-decode each time (cheap on SSD-backed pools; ~ms each).
-                target_wav = _read_pool_wav(tgt_path)
-                interference_wav = _read_pool_wav(intf_path)
-                ref_wav = _read_pool_wav(ref_path)
-            except Exception:
-                continue
-
-            sample_len = hp.sample_length_samples
-            target_wav = random_crop(target_wav, sample_len)
-            interference_wav = random_crop(interference_wav, sample_len)
-            snr = rng.uniform(hp.snr_min_db, hp.snr_max_db)
-            mixed = snr_mix(target_wav, interference_wav, snr)
-
-            yield mixed, target_wav, ref_wav, interference_wav
-            n += 1
-        return
-
-    # ---- HF streaming fallback (legacy path) ----
     # `cache_dir` is honoured by `load_dataset` only when `streaming=False`;
     # when streaming, the rows come straight from the HF Hub stream. We
     # build a kwargs dict per source so target / interference can point at
@@ -285,6 +206,7 @@ def build_eval_pairs(
         )
     )
 
+    rng = random.Random(seed)
     spk_buf_hf: dict[str, dict] = {}
 
     n = 0
@@ -318,15 +240,6 @@ def build_eval_pairs(
         yield mixed, target_wav, ref_wav, interference_wav
         n += 1
 
-
-def _read_pool_wav(path) -> torch.Tensor:
-    """Read a baked-pool wav → (T,) float32 at 16 kHz mono. The pool is
-    always 16 kHz mono (enforced by `prepare_dataset.py`), so no resample."""
-    import soundfile as sf
-    data, _sr = sf.read(str(path), dtype="float32")
-    if data.ndim > 1:
-        data = data.mean(axis=1)
-    return torch.from_numpy(data)
 
 def evaluate(hp: HParams, args: "EvalArgs") -> None:
     # Auto-detect device at runtime unless `--device` forces one.
@@ -387,13 +300,7 @@ def evaluate(hp: HParams, args: "EvalArgs") -> None:
     log_mel_snr_out: list[float] = []
 
     for i, (mixed, target, ref, interference) in enumerate(
-        build_eval_pairs(
-            hp,
-            args.num_samples,
-            hp.seed,
-            use_local_pool=getattr(args, "use_local_pool", True),
-            pool_root=getattr(args, "pool_root", str(DEFAULT_POOL_ROOT)),
-        )
+        build_eval_pairs(hp, args.num_samples, hp.seed)
     ):
         # Compute d-vector from ref. The VoiceFilter d-vector recipe expects
         # arbitrary-length refs (it does its own windowed aggregation),
@@ -516,7 +423,7 @@ def _logmel_to_wav(
     direct LAPACK `gels` solve that fails on rank-deficient filterbank
     matrices — which is exactly our case (n_mels=128, n_freq//2+1=201, so
     the basis is rectangular). Doing the pseudoinverse ourselves is more
-    robust and matches what the old iterative constructor converged on.
+    robust and matches what the earlier iterative constructor converged on.
     """
     import torch.linalg as la
 
@@ -554,8 +461,6 @@ class EvalArgs:
     no_adaptive: bool = False
     hf_endpoint: Optional[str] = None
     hf_transfer: Optional[bool] = None
-    use_local_pool: bool = True
-    pool_root: str = str(DEFAULT_POOL_ROOT)
 
 
 app = App(name="voicefilter-lite", help_format="plaintext")
@@ -606,23 +511,6 @@ def main(
         Optional[bool],
         Parameter(negative="--no-hf-transfer", help="Force-enable HF hf_transfer protocol."),
     ] = None,
-    use_local_pool: Annotated[
-        bool,
-        Parameter(
-            name="--use-local-pool",
-            help="Read LibriSpeech wavs from the baked pool at <pool-root>/ "
-                 "(default: data/processed). Requires prepare_dataset.py to "
-                 "have baked both target/librispeech/clean/<split>/ and "
-                 "pool/librispeech/other/<split>/.",
-        ),
-    ] = True,
-    pool_root: Annotated[
-        str,
-        Parameter(
-            name="--pool-root",
-            help="Root of the baked pool (default: data/processed).",
-        ),
-    ] = str(DEFAULT_POOL_ROOT),
 ) -> None:
     """Evaluate a trained VoiceFilter-Lite checkpoint on LibriSpeech.
 
@@ -637,8 +525,6 @@ def main(
         no_adaptive=no_adaptive,
         hf_endpoint=hf_endpoint,
         hf_transfer=hf_transfer,
-        use_local_pool=use_local_pool,
-        pool_root=pool_root,
     )
     hp = HParams()
     evaluate(hp, args)

@@ -384,9 +384,9 @@ class InterferenceTypeConfig:
     # Per-speaker segment length upper bound (s).
     babble_seg_max_sec: float = 2.0
     # Per-speaker gain lower bound (uniform per clip in [min, max]).
-    gain_min: float = 0.3
+    gain_min: float = 0.6
     # Per-speaker gain upper bound.
-    gain_max: float = 1.0
+    gain_max: float = 1.2
 
 
 def _default_sources() -> tuple[HfSourceSpec, ...]:
@@ -449,7 +449,7 @@ def _default_babble() -> InterferenceTypeConfig:
         enabled=True, prob=0.5, sources=_default_speech_sources(),
         n_speakers_min=1, n_speakers_max=5,
         babble_seg_min_sec=0.5, babble_seg_max_sec=2.0,
-        gain_min=0.3, gain_max=1.0,
+        gain_min=0.6, gain_max=1.2,
     )
 
 
@@ -680,13 +680,6 @@ class DatasetConfig:
     # LocalTripletStream reads local wavs (~5 ms/sample) so depth 1-2
     # is usually enough.
     prefetch_batches_max: int = 2
-    # Vestigial: legacy thread-pool size for parallel FLAC decode.
-    # LocalTripletStream does not use a decode pool (local wavs only),
-    # so this field is ignored. Kept so old YAMLs don't error.
-    decode_workers: int = 0
-    # Vestigial: legacy per-thread decode-pipeline depth. Ignored;
-    # kept for backward YAML compatibility.
-    decode_prefetch: int = 0
 
 
 # ============================================================ #
@@ -715,8 +708,6 @@ class TrainConfig:
     grad_clip_norm: float = 5.0
     # Print training heartbeat every N steps.
     log_every: int = 5
-    # Run evaluation every N steps (0 = disabled).
-    eval_every: int = 1_000
     # Save a checkpoint every N steps. Last 3 ckpts are kept; older
     # ones are auto-deleted to bound disk usage.
     ckpt_every: int = 1_000
@@ -1167,11 +1158,6 @@ class HParams:
     def log_every(self, v: int) -> None: self.train.log_every = v
 
     @property
-    def eval_every(self) -> int: return self.train.eval_every
-    @eval_every.setter
-    def eval_every(self, v: int) -> None: self.train.eval_every = v
-
-    @property
     def ckpt_every(self) -> int: return self.train.ckpt_every
     @ckpt_every.setter
     def ckpt_every(self, v: int) -> None: self.train.ckpt_every = v
@@ -1195,16 +1181,6 @@ class HParams:
     def streaming(self) -> bool:
         """Streaming mode is permanently removed. Always False."""
         return False
-
-    @property
-    def decode_workers(self) -> int: return self.dataset.decode_workers
-    @decode_workers.setter
-    def decode_workers(self, v: int) -> None: self.dataset.decode_workers = v
-
-    @property
-    def decode_prefetch(self) -> int: return self.dataset.decode_prefetch
-    @decode_prefetch.setter
-    def decode_prefetch(self, v: int) -> None: self.dataset.decode_prefetch = v
 
     @property
     def prefetch_batches_max(self) -> int: return self.dataset.prefetch_batches_max
@@ -1483,10 +1459,8 @@ _LEGACY_FLAT_TO_NESTED: dict[str, tuple[str, str, str]] = {
     "ref_max_sec": ("dataset", "reference", "max_sec"),
     "ref_buffer_max_per_spk": ("dataset", "reference", "buffer_max_per_spk"),
     "ref_buffer_max_speakers": ("dataset", "reference", "buffer_max_speakers"),
-    # dataset (top: processed_dir + decode_*)
+    # dataset (top: processed_dir)
     "processed_dir": ("dataset", None, "processed_dir"),
-    "decode_workers": ("dataset", None, "decode_workers"),
-    "decode_prefetch": ("dataset", None, "decode_prefetch"),
     "prefetch_batches_max": ("dataset", None, "prefetch_batches_max"),
     # train
     "batch_size": ("train", None, "batch_size"),
@@ -1496,7 +1470,6 @@ _LEGACY_FLAT_TO_NESTED: dict[str, tuple[str, str, str]] = {
     "warmup_steps": ("train", None, "warmup_steps"),
     "grad_clip_norm": ("train", None, "grad_clip_norm"),
     "log_every": ("train", None, "log_every"),
-    "eval_every": ("train", None, "eval_every"),
     "ckpt_every": ("train", None, "ckpt_every"),
     "empty_cache_every": ("train", None, "empty_cache_every"),
     "seed": ("train", None, "seed"),
@@ -1576,6 +1549,16 @@ def resolve_source(hp: "HParams", ref: "SourceRef") -> "ResolvedSource":
     if subset is None and len(spec.configs) == 1:
         subset = spec.configs[0]
     splits = ref.splits or spec.splits
+    # MUSAN has no real "splits" — every subset (`speech` / `noise` /
+    # `music`) only exposes a single HF split named `"train"`. When
+    # neither the ref nor the spec declared `splits:` (the usual case
+    # since MUSAN is config-organised, not split-organised), fall back
+    # to the canonical default so `load_dataset(... split="train")` has
+    # something to pass and `prepare_dataset._prepare_source`'s split
+    # loop has a body. Without this, a MUSAN spec with no `splits:`
+    # silently bakes 0 rows — see prepare run on 2026-10-08.
+    if not splits and spec.repo == "corypaik/musan":
+        splits = ("train",)
     return ResolvedSource(spec=spec, subset=subset, splits=splits)
 
 
