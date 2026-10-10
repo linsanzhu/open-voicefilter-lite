@@ -70,11 +70,11 @@ import numpy as np
 import torch
 from cyclopts import App, Parameter
 
-from voicefilter_lite.audio import pad_or_trim, wav_to_dvec_mel
+from model.audio import pad_or_trim, wav_to_dvec_mel
 from voicefilter_cli.hf import apply_hf_endpoint
-from voicefilter_cli.losses import GE2ELoss
+from model.losses import GE2ELoss
 from voicefilter_lite.hparams import HParams
-from voicefilter_lite.speaker_encoder import SpeakerEncoder
+from model.speaker_encoder import SpeakerEncoder
 
 # ---- GE2E loss -------------------------------------------------------------
 #

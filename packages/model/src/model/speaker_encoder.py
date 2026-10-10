@@ -83,7 +83,7 @@ class SpeakerEncoder(nn.Module):
     The model itself is windowed — i.e. it consumes a single 80-frame
     mel window. Aggregation over multiple windows (L2-norm per window →
     mean → final L2-norm) is the caller's job and lives in
-    `voicefilter_lite.audio.extract_dvec`. Pretrained weights load
+    `model.audio.extract_dvec`. Pretrained weights load
     with `load_pretrained(...)`; `freeze()` after loading when used as a
     frozen feature extractor.
     """
@@ -117,8 +117,8 @@ class SpeakerEncoder(nn.Module):
 
         Aggregation (per-window L2 → mean → final L2) and audio
         preprocessing (fbank extraction) are the caller's job — see
-        `voicefilter_lite.audio.wav_to_dvec_mel` and
-        `voicefilter_lite.audio.extract_dvec`.
+        `model.audio.wav_to_dvec_mel` and
+        `model.audio.extract_dvec`.
         """
         # `flatten_parameters()` packs the LSTM weights into contiguous
         # memory for faster cuDNN dispatch; the original VoiceFilter repo

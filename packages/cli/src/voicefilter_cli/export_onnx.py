@@ -63,7 +63,7 @@ from cyclopts import App, Parameter
 
 from voicefilter_cli._onnx_metadata import embed_hp_metadata
 from voicefilter_lite.hparams import HParams
-from voicefilter_lite.model import VoiceFilterLite
+from model.nn import VoiceFilterLite
 
 
 def _inline_onnx_weights(path: str) -> None:

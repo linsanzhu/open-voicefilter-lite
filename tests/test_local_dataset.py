@@ -45,14 +45,18 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 import torch
+import torchaudio
 
-# Make the cli source dir importable when running this file directly.
+# Make the model + inference source dirs importable when running this
+# file directly. Training data pipeline (`HfTripletStream`, mel extract,
+# triplet collate) is in the workspace-only `model` package; HParams /
+# SourceRef live in the published `open-voicefilter-lite` package.
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "packages" / "cli" / "src"))
+sys.path.insert(0, str(ROOT / "packages" / "model" / "src"))
 sys.path.insert(0, str(ROOT / "packages" / "open-voicefilter-lite" / "src"))
 
-from voicefilter_cli import dataset as _dataset_mod
-from voicefilter_cli.dataset import (
+from model import dataset as _dataset_mod
+from model.dataset import (
     HfTripletStream,
     _collect_babble_pool_entries,
     _pick_babble_speakers,
@@ -335,7 +339,7 @@ def test_missing_dvec_triggers_compute_and_caches(hp: HParams) -> None:
     """When a speaker's d-vector `.npy` is missing on disk, the
     `DVectorCache` should compute it on first sight and persist it.
     """
-    import voicefilter_lite.audio as _audio_mod
+    import model.audio as _audio_mod
 
     mock_calls: list[str] = []
 
@@ -905,9 +909,25 @@ def test_short_source_target_act_is_padded_to_sample_len(hp: HParams) -> None:
     """Regression for `_per_frame_overlap_label` IndexError when the
     source utterance is shorter than `hp.sample_length_samples`.
     """
-    from voicefilter_lite.audio import wav_to_log_mel, make_mel_basis
-
-    mel_fn = make_mel_basis(hp, device=torch.device("cpu"))
+    from model.audio import wav_to_log_mel
+    # `voicefilter_lite.mel_basis.make_mel_basis` is the inference-side
+    # torch-free helper (librosa + numpy). The training-side
+    # `wav_to_log_mel` expects a torchaudio MelSpectrogram, so build
+    # it inline here. (Was the call `make_mel_basis(hp, device=...)`
+    # before the train/inference split; the old helper was the
+    # torchaudio-based one, which now lives only on the training side.)
+    mel_fn = torchaudio.transforms.MelSpectrogram(
+        sample_rate=hp.sample_rate,
+        n_fft=hp.n_fft,
+        win_length=hp.win_length,
+        hop_length=hp.hop_length,
+        n_mels=hp.n_mels,
+        power=2.0,
+        center=False,
+        window_fn=torch.hann_window,
+        mel_scale="htk",
+        normalized=False,
+    )
     sample_len = hp.sample_length_samples
 
     for src_dur_sec in (0.3, 0.5, 1.0, 2.5):

@@ -17,28 +17,29 @@ the training / data-prep / ONNX-export CLI lives in the sibling
 pip install open-voicefilter-lite
 ```
 
-The install pulls in PyTorch, torchaudio, onnxruntime, librosa, and
-soundfile. No checkpoint download is required — the ONNX graphs are
-bundled inside the wheel.
+The install pulls in **onnxruntime, numpy, librosa, soundfile, and
+PyYAML** — no PyTorch, no torchaudio. The package is **runtime
+torch-free**: `import voicefilter_lite` does not load `torch` or
+`torchaudio` into `sys.modules`, so the wheel can be deployed in a
+slim inference image (training lives in the workspace-only `model`
+package, not in this wheel). No checkpoint download is required —
+the ONNX graphs are bundled inside the wheel.
 
 ## Quick use
 
 ```python
 import numpy as np
 import soundfile as sf
-import torch
-import torchaudio
+import librosa
 from voicefilter_lite import StreamingVoiceFilter
 
 # Load the target speaker yourself — the library takes PCM only, not paths.
 wav, sr = sf.read("enroll.wav", dtype="float32")
 if sr != 16000:
-    wav = torchaudio.functional.resample(
-        torch.from_numpy(wav), sr, 16000
-    ).numpy()
+    wav = librosa.resample(wav, orig_sr=sr, target_sr=16000).astype(np.float32)
 
 sf_vfl = StreamingVoiceFilter()              # uses bundled ONNX
-sf_vfl.set_enrollment(wav)                   # numpy / torch PCM, 1-D
+sf_vfl.set_enrollment(wav)                   # numpy float32 1-D PCM
 
 # Feed it PCM chunks of `hop_length` samples (= 160 at 16 kHz, 10 ms);
 # the model returns the same number of enhanced samples.
@@ -47,15 +48,16 @@ while True:
     pcm = microphone.read(hop)               # numpy float32, 1-D
     if pcm is None:
         break
-    enhanced = sf_vfl.step(pcm)              # torch float32, 1-D
-    speaker.play(enhanced.numpy())
+    enhanced = sf_vfl.step(pcm)              # numpy float32, 1-D
+    speaker.play(enhanced)
 ```
 
-`set_enrollment(audio)` accepts a numpy array or a torch tensor of PCM
+`set_enrollment(audio)` accepts a 1-D numpy float32 array of PCM
 samples at the model's sample rate (16 kHz by default). Multi-channel
 audio is mean-pooled to mono. File I/O is the caller's responsibility
-— load your wav with `soundfile` / `torchaudio` / `librosa` and
-resample externally if the sample rate doesn't match.
+— load your wav with `soundfile` / `librosa` and resample externally
+if the sample rate doesn't match. (If you have a torch tensor, call
+`.numpy()` first — the package itself is torch-free at runtime.)
 
 `set_enrollment()` (no argument) or `clear_enrollment()` drops the
 registered d-vector. After a clear, `step()` becomes a passthrough —
@@ -67,9 +69,9 @@ when they walk away. Mid-stream re-enrollment (switching from speaker A
 to speaker B) is supported — every `set_enrollment` call resets the
 streaming state so old enhanced frames never bleed into the new mode.
 
-`step(pcm_frame)` accepts a numpy array or torch tensor of length
-`hop_length` (160 samples at 16 kHz). Output is always a CPU
-`torch.float32` tensor of the same length.
+`step(pcm_frame)` accepts a 1-D numpy float32 array of length
+`hop_length` (160 samples at 16 kHz). Output is always a 1-D
+`numpy.float32` array of the same length.
 
 ## What's in the box
 
@@ -85,11 +87,13 @@ streaming state so old enhanced frames never bleed into the new mode.
 ## What's *not* in the box
 
 The training-side concerns (losses, training loop, dataset preparation,
-ONNX export) live in the sibling `open-voicefilter-lite-cli` package
-and are deliberately **not** installed by this package. The internal
-modules (`audio.py`, `model.py`, `speaker_encoder.py`, `config.py`) are
-importable by full path for advanced / fine-tuning use, but they're
-not part of the public surface.
+ONNX export) live in the workspace-only `model` and `cli` packages
+and are deliberately **not** installed by this package. The only
+non-public module that ships in the wheel is `voicefilter_lite.mel_basis`
+(the small helper that builds the (n_freq, n_mels) mel filterbank and
+Hann window for the forward STFT — no torch, just `librosa.filters.mel`
+and `np.hanning`). Everything else in `voicefilter_lite.*` is part
+of the public surface.
 
 ## Custom models
 

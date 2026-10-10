@@ -30,27 +30,6 @@ from voicefilter_lite.hparams import HParams
 
 # ---- Cached transforms (constructed once, reused across calls) ----
 
-def make_mel_basis(hp: HParams, device: torch.device) -> torchaudio.transforms.MelSpectrogram:
-    """Build a torchaudio MelSpectrogram configured per HParams.
-
-    Returns log-mel filterbank energies. Always runs on CPU first then moves;
-    MelSpectrogram's mel basis is data-independent so device is irrelevant.
-    """
-    mel = torchaudio.transforms.MelSpectrogram(
-        sample_rate=hp.sample_rate,
-        n_fft=hp.n_fft,
-        win_length=hp.win_length,
-        hop_length=hp.hop_length,
-        n_mels=hp.n_mels,
-        power=2.0,                      # power spectrogram → |S|^2
-        center=False,                   # streaming: no future padding
-        window_fn=torch.hann_window,
-        mel_scale="htk",
-        normalized=False,
-    )
-    return mel
-
-
 def wav_to_log_mel(
     wav: torch.Tensor,
     hp: HParams,
@@ -219,8 +198,10 @@ def reconstruct_wav_from_logmel(
             wrapper's `step()` return value, stacked over time).
         hp: HParams (n_mels, n_fft, hop_length, win_length, sample_rate,
             log_mel_floor).
-        mel_transform: shared torchaudio `MelSpectrogram` from
-            `make_mel_basis(hp, ...)`. Carries the (n_freq, n_mels) mel
+        mel_transform: shared torchaudio `MelSpectrogram`
+            (constructed in the training loop — see
+            `model.dataset.HfTripletStream.__iter__` for the
+            canonical construction). Carries the (n_freq, n_mels) mel
             basis + the Hann window used in the forward STFT.
         ref_wav: (T_samples,) reference waveform, REQUIRED for
             ``method="phase"``. Same wav that was fed to `wav_to_log_mel`

@@ -5,9 +5,9 @@ Synthesises `--num-samples` mixed clips from the HF arrow cache that
 `voicefilter-cli dataset prepare` populated and runs the bundled
 VoiceFilter-Lite model on them so you can audition the result directly.
 The synthesis path is the module-level `synthesize_raw_sample` from
-`voicefilter_cli.dataset` — i.e. the exact same code the training
-iterator runs — so the audition samples have the same interference
-statistics as training:
+`model.dataset` — i.e. the exact same code the training iterator runs
+— so the audition samples have the same interference statistics as
+training:
 
   * target picked from LibriSpeech (first declared target source,
     `hp.target_sources[0]`); random-cropped to `hp.sample_length_samples`.
@@ -31,6 +31,13 @@ The model itself is the bundled ONNX (no checkpoint needed); the
 turnkey `StreamingVoiceFilter` does the d-vector extraction, the
 frame-by-frame log-mel / mask / OLA pipeline, and the PCM
 reconstruction.
+
+The example itself is torch-free: it uses numpy + soundfile +
+librosa. The synthesis step delegates to `model.dataset` (the
+workspace-only training library, which uses torch internally for
+sample-level tensor ops); the example only consumes the numpy view
+of the result. See [[project-train-inference-split]] for the
+package-boundary rationale.
 
 Prerequisite
 ------------
@@ -79,20 +86,19 @@ from typing import Optional
 
 import numpy as np
 import soundfile as sf
-import torch
 
-# Self-contained: add the lib's `src/` layout and the CLI's `src/` so
-# this works without `pip install -e .`.
+# Self-contained: add the lib's `src/` layout and the model package's
+# `src/` so this works without `pip install -e .`.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..",
     "packages", "open-voicefilter-lite", "src")))
 sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..",
-    "packages", "cli", "src")))
+    "packages", "model", "src")))
 
 from voicefilter_lite import StreamingVoiceFilter  # noqa: E402
 from voicefilter_lite.config import load_and_apply  # noqa: E402
 from voicefilter_lite.hparams import HParams  # noqa: E402
-from voicefilter_cli.dataset import (  # noqa: E402
+from model.dataset import (  # noqa: E402
     HfEntry,
     _build_target_index,
     _collect_babble_pool_entries,
@@ -108,7 +114,7 @@ NOISE_KIND_NOISE = "noise"
 NOISE_KIND_MUSIC = "music"
 
 
-def _save_wav(path: str, wav: torch.Tensor, sample_rate: int) -> None:
+def _save_wav(path: str, wav: np.ndarray, sample_rate: int) -> None:
     """Peak-normalise then write a 16-bit WAV.
 
     Peak normalisation keeps audibility consistent across the per-sample
@@ -116,10 +122,10 @@ def _save_wav(path: str, wav: torch.Tensor, sample_rate: int) -> None:
     the SNR scaling, but the listener's volume knob shouldn't have to
     chase the per-file energy. Hard-clips to ±1 only if a clip would clip.
     """
-    peak = wav.abs().max().clamp(min=1e-8)
+    peak = float(np.abs(wav).max()) if wav.size else 0.0
     if peak > 1.0:
         wav = wav / peak
-    sf.write(path, wav.numpy().astype(np.float32), sample_rate)
+    sf.write(path, wav.astype(np.float32, copy=False), sample_rate)
 
 
 # --------------------------------------------------------------------------- #
@@ -145,17 +151,14 @@ class SampleSummary:
     notes: list[str] = field(default_factory=list)
 
 
-def _stream_pcm_through(model: StreamingVoiceFilter, pcm: torch.Tensor) -> torch.Tensor:
+def _stream_pcm_through(model: StreamingVoiceFilter, pcm: np.ndarray) -> np.ndarray:
     """Slice `pcm` into `hop`-sized chunks, run `step`, concat the outputs."""
     hop = model.hop_length
     n_full = pcm.shape[-1] // hop
     if n_full == 0:
-        return torch.zeros(0, dtype=torch.float32)
-    out_chunks = [
-        model.step(pcm[i * hop:(i + 1) * hop].numpy())
-        for i in range(n_full)
-    ]
-    return torch.cat(out_chunks)[: n_full * hop]
+        return np.zeros(0, dtype=np.float32)
+    out_chunks = [model.step(pcm[i * hop:(i + 1) * hop]) for i in range(n_full)]
+    return np.concatenate(out_chunks)[: n_full * hop]
 
 
 def build_one_sample(
@@ -163,8 +166,8 @@ def build_one_sample(
     hp: HParams,
     rng: random.Random,
     target_spk: str,
-    target_wav_full: torch.Tensor,
-    enroll_wav: Optional[torch.Tensor],
+    target_wav_full: np.ndarray,
+    enroll_wav: Optional[np.ndarray],
     babble_spk_to_entries: dict[str, list[HfEntry]],
     noise_pool: list[HfEntry],
     music_pool: list[HfEntry],
@@ -185,7 +188,9 @@ def build_one_sample(
     notes: list[str] = []
 
     # 1) Synthesize the WAV-level sample using the SAME module-level
-    #    function the training iterator calls.
+    #    function the training iterator calls. `synthesize_raw_sample`
+    #    returns torch tensors (training-side), which we immediately
+    #    cast to numpy — the rest of this example never touches torch.
     if enroll_wav is None:
         enroll_full = target_wav_full
         notes.append("enrollment: self (single-utt speaker or 30%-roll)")
@@ -206,9 +211,9 @@ def build_one_sample(
         music_cfg=music_cfg,
         multi_type_prob=1.0,
     )
-    target_wav = raw.target_wav
-    interference_wav = raw.interference_wav
-    mixed_wav = raw.mixed_wav
+    target_wav = np.asarray(raw.target_wav.detach().cpu().numpy(), dtype=np.float32)
+    interference_wav = np.asarray(raw.interference_wav.detach().cpu().numpy(), dtype=np.float32)
+    mixed_wav = np.asarray(raw.mixed_wav.detach().cpu().numpy(), dtype=np.float32)
     noise_kind = raw.included_kinds
     snr_db = raw.snr_db
     detail = "+".join(noise_kind) if noise_kind else "silence"
@@ -288,10 +293,15 @@ def main() -> None:
 
     rng = random.Random(args.seed)
     np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
 
     # ---- Build target / interference pools ----
-    wav_loader = default_hf_wav_loader
+    # `default_hf_wav_loader` is a plain function (not a context
+    # manager) that returns a 1-D numpy float32 array. We invoke it
+    # directly rather than through a `with` block (older example
+    # versions used a now-removed context-manager API).
+    def _load(entry: HfEntry) -> np.ndarray:
+        return default_hf_wav_loader(entry, hp.sample_rate)
+    wav_loader = _load
     target_index = _build_target_index(hp)
     if not target_index:
         raise SystemExit(
@@ -333,16 +343,14 @@ def main() -> None:
         target_spk = rng.choice(speakers)
         spk_entries = target_index[target_spk]
         target_entry = rng.choice(spk_entries)
-        with wav_loader(target_entry) as loader:
-            target_wav_full = loader.get_full_wav()
+        target_wav_full = wav_loader(target_entry)
         # 70% same-spk-different-utt, 30% self (training's `__iter__`).
-        enroll_wav_full: Optional[torch.Tensor] = None
+        enroll_wav_full: Optional[np.ndarray] = None
         if len(spk_entries) > 1 and rng.random() < 0.7:
             for _ in range(20):
                 e = rng.choice(spk_entries)
                 if e != target_entry:
-                    with wav_loader(e) as loader:
-                        enroll_wav_full = loader.get_full_wav()
+                    enroll_wav_full = wav_loader(e)
                     break
 
         summary = build_one_sample(
@@ -356,16 +364,11 @@ def main() -> None:
         )
         summary.target_utt_id = target_entry.utt_id
         if enroll_wav_full is not None:
-            # Already resolved in the loop above; round-trip through
-            # the candidates to recover the utt_id we used.
-            for e in spk_entries:
-                if e != target_entry:
-                    # We can't fully reconstruct the rng's choice, but
-                    # the rolled enroll_wav was bounded to the first
-                    # 20 candidates — recording the *target* spk + the
-                    # mixed utterance id is enough for the summary.
-                    summary.enrollment_utt_id = f"(same spk as {target_entry.utt_id})"
-                    break
+            # We don't reconstruct the rng's choice exactly, but the
+            # 70%-same-spk enrollee was bounded to the first 20
+            # candidates — recording the *target* spk + the mixed
+            # utterance id is enough for the summary.
+            summary.enrollment_utt_id = f"(same spk as {target_entry.utt_id})"
         summaries.append(summary)
         print(f"[example04] sample {i:02d} — target_spk={target_spk} "
               f"SNR={summary.snr_db:+.1f} dB interference={summary.interference_detail}")

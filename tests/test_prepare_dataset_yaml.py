@@ -24,6 +24,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "packages" / "cli" / "src"))
 sys.path.insert(0, str(ROOT / "packages" / "open-voicefilter-lite" / "src"))
+sys.path.insert(0, str(ROOT / "packages" / "model" / "src"))
 
 from voicefilter_cli.prepare_dataset import _yaml_to_prepare_defaults  # noqa: E402
 from voicefilter_lite.config import load_config  # noqa: E402

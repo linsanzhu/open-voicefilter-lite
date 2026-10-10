@@ -61,7 +61,7 @@ from cyclopts import App, Parameter
 
 from voicefilter_lite.hparams import HParams, ResolvedSource, resolve_source
 from voicefilter_cli.hf import apply_hf_endpoint
-from voicefilter_cli.dataset import (
+from model.dataset import (
     INDEX_DIRNAME,
     MANIFEST_FILENAME,
     _cast_audio_no_decode,

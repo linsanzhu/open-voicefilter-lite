@@ -19,8 +19,9 @@ import argparse
 import os
 import sys
 
+import librosa
+import numpy as np
 import soundfile as sf
-import torch
 
 # Self-contained: add the lib's `src/` layout to sys.path so this works
 # without `pip install -e .`.
@@ -31,20 +32,17 @@ sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..",
 from voicefilter_lite import StreamingVoiceFilter
 
 
-def _load_audio_mono_16k(path: str, target_sr: int = 16000) -> torch.Tensor:
-    """Read a wav file → 1-D float32 tensor at `target_sr` mono."""
+def _load_audio_mono_16k(path: str, target_sr: int = 16000) -> np.ndarray:
+    """Read a wav file → 1-D float32 numpy array at `target_sr` mono."""
     wav, sr = sf.read(path, dtype="float32")
     if wav.ndim > 1:
         wav = wav.mean(axis=1)
     if sr != target_sr:
-        import torchaudio
-        wav = torchaudio.functional.resample(
-            torch.from_numpy(wav), sr, target_sr
-        ).numpy()
-    return torch.from_numpy(wav.astype("float32"))
+        wav = librosa.resample(wav, orig_sr=sr, target_sr=target_sr).astype(np.float32)
+    return wav.astype(np.float32, copy=False)
 
 
-def _stream_pcm_through(model: StreamingVoiceFilter, pcm: torch.Tensor) -> torch.Tensor:
+def _stream_pcm_through(model: StreamingVoiceFilter, pcm: np.ndarray) -> np.ndarray:
     """Slice `pcm` into `hop`-sized chunks, run `step`, concat the outputs.
 
     Drops the trailing partial chunk (a partial hop can't be fully
@@ -54,12 +52,9 @@ def _stream_pcm_through(model: StreamingVoiceFilter, pcm: torch.Tensor) -> torch
     n_full = pcm.shape[-1] // hop
     usable = n_full * hop
     if n_full == 0:
-        return torch.zeros(0, dtype=torch.float32)
-    out_chunks = [
-        model.step(pcm[i * hop:(i + 1) * hop].numpy())
-        for i in range(n_full)
-    ]
-    return torch.cat(out_chunks)[:usable]
+        return np.zeros(0, dtype=np.float32)
+    out_chunks = [model.step(pcm[i * hop:(i + 1) * hop]) for i in range(n_full)]
+    return np.concatenate(out_chunks)[:usable]
 
 
 def main() -> None:
@@ -83,11 +78,11 @@ def main() -> None:
 
     enhanced = _stream_pcm_through(model, mixed)
 
-    peak = enhanced.abs().max().clamp(min=1e-8)
-    if peak > 1.0:
+    peak = float(np.abs(enhanced).max())
+    if peak > 1e-8 and peak > 1.0:
         enhanced = enhanced / peak
 
-    sf.write(args.out, enhanced.numpy(), 16000)
+    sf.write(args.out, enhanced.astype(np.float32), 16000)
     print(f"[offline] wrote {args.out} ({enhanced.shape[-1] / 16000:.2f}s)")
 
 

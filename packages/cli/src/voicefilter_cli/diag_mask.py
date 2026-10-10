@@ -36,7 +36,7 @@ import soundfile as sf
 import torch
 from cyclopts import App, Parameter
 
-from voicefilter_lite.audio import (
+from model.audio import (
     extract_dvec,
     make_mel_basis,
     pad_or_trim,
@@ -45,14 +45,14 @@ from voicefilter_lite.audio import (
     wav_to_log_mel,
 )
 from voicefilter_cli.hf import apply_hf_endpoint
-from voicefilter_cli.dataset import (
+from model.dataset import (
     _cast_audio_no_decode,
     _disable_hf_audio_decode,
     first_librispeech_other_source,
 )
 from voicefilter_lite.hparams import HParams, resolve_source
-from voicefilter_lite.model import VoiceFilterLite
-from voicefilter_lite.speaker_encoder import SpeakerEncoder
+from model.nn import VoiceFilterLite
+from model.speaker_encoder import SpeakerEncoder
 
 # Threshold for input frame energy buckets (log-mel mean across bins).
 # log_mel_floor=1e-6 → log(1e-6)≈-13.8 is the absolute silence floor.

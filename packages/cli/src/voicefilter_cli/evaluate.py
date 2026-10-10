@@ -29,7 +29,7 @@ import soundfile as sf
 import torch
 from cyclopts import App, Parameter
 
-from voicefilter_lite.audio import (
+from model.audio import (
     extract_dvec,
     make_mel_basis,
     pad_or_trim,
@@ -37,16 +37,16 @@ from voicefilter_lite.audio import (
     snr_mix,
     wav_to_log_mel,
 )
-from voicefilter_cli.dataset import first_librispeech_other_source
+from model.dataset import first_librispeech_other_source
 from voicefilter_cli.hf import apply_hf_endpoint
-from voicefilter_cli.dataset import (
+from model.dataset import (
     _cast_audio_no_decode,
     _disable_hf_audio_decode,
 )
 from voicefilter_lite.hparams import HParams, resolve_source
-from voicefilter_lite.model import VoiceFilterLite
+from model.nn import VoiceFilterLite
 from voicefilter_lite.streaming import StreamingVoiceFilter
-from voicefilter_lite.speaker_encoder import SpeakerEncoder
+from model.speaker_encoder import SpeakerEncoder
 
 # ---- SI-SNR / SDR ----
 
@@ -73,7 +73,7 @@ def log_mel_snr(
     eps: float = 1e-8,
 ) -> tuple[float, float, float]:
     """Compute SI-SNR in the **linear-mel** domain. The model itself operates
-    on linear-mel filterbank energies (`voicefilter_lite.model.apply_mask` applies
+    on linear-mel filterbank energies (`model.nn.apply_mask` applies
     the mask to magnitude then re-logs), so this metric is the cleanest
     phase-free proxy for how well VoiceFilter recovers the target's spectral
     envelope.

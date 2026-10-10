@@ -27,15 +27,15 @@ import soundfile as sf
 import torch
 import torch.nn.functional as F
 
-from voicefilter_lite.audio import extract_dvec, pad_or_trim
+from model.audio import extract_dvec, pad_or_trim
 from voicefilter_lite.hparams import HParams
-from voicefilter_lite.speaker_encoder import SpeakerEncoder
+from model.speaker_encoder import SpeakerEncoder
 
 
 def dvec_onnx(onnx_path: str, wav: torch.Tensor, hp: HParams) -> torch.Tensor:
     """Replicate `extract_dvec` against an ONNX d-vector encoder."""
     # Reuse the same audio preprocessing the PyTorch path uses.
-    from voicefilter_lite.audio import wav_to_dvec_mel
+    from model.audio import wav_to_dvec_mel
 
     feat = wav_to_dvec_mel(wav, hp)
     if feat.dim() == 2:

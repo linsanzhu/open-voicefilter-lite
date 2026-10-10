@@ -49,13 +49,13 @@ warnings.filterwarnings(
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 
-from voicefilter_cli.dataset import HfTripletStream, collate_triplets
+from model.dataset import HfTripletStream, collate_triplets
 from voicefilter_cli.hf import apply_hf_endpoint
-from voicefilter_cli.losses import build_loss, linear_mel_si_snr_per_sample
-from voicefilter_lite.audio import log_mel_to_linear
+from model.losses import build_loss, linear_mel_si_snr_per_sample
+from model.audio import log_mel_to_linear
 from voicefilter_lite.config import load_and_apply
 from voicefilter_lite.hparams import HParams
-from voicefilter_lite.model import VoiceFilterLite, apply_mask
+from model.nn import VoiceFilterLite, apply_mask
 
 
 # ---- Background prefetch ----

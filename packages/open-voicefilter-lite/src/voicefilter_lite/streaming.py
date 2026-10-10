@@ -6,14 +6,15 @@ it hands back enhanced PCM, one chunk at a time:
 
     from voicefilter_lite import StreamingVoiceFilter
     import soundfile as sf
+    import numpy as np
     sf_vfl = StreamingVoiceFilter()               # uses bundled ONNX
     enroll, sr = sf.read("target_speaker.wav", dtype="float32")
     if sr != sf_vfl.hp.sample_rate:
         # resample externally to hp.sample_rate
         ...
-    sf_vfl.set_enrollment(enroll)                 # numpy / torch tensor PCM
+    sf_vfl.set_enrollment(enroll)                 # numpy float32 1-D PCM
     for chunk in microphone_stream:               # each chunk is hp.hop_length samples
-        enhanced = sf_vfl.step(chunk)             # same shape, same dtype
+        enhanced = sf_vfl.step(chunk)             # numpy float32 1-D, same length
 
 The bundled ONNX models carry their own hyperparameters in
 `metadata_props` (see `voicefilter_cli._onnx_metadata`), so the
@@ -21,6 +22,12 @@ hyperparameter details (n_fft, win_length, adaptive β, ...) are read
 out of the model at construction time and never need to be set by the
 caller. Advanced users can override via the optional `mask_model` /
 `dvector_model` constructor kwargs.
+
+This module is **torch-free at runtime** — it uses numpy, scipy
+implicitly via librosa, and onnxruntime. The training-side DSP
+(`wav_to_log_mel`, `extract_dvec`, `reconstruct_wav_from_logmel`, ...)
+lives in the workspace-only `model` package, which is the only place
+torch / torchaudio is allowed to appear.
 
 Per-step pipeline
 -----------------
@@ -49,12 +56,12 @@ Per-step pipeline
    Return the last `hop` samples — the "newly determined" hop, which
    is the only region covered by all L frames' windows.
 
-PCM reconstruction uses the hand-rolled OLA loop (matching
-`audio.reconstruct_wav_from_logmel`) because the shipped mask ONNX
-has `n_fft=1200, win_length=640` and `torch.istft(center=False)` trips
-on Hann window zero-endpoints ("window overlap add min: 1" — known
-limitation). Using the hand-rolled loop is also a single-file, no-
-iteration, no-Griffin-Lim path: it borrows the input phase and
+PCM reconstruction uses the hand-rolled OLA loop (matching the
+training-side `reconstruct_wav_from_logmel`) because the shipped mask
+ONNX has `n_fft=1200, win_length=640` and `torch.istft(center=False)`
+trips on Hann window zero-endpoints ("window overlap add min: 1" —
+known limitation). Using the hand-rolled loop is also a single-file,
+no-iteration, no-Griffin-Lim path: it borrows the input phase and
 re-uses the Hann window the forward STFT used, so the OLA lines up
 exactly with the training inference.
 
@@ -72,15 +79,11 @@ from __future__ import annotations
 
 from importlib import resources
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional
 
 import numpy as np
-import torch
 
 from voicefilter_lite.hparams import HParams
-
-
-ArrayLike = Union[np.ndarray, torch.Tensor]
 
 
 # ---------------------------------------------------------- bundled model paths
@@ -116,44 +119,45 @@ def _bundled_path(filename: str) -> str:
 
 # ---------------------------------------------------------- per-step machinery
 
-def _to_pcm_tensor(audio: ArrayLike) -> torch.Tensor:
-    """Coerce a wav-like input to a 1-D float32 CPU tensor.
+def _to_pcm_array(audio: np.ndarray) -> np.ndarray:
+    """Coerce a wav-like input to a 1-D float32 numpy array.
 
-    Accepts numpy arrays or torch tensors. Multi-channel (T, C) or
-    (C, T) inputs are mean-pooled to mono. (T,) is returned as-is.
-    Non-float dtypes are cast to float32.
+    Accepts a 1-D `(T,)` array (returned as-is) or a 2-D `(T, C)` /
+    `(C, T)` array (mean-pooled to mono along the last axis). Any other
+    type or rank raises.
+
+    Why we don't duck-type torch tensors: the published package is
+    torch-free. If you have a torch tensor, call `.numpy()` (and
+    `.cpu()` if it's on GPU) yourself before passing it in.
     """
-    if isinstance(audio, torch.Tensor):
-        t = audio.detach().cpu().float()
-    elif isinstance(audio, np.ndarray):
-        t = torch.from_numpy(np.ascontiguousarray(audio)).float()
-    else:
+    if not isinstance(audio, np.ndarray):
         raise TypeError(
-            f"audio must be a numpy array or torch tensor, got {type(audio).__name__}"
+            f"audio must be a numpy array, got {type(audio).__name__}"
         )
-    if t.dim() == 2:
+    a = np.ascontiguousarray(audio, dtype=np.float32)
+    if a.ndim == 2:
         # Mean-pool multi-channel down to mono. Channels-last (T, C)
         # is the convention for `soundfile.read`; (C, T) is the
         # torchaudio convention — either way mean over the last dim
         # collapses channels correctly.
-        t = t.mean(dim=-1)
-    elif t.dim() != 1:
+        a = a.mean(axis=-1)
+    elif a.ndim != 1:
         raise ValueError(
-            f"audio must be 1-D (T,) or 2-D (T, C) / (C, T); got shape {tuple(t.shape)}"
+            f"audio must be 1-D (T,) or 2-D (T, C) / (C, T); got shape {a.shape}"
         )
-    return t
+    return a
 
 
 # ---------------------------------------------------------- d-vector ONNX setup
 
 def _extract_dvec(
-    wav: torch.Tensor,
+    wav: np.ndarray,
     hp: HParams,
     dvec_session,                   # onnxruntime.InferenceSession (duck-typed)
 ) -> np.ndarray:
     """(T,) @ hp.sample_rate → (hp.d_vector_dim,) L2-normalised d-vector.
 
-    Mirrors `audio.extract_dvec` (paper §3.1) exactly, with the
+    Mirrors `model.audio.extract_dvec` (paper §3.1) exactly, with the
     `encoder.forward` call replaced by an onnxruntime session.run
     call. The recipe is locked to match the pretrained embedder:
 
@@ -165,7 +169,7 @@ def _extract_dvec(
     """
     import librosa
 
-    wav_np = wav.detach().cpu().numpy().astype(np.float32)
+    wav_np = np.ascontiguousarray(wav, dtype=np.float32)
     # 1) Log-mel fbank (librosa, hamming window, no center pad).
     S = librosa.feature.melspectrogram(
         y=wav_np,
@@ -224,11 +228,12 @@ class StreamingVoiceFilter:
     Typical use::
 
         import soundfile as sf
+        import numpy as np
         enroll, sr = sf.read("enroll.wav", dtype="float32")   # load yourself
         if sr != 16000:
             ...                                               # resample
         sf = StreamingVoiceFilter()                           # bundled models
-        sf.set_enrollment(enroll)                              # numpy / torch PCM
+        sf.set_enrollment(enroll)                              # numpy float32 1-D PCM
         for chunk in mic_stream:                              # each chunk is hp.hop samples
             out = sf.step(chunk)                              # enhanced PCM, same shape
     """
@@ -304,23 +309,25 @@ class StreamingVoiceFilter:
         # ---- Cached mel basis (paper §3.2 forward) and its pseudo-inverse (for §3.4 inverse).
         # Built once per (sample_rate, n_fft, n_mels). The basis itself
         # is (n_freq, n_mels). The pseudo-inverse of `fb.T` (shape
-        # (n_mels, n_freq)) is (n_freq, n_mels) — `torch.linalg.pinv`
-        # swaps dims — so the inverse projection
-        # `mel_pinv @ linear_mel` maps (n_mels,) → (n_freq,) and
-        # `fb.T @ mag2` does the forward projection (n_freq,) → (n_mels,).
-        from voicefilter_lite.audio import make_mel_basis
-        self._mel = make_mel_basis(self.hp, torch.device("cpu"))
-        self._mel_fb = self._mel.mel_scale.fb.cpu()         # (n_freq, n_mels)
-        self._mel_pinv = torch.linalg.pinv(
-            self._mel_fb.transpose(-1, -2), rcond=0.1
-        )                                                  # (n_freq, n_mels)
+        # (n_mels, n_freq)) is (n_freq, n_mels) — `np.linalg.pinv` swaps
+        # dims — so the inverse projection `mel_pinv @ linear_mel` maps
+        # (n_mels,) → (n_freq,) and `fb.T @ mag2` does the forward
+        # projection (n_freq,) → (n_mels,).
+        from voicefilter_lite.mel_basis import make_mel_basis
+        self._mel = make_mel_basis(self.hp)
+        self._mel_fb = self._mel.fb                            # (n_freq, n_mels)
+        self._mel_pinv = np.linalg.pinv(
+            self._mel_fb.T, rcond=0.1
+        )                                                      # (n_freq, n_mels)
 
         # ---- Cached Hann window (paper §3.2 forward STFT).
-        # We use the SAME window the torchaudio MelSpectrogram uses
-        # internally (`make_mel_basis` sets `window_fn=hann_window`),
-        # so the forward STFT in `step` and the inverse OLA over
-        # `_spec_buf` are perfectly aligned.
-        self._hann = self._mel.spectrogram.window.cpu()     # (win_length,)
+        # We use the SAME window the training pipeline's torchaudio
+        # MelSpectrogram used internally (`np.hanning` matches
+        # `torch.hann_window(periodic=True)`), so the forward STFT in
+        # `step` and the inverse OLA over `_spec_buf` are perfectly
+        # aligned with the training-time features the ONNX weights
+        # were learned on.
+        self._hann = self._mel.hann                            # (win_length,)
 
         # ---- Streaming state.
         # Number of frames that fit in the audio buffer.
@@ -331,20 +338,20 @@ class StreamingVoiceFilter:
 
         self._h: Optional[np.ndarray] = None
         self._c: Optional[np.ndarray] = None
-        self._context: list[torch.Tensor] = []
-        self._audio_buf: Optional[torch.Tensor] = None
-        self._spec_buf: Optional[torch.Tensor] = None
+        self._context: list[np.ndarray] = []
+        self._audio_buf: Optional[np.ndarray] = None
+        self._spec_buf: Optional[np.ndarray] = None
         self._w: float = 0.0
         self._dvec: Optional[np.ndarray] = None
 
         self.reset_state()
 
     # ----------------------------------------------------------------- public
-    def set_enrollment(self, audio: Optional[ArrayLike] = None) -> None:
+    def set_enrollment(self, audio: Optional[np.ndarray] = None) -> None:
         """Register the target speaker from PCM audio (or clear enrollment).
 
         Args:
-            audio: 1-D numpy array or torch tensor of PCM samples at
+            audio: 1-D numpy float32 array of PCM samples at
                 `hp.sample_rate` (16 kHz by default). Multi-channel
                 (T, C) or (C, T) inputs are mean-pooled to mono.
 
@@ -358,9 +365,9 @@ class StreamingVoiceFilter:
                 state is reset on every call (clear and re-enroll alike).
 
         Note: file I/O is the caller's responsibility. To enroll from
-        a wav file, load it yourself first (e.g. with `soundfile` or
-        `torchaudio`) and resample to `hp.sample_rate` if needed.
-        Pass the resulting numpy array / torch tensor here.
+        a wav file, load it yourself first (e.g. with `soundfile`) and
+        resample to `hp.sample_rate` if needed. Pass the resulting
+        numpy array here.
         """
         if audio is None:
             # Caller is explicitly clearing — drop the d-vector and
@@ -371,14 +378,14 @@ class StreamingVoiceFilter:
             self._dvec = None
             self.reset_state()
             return
-        wav = _to_pcm_tensor(audio)
-        if wav.numel() < int(0.1 * self.hp.sample_rate):
+        wav = _to_pcm_array(audio)
+        if wav.size < int(0.1 * self.hp.sample_rate):
             # 100 ms of audio is the practical minimum the
             # d-vector pipeline needs to produce a stable speaker
             # embedding (4 sliding windows at default settings).
             raise ValueError(
-                f"Enrollment audio too short: {wav.numel()} samples "
-                f"({wav.numel() / self.hp.sample_rate:.2f}s); need at "
+                f"Enrollment audio too short: {wav.size} samples "
+                f"({wav.size / self.hp.sample_rate:.2f}s); need at "
                 f"least 0.1s for a stable d-vector."
             )
         self._dvec = _extract_dvec(wav, self.hp, self._dvec_sess)
@@ -408,22 +415,20 @@ class StreamingVoiceFilter:
         self._h = np.zeros((L, 1, H), dtype=np.float32)
         self._c = np.zeros((L, 1, H), dtype=np.float32)
         self._context = []
-        self._audio_buf = torch.zeros(self._audio_buf_len, dtype=torch.float32)
-        self._spec_buf = torch.zeros(self._n_freq, self._L, dtype=torch.complex64)
+        self._audio_buf = np.zeros(self._audio_buf_len, dtype=np.float32)
+        self._spec_buf = np.zeros((self._n_freq, self._L), dtype=np.complex64)
         self._w = 0.0
 
-    @torch.no_grad()
-    def step(self, pcm_frame: ArrayLike) -> torch.Tensor:
+    def step(self, pcm_frame: np.ndarray) -> np.ndarray:
         """Process one hop of PCM, return one hop of enhanced PCM.
 
         Args:
-            pcm_frame: 1-D numpy array or torch tensor of length
-                exactly `hp.hop_length` samples (16 kHz). Any
-                deviation raises `ValueError`.
+            pcm_frame: 1-D numpy float32 array of length exactly
+                `hp.hop_length` samples (16 kHz). Any deviation raises
+                `ValueError`.
 
         Returns:
-            1-D torch tensor of length `hp.hop_length`, float32,
-            on CPU.
+            1-D numpy float32 array of length `hp.hop_length`.
 
         If no enrollment is currently set (i.e. `set_enrollment` was
         never called, or was called with `None`), the input is passed
@@ -440,7 +445,7 @@ class StreamingVoiceFilter:
         # Coerce input once for both the passthrough and the
         # enhanced paths so the hop-length check fires regardless of
         # the enrollment state.
-        t = _to_pcm_tensor(pcm_frame)
+        t = _to_pcm_array(pcm_frame)
         if t.shape[-1] != self.hp.hop_length:
             raise ValueError(
                 f"pcm_frame length {t.shape[-1]} != hp.hop_length "
@@ -449,53 +454,57 @@ class StreamingVoiceFilter:
         if self._dvec is None:
             # Passthrough: no d-vector registered, so there's nothing
             # to extract the target speaker for. Return the input
-            # chunk as-is, on CPU, in the same dtype the rest of the
-            # API returns. We deliberately do NOT touch the audio /
-            # spec / LSTM buffers here — `reset_state` already wiped
-            # them at clear-time, and we want the next
+            # chunk as-is in float32. We deliberately do NOT touch the
+            # audio / spec / LSTM buffers here — `reset_state` already
+            # wiped them at clear-time, and we want the next
             # `set_enrollment(pcm)` to start from a clean slate, not
             # from a buffer half-filled with passthrough samples that
             # would then bleed into the first enhanced frames.
-            return t.detach().cpu().to(torch.float32)
+            return t.astype(np.float32, copy=False)
         hp = self.hp
 
         # 1) Slide audio buffer.
-        self._audio_buf = torch.cat(
-            [self._audio_buf[hp.hop_length:], t.to(torch.float32)]
+        t_f32 = t.astype(np.float32, copy=False)
+        self._audio_buf = np.concatenate(
+            [self._audio_buf[hp.hop_length:], t_f32]
         )
 
         # 2) STFT the new frame (Hann window, center=False, no zero pad).
-        # `make_mel_basis` already uses `center=False, n_fft, win_length,
-        # hann_window` — but it does its own padding, so we replicate
-        # the same forward STFT explicitly to keep the buffer /
-        # window relationship crystal-clear.
-        win_padded = torch.zeros(hp.n_fft, dtype=torch.float32)
+        # `make_mel_basis` builds the same Hann window the training
+        # pipeline's `torchaudio.MelSpectrogram` used, so the forward
+        # STFT here matches the features the ONNX weights were learned
+        # on bit-for-bit. We replicate the forward STFT explicitly
+        # here (rather than calling a one-liner from `audio.py`) to
+        # keep the buffer / window / phase relationship crystal-clear
+        # in this single file.
+        win_padded = np.zeros(hp.n_fft, dtype=np.float32)
         win_padded[: hp.win_length] = self._hann
         frame_audio = self._audio_buf[-hp.n_fft:]
-        spec = torch.fft.rfft(frame_audio * win_padded)     # (n_freq,) complex
+        spec = np.fft.rfft(frame_audio * win_padded)     # (n_freq,) complex128
+        spec = spec.astype(np.complex64)                 # match _spec_buf dtype
 
         # 3) Linear-mel via the cached basis, then log.
-        mag2 = spec.abs().pow(2)                             # (n_freq,)
-        linear_mel = self._mel_fb.T @ mag2                    # (n_mels,)
-        log_mel = torch.log(linear_mel + hp.log_mel_floor)    # (n_mels,)
+        mag2 = (spec.real ** 2 + spec.imag ** 2).astype(np.float32)  # (n_freq,)
+        linear_mel = self._mel_fb.T @ mag2                              # (n_mels,)
+        log_mel = np.log(linear_mel + hp.log_mel_floor)                 # (n_mels,)
 
         # 4) Frame stacking with left zero-padding (matches training).
         stacked = self._stack_context(log_mel)               # (1, frame_stack, n_mels)
 
         # 5) Run mask ONNX.
         feed = {
-            "stacked_logmel": stacked.reshape(1, 1, -1).numpy().astype(np.float32),
+            "stacked_logmel": stacked.reshape(1, 1, -1).astype(np.float32),
             "dvec":           self._dvec.reshape(1, -1) if self._dvec.shape[0] != 1 else self._dvec,
             "h0":             self._h,
             "c0":             self._c,
         }
         mask_np, fa_np, self._h, self._c = self._mask_sess.run(None, feed)
-        mask = torch.from_numpy(np.asarray(mask_np).reshape(-1)).float()
+        mask = np.asarray(mask_np).reshape(-1).astype(np.float32)
         f_adapt = float(np.asarray(fa_np).reshape(-1)[0])
 
         # 6) Mask + adaptive suppression in linear-mel (paper §3.2 / §3.4).
-        raw_lin = (torch.exp(log_mel) - hp.log_mel_floor).clamp(min=0.0)
-        filtered_lin = (mask * raw_lin).clamp(min=0.0)
+        raw_lin = np.maximum(np.exp(log_mel) - hp.log_mel_floor, 0.0)
+        filtered_lin = np.maximum(mask * raw_lin, 0.0)
         a, b, beta = hp.adaptive_w_a, hp.adaptive_w_b, hp.adaptive_w_beta
         target = a * f_adapt + b
         self._w = max(0.0, min(1.0, beta * self._w + (1.0 - beta) * target))
@@ -504,25 +513,25 @@ class StreamingVoiceFilter:
         # 7) Lift enhanced linear-mel back to linear-spectrum, then paint
         #    the input's phase on top (the mic phase the model never
         #    sees; combining it with the model's enhanced magnitude
-        #    is the "re-skin" trick — see `audio.reconstruct_wav_from_logmel`).
-        enh_mag2 = (self._mel_pinv @ enhanced_lin).clamp(min=0.0)
-        enh_spec = torch.sqrt(enh_mag2) * torch.exp(1j * torch.angle(spec))
+        #    is the "re-skin" trick — see `model.audio.reconstruct_wav_from_logmel`).
+        enh_mag2 = np.maximum(self._mel_pinv @ enhanced_lin, 0.0)
+        enh_spec = (
+            np.sqrt(enh_mag2) * np.exp(1j * np.angle(spec))
+        ).astype(np.complex64)
 
         # 8) Push to spec buffer (drop oldest, append newest).
-        self._spec_buf = torch.cat(
-            [self._spec_buf[:, 1:], enh_spec.unsqueeze(-1).to(torch.complex64)],
-            dim=-1,
+        self._spec_buf = np.concatenate(
+            [self._spec_buf[:, 1:], enh_spec.reshape(-1, 1)],
+            axis=-1,
         )
 
         # 9) Reconstruct audio via hand-rolled OLA over the spec buffer.
         #    `wss` is precomputed in __init__ (constant — depends only on
-        #    L, hop, n_fft, win_length, hann). See audio.py's
-        #    `reconstruct_wav_from_logmel` for the same recipe.
-        ola = torch.zeros(self._audio_buf_len, dtype=torch.float32)
+        #    L, hop, n_fft, win_length, hann). See
+        #    `model.audio.reconstruct_wav_from_logmel` for the same recipe.
+        ola = np.zeros(self._audio_buf_len, dtype=np.float32)
         for t in range(self._L):
-            frame_time = torch.fft.irfft(
-                self._spec_buf[:, t], n=hp.n_fft
-            )
+            frame_time = np.fft.irfft(self._spec_buf[:, t], n=hp.n_fft)
             if hp.n_fft != hp.win_length:
                 frame_time = frame_time[..., : hp.win_length]
             start = t * hp.hop_length
@@ -543,11 +552,11 @@ class StreamingVoiceFilter:
         # explicitly slice into the "fully covered" region.
         newest_hop_start = (self._L - 1) * hp.hop_length
         newest_hop_end = newest_hop_start + hp.hop_length
-        return ola[newest_hop_start:newest_hop_end].detach().cpu()
+        return ola[newest_hop_start:newest_hop_end]
 
     # ---------------------------------------------------------------- helpers
-    def _stack_context(self, frame_logmel: torch.Tensor) -> torch.Tensor:
-        """Right-align the new log-mel frame into a `(1, frame_stack, n_mels)` tensor.
+    def _stack_context(self, frame_logmel: np.ndarray) -> np.ndarray:
+        """Right-align the new log-mel frame into a `(1, frame_stack, n_mels)` array.
 
         Left-padded with zeros for the first `frame_stack-1` calls —
         same warm-up pattern as the training pipeline (`frame_stack_left`).
@@ -557,13 +566,13 @@ class StreamingVoiceFilter:
         self._context.append(frame_logmel)
         if len(self._context) > stack:
             self._context = self._context[-stack:]
-        stacked = torch.zeros(1, stack, n_mels, dtype=torch.float32)
+        stacked = np.zeros((1, stack, n_mels), dtype=np.float32)
         offset = stack - len(self._context)
         for i, f in enumerate(self._context):
             stacked[0, offset + i] = f
         return stacked
 
-    def _compute_wss(self) -> torch.Tensor:
+    def _compute_wss(self) -> np.ndarray:
         """Precompute the per-sample window² sum for the OLA normaliser.
 
         Constant for the lifetime of the instance: depends only on
@@ -582,9 +591,9 @@ class StreamingVoiceFilter:
         # Place a `win`-length slice of `win^2` at every frame position,
         # then sum overlaps. This is `reconstruct_wav_from_logmel`'s
         # `wss` accumulation, but precomputed once.
-        win_padded = torch.zeros(n_fft, dtype=torch.float32)
+        win_padded = np.zeros(n_fft, dtype=np.float32)
         win_padded[:win_length] = win
-        wss = torch.zeros(self._audio_buf_len, dtype=torch.float32)
+        wss = np.zeros(self._audio_buf_len, dtype=np.float32)
         for t in range(L):
             start = t * hop
             wss[start:start + win_length] += win_padded[:win_length] ** 2

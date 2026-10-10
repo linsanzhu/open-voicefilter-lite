@@ -34,13 +34,13 @@ from cyclopts import App, Parameter
 
 from datasets import load_dataset
 from voicefilter_cli.hf import apply_hf_endpoint
-from voicefilter_cli.dataset import (
+from model.dataset import (
     _disable_hf_audio_decode,
     _cast_audio_no_decode,
 )
 from voicefilter_lite.hparams import HParams, resolve_source
-from voicefilter_lite.audio import extract_dvec, pad_or_trim
-from voicefilter_lite.speaker_encoder import SpeakerEncoder
+from model.audio import extract_dvec, pad_or_trim
+from model.speaker_encoder import SpeakerEncoder
 
 def decode_audio(audio_field, target_sr):
     if isinstance(audio_field, dict):

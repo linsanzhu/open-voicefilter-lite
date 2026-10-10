@@ -48,18 +48,28 @@ PyTorch state_dict that loads with no key remapping.
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# Make the model + inference source dirs importable when running this
+# file directly. Training library lives in `packages/model/`; HParams +
+# ONNX metadata parsing in `packages/open-voicefilter-lite/`.
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "packages" / "model" / "src"))
+sys.path.insert(0, str(ROOT / "packages" / "open-voicefilter-lite" / "src"))
+
 import torch
 
-from voicefilter_cli.dataset import _per_frame_overlap_label
+from model.dataset import _per_frame_overlap_label
 from voicefilter_lite.hparams import HParams
-from voicefilter_cli.losses import (
+from model.losses import (
     AsymmetricL2Loss,
     build_loss,
     hinge_loss,
     linear_mel_si_snr_per_sample,
 )
-from voicefilter_lite.audio import linear_to_log_mel
-from voicefilter_lite.model import VoiceFilterLite, apply_mask
+from model.audio import linear_to_log_mel
+from model.nn import VoiceFilterLite, apply_mask
 
 
 def _select_device() -> torch.device:
@@ -75,7 +85,7 @@ def test_dvector_encoder_construct_only(hp: HParams) -> None:
     The actual weight load happens lazily inside `forward`, so the
     constructor + submodules are the only smoke-checkable surface.
     """
-    from voicefilter_lite.speaker_encoder import SpeakerEncoder
+    from model.speaker_encoder import SpeakerEncoder
 
     enc = SpeakerEncoder(hp)
     assert enc.lstm.num_layers == hp.dvector_lstm_layers, (
@@ -113,7 +123,7 @@ def test_speaker_encoder_only(hp: HParams) -> None:
     `hp.d_vector_dim` is fixed at 256. `HParams(speaker_encoder=...)` is
     no longer a supported kwarg, so the only path is the default.
     """
-    from voicefilter_lite.speaker_encoder import SpeakerEncoder
+    from model.speaker_encoder import SpeakerEncoder
 
     enc = SpeakerEncoder(hp)
     assert enc.lstm.input_size == hp.dvector_n_mels
@@ -139,8 +149,8 @@ def test_extract_dvec_pipeline(hp: HParams, device: torch.device) -> None:
     the test verifies shape + L2-norm contract, not d-vector quality.
     The latter is `voicefilter-cli verify-dvec`'s job.
     """
-    from voicefilter_lite.audio import extract_dvec, wav_to_dvec_mel
-    from voicefilter_lite.speaker_encoder import SpeakerEncoder
+    from model.audio import extract_dvec, wav_to_dvec_mel
+    from model.speaker_encoder import SpeakerEncoder
 
     enc = SpeakerEncoder(hp).to(device).eval()
     enc.freeze()
@@ -558,7 +568,7 @@ def test_activity_burst_no_oob() -> None:
     """
     import random
 
-    from voicefilter_cli.dataset import _sample_activity_burst
+    from model.dataset import _sample_activity_burst
 
     hp = HParams()  # sample_len=48000, fade_ms=50.0, sr=16000
     rng = random.Random(5017)

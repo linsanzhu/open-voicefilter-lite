@@ -35,14 +35,14 @@ import torch
 import torch.linalg as la
 from cyclopts import App, Parameter
 
-from voicefilter_lite.audio import (
+from model.audio import (
     extract_dvec,
     make_mel_basis,
     pad_or_trim,
 )
 from voicefilter_lite.hparams import HParams
-from voicefilter_lite.model import VoiceFilterLite
-from voicefilter_lite.speaker_encoder import SpeakerEncoder
+from model.nn import VoiceFilterLite
+from model.speaker_encoder import SpeakerEncoder
 
 def compute_si_sdr(estimate: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> float:
     """Scale-invariant SDR in dB. Both inputs (T,) mono."""

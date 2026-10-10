@@ -15,7 +15,6 @@ import sys
 
 import numpy as np
 import soundfile as sf
-import torch
 
 # Make the lib importable when running from the repo root.
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -97,14 +96,13 @@ def _test_set_enrollment_rejects_path() -> None:
 
 
 def _test_set_enrollment_array_tensor() -> None:
-    """`set_enrollment(array)` and `set_enrollment(tensor)` both work."""
+    """`set_enrollment(array)` accepts 1-D and 2-D numpy float32 arrays."""
     from voicefilter_lite import StreamingVoiceFilter
 
     sfm = StreamingVoiceFilter()
     sfm.set_enrollment(np.random.randn(16000 * 2).astype(np.float32))
-    sfm.set_enrollment(torch.randn(16000 * 2))
     sfm.set_enrollment(np.random.randn(16000 * 2, 2).astype(np.float32))  # multi-channel
-    print("  set_enrollment(array / tensor / multi-channel) OK")
+    print("  set_enrollment(numpy 1-D / 2-D) OK")
 
 
 def _test_step_pcm_loop() -> None:
@@ -119,13 +117,14 @@ def _test_step_pcm_loop() -> None:
     np.random.seed(42)
     in_chunks = [np.random.randn(hop).astype(np.float32) * 0.3 for _ in range(n_iters)]
     out_chunks = [sfm.step(c) for c in in_chunks]
-    out = torch.cat(out_chunks)
+    out = np.concatenate(out_chunks)
     assert out.shape == (hop * n_iters,), f"out shape {out.shape} != ({hop * n_iters},)"
-    assert bool(torch.isfinite(out).all()), "out has non-finite values"
+    assert out.dtype == np.float32, f"out dtype {out.dtype} != float32"
+    assert bool(np.isfinite(out).all()), "out has non-finite values"
     # Some real audio must come out (otherwise the model is dead).
-    assert float(out.abs().max()) > 0.0, "out is all zeros — model not running"
+    assert float(np.abs(out).max()) > 0.0, "out is all zeros — model not running"
     print(
-        f"  step(pcm) loop OK — {n_iters} hops, output mean abs={float(out.abs().mean()):.4f}"
+        f"  step(pcm) loop OK — {n_iters} hops, output mean abs={float(np.abs(out).mean()):.4f}"
     )
 
 
@@ -143,7 +142,7 @@ def _test_input_validation() -> None:
     pcm_in = np.random.randn(160).astype(np.float32) * 0.5
     out = sfm.step(pcm_in)
     assert out.shape == (160,), f"passthrough shape {tuple(out.shape)} != (160,)"
-    assert torch.allclose(out, torch.from_numpy(pcm_in), atol=1e-7), (
+    assert np.allclose(out, pcm_in, atol=1e-7), (
         "step() without enrollment must return the input unchanged"
     )
     # clear_enrollment() / set_enrollment(None) on a never-enrolled
@@ -191,7 +190,7 @@ def _test_enrollment_toggle() -> None:
     # 1) Passthrough phase (no enrollment yet).
     pcm_a = np.random.randn(hop).astype(np.float32) * 0.4
     out_a = sfm.step(pcm_a)
-    assert torch.allclose(out_a, torch.from_numpy(pcm_a), atol=1e-7), (
+    assert np.allclose(out_a, pcm_a, atol=1e-7), (
         "step() before any enrollment must passthrough"
     )
 
@@ -207,7 +206,7 @@ def _test_enrollment_toggle() -> None:
     sfm.clear_enrollment()
     pcm_b = np.random.randn(hop).astype(np.float32) * 0.4
     out_b = sfm.step(pcm_b)
-    assert torch.allclose(out_b, torch.from_numpy(pcm_b), atol=1e-7), (
+    assert np.allclose(out_b, pcm_b, atol=1e-7), (
         "step() after clear_enrollment() must passthrough with no leakage"
     )
 

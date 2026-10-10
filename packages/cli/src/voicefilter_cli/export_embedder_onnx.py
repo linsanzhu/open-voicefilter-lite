@@ -5,7 +5,7 @@ Exports the bare ``SpeakerEncoder`` module (paper §3.1) — input is one
 or more 80-frame × 40-mel log10 windows, output is the (B, 256) raw
 embedding (NOT L2-normalised). Audio-side preprocessing (fbank +
 80-frame sliding windows + per-window L2 → mean → final L2) stays on
-the caller — ``voicefilter_lite.audio.extract_dvec`` is the canonical
+the caller — ``model.audio.extract_dvec`` is the canonical
 PyTorch reference; the ONNX graph just hosts the heavy LSTM.
 
 Usage
@@ -31,7 +31,7 @@ from cyclopts import App, Parameter
 
 from voicefilter_cli._onnx_metadata import embed_hp_metadata
 from voicefilter_lite.hparams import HParams
-from voicefilter_lite.speaker_encoder import SpeakerEncoder
+from model.speaker_encoder import SpeakerEncoder
 
 
 def _inline_onnx_weights(path: str) -> None:

@@ -105,9 +105,10 @@ from typing import Any, Callable, Iterator, Optional
 import numpy as np
 import soundfile as sf
 import torch
+import torchaudio
 from torch.utils.data import IterableDataset
 
-from voicefilter_lite.audio import (
+from model.audio import (
     frame_stack_left,
     random_crop,
     snr_mix,
@@ -2091,7 +2092,7 @@ class DVectorCache:
         the old prepare step, so training can run on machines without
         `models/embedder.pt`.
         """
-        from voicefilter_lite.speaker_encoder import SpeakerEncoder
+        from model.speaker_encoder import SpeakerEncoder
 
         pt = Path(self.hp.dvector_pt_path)
         try:
@@ -2125,7 +2126,7 @@ class DVectorCache:
             # (Removed: WARN print — per training-log-only policy.
             # Behaviour is identical: silently return zero d-vector.)
             return np.zeros(self.hp.d_vector_dim, dtype=np.float32)
-        from voicefilter_lite.audio import extract_dvec
+        from model.audio import extract_dvec
 
         wav = default_hf_wav_loader(ref, self.hp.sample_rate)
         wav_t = torch.from_numpy(wav.astype(np.float32))
@@ -2436,9 +2437,26 @@ class HfTripletStream(IterableDataset):
         # parallel — see `_ensure_initialized` for the rationale.
         self._ensure_initialized()
 
-        from voicefilter_lite.audio import make_mel_basis
         if self._mel is None:
-            self._mel = make_mel_basis(self.hp, device=torch.device("cpu"))
+            # Build the training-side torchaudio MelSpectrogram directly
+            # here. `voicefilter_lite.mel_basis.make_mel_basis` is the
+            # torch-free inference helper (librosa + numpy); the training
+            # pipeline needs the torchaudio one (so the features line up
+            # bit-for-bit with what the model was trained on). Before the
+            # train/inference split, both sides shared the torchaudio
+            # implementation; after the split, training owns it.
+            self._mel = torchaudio.transforms.MelSpectrogram(
+                sample_rate=self.hp.sample_rate,
+                n_fft=self.hp.n_fft,
+                win_length=self.hp.win_length,
+                hop_length=self.hp.hop_length,
+                n_mels=self.hp.n_mels,
+                power=2.0,
+                center=False,
+                window_fn=torch.hann_window,
+                mel_scale="htk",
+                normalized=False,
+            )
 
         # Per-worker RNG: without re-seeding, all worker processes would
         # draw identical samples — duplicates instead of parallelism.

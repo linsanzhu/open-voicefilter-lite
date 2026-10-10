@@ -14,7 +14,7 @@ fed **directly** into `in_proj` — there is no in-model projection layer.
 The mask is applied in **linear filterbank-energy** space (paper §3.2,
 literal `Y_enh(t,f) = M(t,f) · Y(t,f)` on `S_in`, NOT on log-mel). The
 model's input/output remains log-mel (ASR-side convention) — callers
-convert via `voicefilter_lite.audio.log_mel_to_linear` /
+convert via `model.audio.log_mel_to_linear` /
 `linear_to_log_mel` before/after `apply_mask`. At `M=0` the enhanced
 output is 0 (silence); at `M=1` it is identity. The noise-type head
 emits per-frame logits for an "overlapped speech?" binary classifier;
@@ -44,7 +44,7 @@ class VoiceFilterLite(nn.Module):
     thing the model emits. Applying the mask in **linear** mel-energy
     space (`Y_enh = M · Y`, paper §3.2) is the caller's job — see the
     module-level `apply_mask` helper. Use
-    `voicefilter_lite.audio.log_mel_to_linear` /
+    `model.audio.log_mel_to_linear` /
     `linear_to_log_mel` to bridge the log-mel ↔ linear-mel boundary.
 
     Public surface for callers that need extra pieces of the model:
@@ -256,7 +256,7 @@ def apply_mask(mask: torch.Tensor, cur_linear: torch.Tensor) -> torch.Tensor:
     identically.
 
     `cur_linear` must already be in linear-mel (use
-    `voicefilter_lite.audio.log_mel_to_linear` to recover it from
+    `model.audio.log_mel_to_linear` to recover it from
     log-mel). The streaming wrapper blends the result with the raw
     linear-mel input at strength `w^(t)` to drive the adaptive
     suppression from §3.4 — see `streaming.py`.

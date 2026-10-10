@@ -62,7 +62,7 @@ def linear_mel_si_snr_per_sample(
 
     Inputs MUST be in linear filterbank-energy space, not log-mel —
     `cur_linear` / `target_linear` / `enhanced_linear` produced by
-    `voicefilter_lite.audio.log_mel_to_linear` are exactly that.
+    `model.audio.log_mel_to_linear` are exactly that.
 
     Args:
         estimate: (B, T, F) — predicted enhanced linear-mel (`M · S_in`).
@@ -113,7 +113,7 @@ def asymmetric_l2_loss(
     Domain note: paper §3.3 / §3.4 work on the **linear filterbank-
     energy** spectrograms (`S_cln`, `S_enh`, `S_in`), not log-mel.
     Callers should pass `pred = M · S_in_linear` and
-    `target = S_cln_linear` — see `voicefilter_lite.audio.log_mel_to_linear`.
+    `target = S_cln_linear` — see `model.audio.log_mel_to_linear`.
     The loss itself is domain-agnostic (same algebraic form for any
     positive-definite energy representation); running it on log-mel would
     change the meaning of the asymmetry because the residual direction
@@ -238,7 +238,7 @@ class AsymmetricL2Loss(nn.Module):
     uncertain — see `asymmetric_l2_loss` docstring for the full derivation.
     Both `pred` and `target` must be in **linear** filterbank-energy
     space (paper §3.3 works on `S_cln`/`S_enh`/`S_in`, not log-mel); the
-    training loop converts via `voicefilter_lite.audio.log_mel_to_linear`.
+    training loop converts via `model.audio.log_mel_to_linear`.
     `L_noise_type` trains the noise-type predictor (§4.2): per-frame
     binary classification of "is this frame overlapped speech?",
     `y ∈ {−1, +1}`. Paper §4.2 explicitly specifies **hinge** for the

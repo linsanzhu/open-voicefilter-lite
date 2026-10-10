@@ -10,7 +10,11 @@ license = { text = "Apache-2.0" }
 # `main.py` at the repo root.
 
 dependencies = [
-    "open-voicefilter-lite",
+    # Training library (workspace-only package). Pulls in
+    # `open-voicefilter-lite` transitively for HParams + ONNX metadata
+    # parsing — the CLI sits on top of the training lib, which sits
+    # on top of the public inference package.
+    "model",
     # CLI plumbing — typed subcommand dispatch.
     "cyclopts>=5.0",
     # Data

@@ -25,8 +25,9 @@ import argparse
 import os
 import sys
 
+import librosa
+import numpy as np
 import soundfile as sf
-import torch
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..",
@@ -35,16 +36,14 @@ sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..",
 from voicefilter_lite import StreamingVoiceFilter
 
 
-def _load_audio_mono_16k(path: str, target_sr: int = 16000) -> torch.Tensor:
+def _load_audio_mono_16k(path: str, target_sr: int = 16000) -> np.ndarray:
+    """Read a wav file → 1-D float32 numpy array at `target_sr` mono."""
     wav, sr = sf.read(path, dtype="float32")
     if wav.ndim > 1:
         wav = wav.mean(axis=1)
     if sr != target_sr:
-        import torchaudio
-        wav = torchaudio.functional.resample(
-            torch.from_numpy(wav), sr, target_sr
-        ).numpy()
-    return torch.from_numpy(wav.astype("float32"))
+        wav = librosa.resample(wav, orig_sr=sr, target_sr=target_sr).astype(np.float32)
+    return wav.astype(np.float32, copy=False)
 
 
 def main() -> None:
@@ -87,16 +86,13 @@ def main() -> None:
     n_full = mixed.shape[-1] // hop
     if n_full == 0:
         raise SystemExit(f"input too short: {mixed.shape[-1]} samples < hop {hop}")
-    out_chunks = [
-        model.step(mixed[i * hop:(i + 1) * hop].numpy())
-        for i in range(n_full)
-    ]
-    enhanced = torch.cat(out_chunks)[: n_full * hop]
+    out_chunks = [model.step(mixed[i * hop:(i + 1) * hop]) for i in range(n_full)]
+    enhanced = np.concatenate(out_chunks)[: n_full * hop]
 
-    peak = enhanced.abs().max().clamp(min=1e-8)
-    if peak > 1.0:
+    peak = float(np.abs(enhanced).max())
+    if peak > 1e-8 and peak > 1.0:
         enhanced = enhanced / peak
-    sf.write(args.out, enhanced.numpy(), 16000)
+    sf.write(args.out, enhanced.astype(np.float32), 16000)
     print(f"[onnx] wrote {args.out} ({enhanced.shape[-1] / 16000:.2f}s)")
 
 

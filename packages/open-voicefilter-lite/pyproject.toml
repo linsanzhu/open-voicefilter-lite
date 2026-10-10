@@ -1,6 +1,6 @@
 [project]
 name = "open-voicefilter-lite"
-version = "0.1.1"
+version = "0.2.0"
 description = "Streaming targeted voice separation (VoiceFilter-Lite reimplementation) — turnkey PCM-in/PCM-out API with bundled ONNX models"
 readme = "README.md"
 authors = [{ name = "linsan", email = "bin.zaq@foxmail.com" }]
@@ -8,9 +8,10 @@ requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
 
 dependencies = [
-    # Core
-    "torch>=2.2",
-    "torchaudio>=2.2",
+    # Core numerical / ONNX runtime — no torch, no torchaudio. The
+    # published wheel is the turnkey inference path; training lives
+    # in the workspace-only `model` package (which adds torch + the
+    # rest of the DSP helpers).
     "numpy>=1.26",
     # Audio IO + DSP
     "soundfile>=0.12",
@@ -18,6 +19,8 @@ dependencies = [
     "onnxruntime>=1.17",
     "onnx>=1.16",
     "librosa>=0.11",
+    # YAML config loader (`voicefilter_lite.config.load_config`).
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]

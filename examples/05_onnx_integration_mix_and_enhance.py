@@ -45,20 +45,19 @@ from typing import Optional
 
 import numpy as np
 import soundfile as sf
-import torch
 
-# Self-contained: add the lib's `src/` and the CLI's `src/` so this
-# works without `pip install -e .`.
+# Self-contained: add the lib's `src/` and the model package's `src/`
+# so this works without `pip install -e .`.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..",
     "packages", "open-voicefilter-lite", "src")))
 sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..",
-    "packages", "cli", "src")))
+    "packages", "model", "src")))
 
 from voicefilter_lite import StreamingVoiceFilter  # noqa: E402
 from voicefilter_lite.config import load_and_apply  # noqa: E402
 from voicefilter_lite.hparams import HParams  # noqa: E402
-from voicefilter_cli.dataset import (  # noqa: E402
+from model.dataset import (  # noqa: E402
     HfEntry,
     _build_target_index,
     _collect_babble_pool_entries,
@@ -74,12 +73,12 @@ NOISE_KIND_NOISE = "noise"
 NOISE_KIND_MUSIC = "music"
 
 
-def _save_wav(path: str, wav: torch.Tensor, sample_rate: int) -> None:
+def _save_wav(path: str, wav: np.ndarray, sample_rate: int) -> None:
     """Peak-normalise then write a 16-bit WAV."""
-    peak = wav.abs().max().clamp(min=1e-8)
+    peak = float(np.abs(wav).max()) if wav.size else 0.0
     if peak > 1.0:
         wav = wav / peak
-    sf.write(path, wav.numpy().astype(np.float32), sample_rate)
+    sf.write(path, wav.astype(np.float32, copy=False), sample_rate)
 
 
 # --------------------------------------------------------------------------- #
@@ -104,17 +103,14 @@ class SampleSummary:
     notes: list[str] = field(default_factory=list)
 
 
-def _stream_pcm_through(model: StreamingVoiceFilter, pcm: torch.Tensor) -> torch.Tensor:
+def _stream_pcm_through(model: StreamingVoiceFilter, pcm: np.ndarray) -> np.ndarray:
     """Slice `pcm` into `hop`-sized chunks, run `step`, concat the outputs."""
     hop = model.hop_length
     n_full = pcm.shape[-1] // hop
     if n_full == 0:
-        return torch.zeros(0, dtype=torch.float32)
-    out_chunks = [
-        model.step(pcm[i * hop:(i + 1) * hop].numpy())
-        for i in range(n_full)
-    ]
-    return torch.cat(out_chunks)[: n_full * hop]
+        return np.zeros(0, dtype=np.float32)
+    out_chunks = [model.step(pcm[i * hop:(i + 1) * hop]) for i in range(n_full)]
+    return np.concatenate(out_chunks)[: n_full * hop]
 
 
 def build_one_sample(
@@ -122,8 +118,8 @@ def build_one_sample(
     hp: HParams,
     rng: random.Random,
     target_spk: str,
-    target_wav_full: torch.Tensor,
-    enroll_wav: Optional[torch.Tensor],
+    target_wav_full: np.ndarray,
+    enroll_wav: Optional[np.ndarray],
     babble_spk_to_entries: dict[str, list[HfEntry]],
     noise_pool: list[HfEntry],
     music_pool: list[HfEntry],
@@ -143,6 +139,9 @@ def build_one_sample(
     else:
         enroll_full = enroll_wav
 
+    # `synthesize_raw_sample` returns torch tensors (training-side);
+    # cast to numpy at the boundary so the rest of this example stays
+    # torch-free.
     raw = synthesize_raw_sample(
         hp, rng,
         target_wav_full=target_wav_full, ref_wav_full=enroll_full,
@@ -152,9 +151,9 @@ def build_one_sample(
         babble_cfg=babble_cfg, noise_cfg=noise_cfg, music_cfg=music_cfg,
         multi_type_prob=1.0,
     )
-    target_wav = raw.target_wav
-    interference_wav = raw.interference_wav
-    mixed_wav = raw.mixed_wav
+    target_wav = np.asarray(raw.target_wav.detach().cpu().numpy(), dtype=np.float32)
+    interference_wav = np.asarray(raw.interference_wav.detach().cpu().numpy(), dtype=np.float32)
+    mixed_wav = np.asarray(raw.mixed_wav.detach().cpu().numpy(), dtype=np.float32)
     noise_kind = raw.included_kinds
     snr_db = raw.snr_db
     detail = "+".join(noise_kind) if noise_kind else "silence"
@@ -226,9 +225,12 @@ def main() -> None:
 
     rng = random.Random(args.seed)
     np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
 
-    wav_loader = default_hf_wav_loader
+    # `default_hf_wav_loader` is a plain function (not a context
+    # manager) that returns a 1-D numpy float32 array.
+    def _load(entry: HfEntry) -> np.ndarray:
+        return default_hf_wav_loader(entry, hp.sample_rate)
+    wav_loader = _load
     target_index = _build_target_index(hp)
     if not target_index:
         raise SystemExit(
@@ -271,15 +273,13 @@ def main() -> None:
         target_spk = rng.choice(speakers)
         spk_entries = target_index[target_spk]
         target_entry = rng.choice(spk_entries)
-        with wav_loader(target_entry) as loader:
-            target_wav_full = loader.get_full_wav()
-        enroll_wav_full: Optional[torch.Tensor] = None
+        target_wav_full = wav_loader(target_entry)
+        enroll_wav_full: Optional[np.ndarray] = None
         if len(spk_entries) > 1 and rng.random() < 0.7:
             for _ in range(20):
                 e = rng.choice(spk_entries)
                 if e != target_entry:
-                    with wav_loader(e) as loader:
-                        enroll_wav_full = loader.get_full_wav()
+                    enroll_wav_full = wav_loader(e)
                     break
 
         summary = build_one_sample(

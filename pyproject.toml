@@ -17,6 +17,7 @@ workspace = { members = ["packages/*"] }
 
 [tool.uv.sources]
 open-voicefilter-lite = { workspace = true }
+model = { workspace = true }
 cli = { workspace = true }
 
 [tool.ruff]

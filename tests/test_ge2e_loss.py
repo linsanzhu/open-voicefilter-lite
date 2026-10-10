@@ -31,10 +31,20 @@ Run with:
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# Make the model source dir importable when running this file directly.
+# The GE2E loss lives in the workspace-only `model` package (formerly
+# `voicefilter_cli.losses`); nothing else from the inference package is
+# needed here.
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "packages" / "model" / "src"))
+
 import numpy as np
 import torch
 
-from voicefilter_cli.losses import GE2ELoss, build_ge2e_loss
+from model.losses import GE2ELoss, build_ge2e_loss
 
 
 def _google_ref(emb: torch.Tensor, w: float, b: float) -> tuple[float, list[str]]:
