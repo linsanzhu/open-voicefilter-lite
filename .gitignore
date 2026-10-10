@@ -73,6 +73,8 @@ models/*
 !models/embedder.pt
 hf_cache/
 artifacts/
+!models/*.onnx
+!models/ckpt_final.pt
 
 # Multimedia
 *.wav
