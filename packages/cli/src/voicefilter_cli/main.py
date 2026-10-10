@@ -119,12 +119,17 @@ evaluate_app.command(
 )
 root.command(evaluate_app)
 
-# `export <target>` — currently only `onnx`.
+# `export <target>` — `onnx` (mask predictor) + `embedder` (d-vector encoder).
 export_app = App(name="export", help="Export a trained model.")
 export_app.command(
     "voicefilter_cli.export_onnx:app",
     name="onnx",
     help="Export VoiceFilter-Lite to ONNX.",
+)
+export_app.command(
+    "voicefilter_cli.export_embedder_onnx:app",
+    name="embedder",
+    help="Export the d-vector speaker encoder (models/embedder.pt) to ONNX.",
 )
 root.command(export_app)
 

@@ -1,6 +1,12 @@
-"""Smoke tests for VoiceFilter-Lite.
+"""Smoke tests for VoiceFilter-Lite's *internal* modules.
 
-These verify that:
+These verify the training-side / advanced-API surfaces — the model
+class, the audio DSP, the loss functions, the dataset prep. The
+*public* turnkey API (`StreamingVoiceFilter` PCM-in/PCM-out) is
+covered by `tests/test_public_api.py` and uses the bundled ONNX
+graphs.
+
+These tests verify that:
     1. SpeakerEncoder constructs with the right shapes (no weights load).
     2. SpeakerEncoder is the only speaker encoder — no factory, no
        alternative backends; `HParams.d_vector_dim` is fixed at 256.
@@ -13,19 +19,24 @@ These verify that:
        params (still FP32 — INT8 dynamic-range quantization brings it
        down to slides p.32 / p.36's 2.2 MB ship size).
     5. A forward + backward pass works (with fake d-vectors; no real audio).
-    6. Streaming inference matches batched inference within fp tolerance.
-    7. The asymmetric loss is finite and decreases after one step.
-    8. The noise-type predictor hinge loss is sane (paper §4.2).
-    9. The mask-mode variants behave as documented.
-    10. The optional 1D CNN branch works end-to-end.
-    11. Per-frame overlap labels (paper §4.2 / deviation 5) follow the
+    6. The asymmetric loss is finite and decreases after one step.
+    7. The noise-type predictor hinge loss is sane (paper §4.2).
+    8. The mask-mode variants behave as documented.
+    9. The optional 1D CNN branch works end-to-end.
+    10. Per-frame overlap labels (paper §4.2 / deviation 5) follow the
         correct +1 / -1 rule given target + interference burst windows.
-    12. `_sample_activity_burst` keeps `burst_end <= sample_len` across a
+    11. `_sample_activity_burst` keeps `burst_end <= sample_len` across a
         wide seed range (regression for a 799-vs-800 training crash).
-    13. `losses.linear_mel_si_snr_per_sample` (per-bin SI-SNR in linear
+    12. `losses.linear_mel_si_snr_per_sample` (per-bin SI-SNR in linear
         mel, used by the train loop for the `train/si_snr_*` TB scalars)
         hits the expected boundary values for identity / silence / noisy
         inputs.
+
+The old "streaming matches batched" test was removed: the new
+`StreamingVoiceFilter` is ONNX-only and the streaming-vs-batched
+parity check is no longer relevant (the ONNX graph's numerics are
+validated separately by the CLI's `export_onnx` self-check, and the
+end-to-end PCM path is covered by `tests/test_public_api.py`).
 
 Run with:
     python tests/smoke_test.py
@@ -49,7 +60,6 @@ from voicefilter_cli.losses import (
 )
 from voicefilter_lite.audio import linear_to_log_mel
 from voicefilter_lite.model import VoiceFilterLite, apply_mask
-from voicefilter_lite.streaming import StreamingVoiceFilter
 
 
 def _select_device() -> torch.device:
@@ -266,55 +276,15 @@ def test_forward_backward(hp: HParams, device: torch.device) -> None:
     )
 
 
-def test_streaming_matches_batched(hp: HParams, device: torch.device) -> None:
-    """Streaming (frame-by-frame with persistent state) should match
-    the batched forward within fp tolerance.
-
-    Note: the streaming path applies adaptive suppression (`w^(t)`), which
-    blurs the output slightly differently from a pure batched forward.
-    For the very first frame, w^(0) = 0, so the output equals the
-    unfiltered input — we check that the streaming pipeline runs without
-    exploding rather than demanding bit-exact parity.
+def test_streaming_removed() -> None:
+    """Placeholder: the legacy streaming-vs-batched parity test was
+    removed when the public API switched to ONNX-only. The end-to-end
+    PCM path is now covered by `tests/test_public_api.py`, and the
+    ONNX graph's numerics are validated by the CLI's `export_onnx`
+    self-check at export time. See the new test for the public
+    surface.
     """
-    torch.manual_seed(0)
-    model = VoiceFilterLite(hp).to(device).eval()
-
-    B = 1
-    T = 30
-    stacked = torch.randn(B, T, hp.n_mels * hp.frame_stack, device=device)
-    dvec = torch.randn(B, hp.d_vector_dim, device=device)
-
-    # Batched forward (no adaptive suppression at inference — uses pure mask).
-    with torch.no_grad():
-        ref_mask, _ = model(stacked, dvec)
-        cur_idx = hp.frame_stack - 1
-        cur = stacked[..., cur_idx * hp.n_mels : (cur_idx + 1) * hp.n_mels]
-        cur_linear = torch.exp(cur).clamp(min=0.0)
-        ref_enhanced_linear = apply_mask(ref_mask, cur_linear)
-        ref_enhanced = linear_to_log_mel(ref_enhanced_linear, floor=hp.log_mel_floor)
-
-    # Streaming forward (adaptive w^(t) per §3.4).
-    sf = StreamingVoiceFilter(model, hp)
-    sf.set_dvector(dvec[0])
-
-    out_frames = []
-    with torch.no_grad():
-        for t in range(T):
-            frame_input = stacked[0, t].view(hp.frame_stack, hp.n_mels)[-1]
-            ef = sf.step(frame_input)
-            out_frames.append(ef)
-    streamed = torch.stack(out_frames, dim=0).unsqueeze(0)
-
-    err = (ref_enhanced - streamed).abs().max().item()
-    print(f"  streaming vs batched max-diff: {err:.3e}")
-    # Wider than 1e-1 because adaptive suppression (w^(t) < 1) blends the
-    # filtered output with the raw input; this is expected behaviour.
-    # Widened to 10.0 after deviation-3 (paper §3.4 f_adapt(S_in^(t))):
-    # alpha_head's input source changed from LSTM output to current frame,
-    # which can change the adaptive-suppression schedule enough to push
-    # the per-frame max-diff above the previous 5.0 bound for fresh
-    # Xavier-init weights. The test still gates catastrophic divergence.
-    assert err < 10.0, f"streaming diverged catastrophically from batched by {err}"
+    print("  streaming-vs-batched: moved to tests/test_public_api.py (ONNX path)")
 
 
 def test_loss_sanity(hp: HParams) -> None:
@@ -613,45 +583,43 @@ def main() -> None:
     device = _select_device()
     print(f"  device={device}")
 
-    print("[1/13] SpeakerEncoder construct-only (no weights load)")
+    print("[1/12] SpeakerEncoder construct-only (no weights load)")
     test_dvector_encoder_construct_only(hp)
 
-    print("[2/13] SpeakerEncoder is the only speaker encoder")
+    print("[2/12] SpeakerEncoder is the only speaker encoder")
     test_speaker_encoder_only(hp)
 
-    print("[3/13] audio.extract_dvec full pipeline (single + batched)")
+    print("[3/12] audio.extract_dvec full pipeline (single + batched)")
     test_extract_dvec_pipeline(hp, device)
 
-    print("[4/13] d_vector_dim fixed at 256 (no auto-derive)")
+    print("[4/12] d_vector_dim fixed at 256 (no auto-derive)")
     test_d_vector_dim_fixed(hp)
 
-    print("[5/13] param count")
+    print("[5/12] param count")
     test_param_count(hp)
 
-    print("[6/13] forward + backward")
+    print("[6/12] forward + backward")
     test_forward_backward(hp, device)
 
-    print("[7/13] streaming matches batched")
-    test_streaming_matches_batched(hp, device)
+    print("[7/12] streaming-vs-batched (moved to tests/test_public_api.py)")
+    test_streaming_removed()
 
-    print("[8/13] asymmetric loss sanity")
+    print("[8/12] asymmetric loss sanity")
     test_loss_sanity(hp)
 
-    print("[9/13] hinge loss sanity")
+    print("[9/12] hinge loss sanity")
     test_hinge_loss_sanity()
 
-    print("[10/13] build_loss factory")
+    print("[10/12] build_loss factory")
     test_build_loss_factory(hp)
 
-    print("[11/13] paper §3.2 mask apply (M·Y in log-mel) + optional CNN + overlap labels")
+    print("[11/12] paper §3.2 mask apply (M·Y in log-mel) + optional CNN + overlap labels")
     test_mask_apply_paper(hp, device)
     test_optional_cnn(hp, device)
     test_per_frame_overlap_labels()
 
-    print("[12/13] activity-burst bounds (regression for training crash)")
+    print("[12/12] activity-burst bounds + linear_mel_si_snr_per_sample (regression + TB metric)")
     test_activity_burst_no_oob()
-
-    print("[13/13] linear_mel_si_snr_per_sample (TB metric sanity)")
     test_linear_mel_si_snr_per_sample()
 
     print("== ALL SMOKE TESTS PASSED ==")

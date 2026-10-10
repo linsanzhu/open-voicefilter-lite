@@ -1,7 +1,7 @@
 [project]
 name = "open-voicefilter-lite"
-version = "0.1.0"
-description = "Streaming targeted voice separation — model + audio primitives (VoiceFilter-Lite reimplementation)"
+version = "0.1.1"
+description = "Streaming targeted voice separation (VoiceFilter-Lite reimplementation) — turnkey PCM-in/PCM-out API with bundled ONNX models"
 readme = "README.md"
 authors = [{ name = "linsan", email = "bin.zaq@foxmail.com" }]
 requires-python = ">=3.11"
@@ -14,9 +14,10 @@ dependencies = [
     "numpy>=1.26",
     # Audio IO + DSP
     "soundfile>=0.12",
-    "scipy>=1.11",
-    # CLI / config
-    "pyyaml>=6.0",
+    # ONNX inference (turnkey bundled-model path)
+    "onnxruntime>=1.17",
+    "onnx>=1.16",
+    "librosa>=0.11",
 ]
 
 [project.optional-dependencies]
@@ -31,3 +32,13 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/voicefilter_lite"]
+
+# Bundle the shipped ONNX models into the wheel so `import voicefilter_lite`
+# works without any model files on disk. Both files live under
+# `src/voicefilter_lite/models/` in the source tree (added so the wheel
+# ships them at `voicefilter_lite/models/<name>.onnx` next to
+# `voicefilter_lite/__init__.py`). Resolved at runtime via
+# `importlib.resources.files("voicefilter_lite").joinpath("models", ...)`.
+[tool.hatch.build.targets.wheel.force-include]
+"src/voicefilter_lite/models/voicefilter_lite.int8.onnx" = "voicefilter_lite/models/voicefilter_lite.int8.onnx"
+"src/voicefilter_lite/models/embedder.int8.onnx" = "voicefilter_lite/models/embedder.int8.onnx"

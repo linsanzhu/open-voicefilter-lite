@@ -1,371 +1,602 @@
-"""Streaming inference wrapper + adaptive suppression (paper §3.4).
+"""Turnkey streaming targeted-voice separation (paper §3).
 
-`StreamingVoiceFilter` is the stateful frame-by-frame inference entry point.
-It owns:
-  * the registered target-speaker d-vector (set once in `set_dvector`)
-  * the LSTM hidden state (`(h, c)`) — held by the active backend
-  * the left-context frame stack (rolling buffer of `frame_stack - 1` frames)
-  * the adaptive-suppression smoother (`AdaptiveSuppression`)
+`StreamingVoiceFilter` is the entire user-facing surface of this library.
+Callers hand it PCM audio and a target-speaker enrollment recording;
+it hands back enhanced PCM, one chunk at a time:
 
-The model core is pluggable: pass an `nn.Module` (torch) or an
-`onnxruntime.InferenceSession` / path-to-onnx-file (ONNX Runtime).
-The interface (`set_dvector` / `reset_state` / `step`) and the
-math (linear-mel mask, adaptive `w^(t)` blend, log-mel return) are
-identical across backends, so callers can swap deployment
-representations without touching their streaming loops.
+    from voicefilter_lite import StreamingVoiceFilter
+    import soundfile as sf
+    sf_vfl = StreamingVoiceFilter()               # uses bundled ONNX
+    enroll, sr = sf.read("target_speaker.wav", dtype="float32")
+    if sr != sf_vfl.hp.sample_rate:
+        # resample externally to hp.sample_rate
+        ...
+    sf_vfl.set_enrollment(enroll)                 # numpy / torch tensor PCM
+    for chunk in microphone_stream:               # each chunk is hp.hop_length samples
+        enhanced = sf_vfl.step(chunk)             # same shape, same dtype
 
-`step(frame_logmel)` does **one** new frame and returns the enhanced
-log-mel (paper §3.2: the ASR pipeline consumes log-mel, so the wrapper
-internally operates in linear-mel for mask + adaptive blending then
-converts back to log-mel for the return value — keeps the caller's
-interface unchanged while running the mask in the paper §3.4-correct
-linear filterbank-energy domain). The caller never sees intermediate
-tensors; device/dim plumbing is contained here.
+The bundled ONNX models carry their own hyperparameters in
+`metadata_props` (see `voicefilter_cli._onnx_metadata`), so the
+hyperparameter details (n_fft, win_length, adaptive β, ...) are read
+out of the model at construction time and never need to be set by the
+caller. Advanced users can override via the optional `mask_model` /
+`dvector_model` constructor kwargs.
 
-Warmup note: the rolling buffer is empty at construction (or after
-`reset_state()`), so the first `frame_stack - 1` calls would have a
-zero-padded left-context. **That is in-distribution**: training uses the
-identical `frame_stack_left` pattern (zero padding on the left for the
-first frames) and resets the LSTM hidden state every batch, so the model
-sees exactly this "zero hidden + zero-padded stacked" warm-up thousands of
-times per epoch. `step()` therefore runs the LSTM forward unconditionally
-from the first call, and the 1-in / 1-out contract holds (one frame in,
-one enhanced frame out, same shape / dtype / device).
+Per-step pipeline
+-----------------
 
-The d-vector comes in already at `hp.d_vector_dim` (256) directly from
-`SpeakerEncoder` — no in-model projection.
+1. Slide an audio buffer of length `(L-1)·hop + n_fft` (where
+   `L = ⌈n_fft / hop⌉`), dropping the oldest `hop` samples and
+   appending the new chunk.
+2. STFT the last `n_fft` samples of the buffer (Hann window, `center=False`,
+   matches training). Compute log-mel via the cached mel basis.
+3. Append the new log-mel to a left-context buffer (right-aligned;
+   left-padded with zeros for the first `frame_stack-1` calls — same
+   warm-up pattern the training pipeline uses).
+4. Run the mask-predictor ONNX. Get the (n_mels,) mask and the
+   noise-type head's `f_adapt ∈ [0, 1]`.
+5. Apply the mask in **linear-mel** (paper §3.2: `M·S_in`), then
+   blend with the raw input via the paper §3.4 adaptive
+   suppression `w^(t)` smoother (using β / a / b from the ONNX
+   metadata — note: the shipped models were exported with
+   β=0.8 / a=0.8 / b=0.1, not the older default β=0.4 / a=0.7 / b=0.2).
+6. Lift the enhanced linear-mel back to linear-spectrum via the cached
+   mel pseudo-inverse. Combine with the input STFT's phase (the
+   microphone phase the model never sees). Push the resulting complex
+   spectrum into a rolling buffer of size L.
+7. Reconstruct audio via a hand-rolled overlap-add over the L-frame
+   spec buffer, Hann window, and a precomputed window²-sum normaliser.
+   Return the last `hop` samples — the "newly determined" hop, which
+   is the only region covered by all L frames' windows.
+
+PCM reconstruction uses the hand-rolled OLA loop (matching
+`audio.reconstruct_wav_from_logmel`) because the shipped mask ONNX
+has `n_fft=1200, win_length=640` and `torch.istft(center=False)` trips
+on Hann window zero-endpoints ("window overlap add min: 1" — known
+limitation). Using the hand-rolled loop is also a single-file, no-
+iteration, no-Griffin-Lim path: it borrows the input phase and
+re-uses the Hann window the forward STFT used, so the OLA lines up
+exactly with the training inference.
+
+State
+-----
+`StreamingVoiceFilter` holds the LSTM hidden state (`_h`, `_c` in
+numpy — onnxruntime's IO contract), the left-context log-mel buffer
+(`_context`), the audio buffer (`_audio_buf`), the enhanced spectrum
+buffer (`_spec_buf`), and the adaptive-suppression scalar (`_w`).
+`reset_state()` zeros all of them; `set_enrollment(audio)` calls it
+implicitly (a new speaker invalidates the LSTM state).
 """
 
 from __future__ import annotations
 
-import os
+from importlib import resources
 from pathlib import Path
-from typing import List, Optional, Tuple, Union
+from typing import Optional, Union
 
 import numpy as np
 import torch
 
-from voicefilter_lite.audio import linear_to_log_mel, log_mel_to_linear
 from voicefilter_lite.hparams import HParams
-from voicefilter_lite.model import VoiceFilterLite, apply_mask
 
 
-class AdaptiveSuppression:
-    """Inference-time adaptive suppression strength `w^(t)` (paper §3.4).
+ArrayLike = Union[np.ndarray, torch.Tensor]
 
-    The noise-type predictor emits `f_adapt ∈ [0, 1]` per frame. The
-    smoothed suppression is:
 
-        w^(t) = β · w^(t-1) + (1 - β) · (a · f_adapt + b)
+# ---------------------------------------------------------- bundled model paths
 
-    β ∈ [0, 1) is the moving-average coefficient. Paper §4.4 last
-    paragraph (Table 2 last row) reports β=0.4 as the value that gives
-    "almost no WER degradation on clean and non-speech noise conditions,
-    and still a large improvement on speech noise conditions"; the
-    upstream open-source default β=0.8 was an earlier guess and is no
-    longer the recommended value.
+def _bundled_path(filename: str) -> str:
+    """Resolve a bundled ONNX filename to an absolute path on disk.
 
-    `a, b` define a linear transform on f_adapt that maps f_adapt ∈ [0,1]
-    onto w_raw ∈ [w_min, w_max] with w_min = b and w_max = a + b. The
-    defaults below (a=0.7, b=0.2) → w_raw ∈ [0.2, 0.9]: predictor-clean
-    frames keep a small always-on compensation (w_min=0.2), predictor-
-    overlap frames get near-full filtering (w_max=0.9) with a sliver of
-    the original input as a safety net. Slides §3.4 Eq. 5 does not pin
-    numeric values; see configs/paper.yaml for the full derivation.
-
-    Output is clamped to [0, 1]:
-      * w = 0 → voice filtering disabled (pass-through)
-      * w = 1 → no compensation (full filtering)
+    The package ships `models/voicefilter_lite.int8.onnx` and
+    `models/embedder.int8.onnx` inside the wheel. We read them via
+    `importlib.resources` so the resolution works both in editable
+    installs (the package source is on `sys.path`) and in installed
+    wheels (the files live inside the package's `models/` directory).
     """
-
-    def __init__(self, beta: float = 0.4, a: float = 0.7, b: float = 0.2):
-        self.beta = float(beta)
-        self.a = float(a)
-        self.b = float(b)
-        self.w = 0.0
-
-    def reset(self) -> None:
-        self.w = 0.0
-
-    def update(self, f_adapt: float) -> float:
-        target = self.a * f_adapt + self.b
-        self.w = self.beta * self.w + (1.0 - self.beta) * target
-        self.w = max(0.0, min(1.0, self.w))
-        return self.w
-
-
-# --------------------------------------------------------------------- backends
-class _Backend:
-    """Minimal interface every backend exposes to `StreamingVoiceFilter`."""
-
-    name: str = "abstract"
-
-    def reset(self, dtype, device) -> None: ...
-    def set_dvec(self, dvec: torch.Tensor) -> None: ...
-    def infer(self, stacked_logmel: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, float]:
-        """Run one step. Returns (mask (1, 1, n_mels), last_frame (n_mels,), f_adapt)."""
-        ...
-
-
-class _TorchBackend(_Backend):
-    """Runs `VoiceFilterLite` on whatever device the module is on."""
-
-    name = "torch"
-
-    def __init__(self, model: VoiceFilterLite, hp: HParams):
-        self.model = model.eval()
-        self.hp = hp
-        self._dvec: Optional[torch.Tensor] = None
-        self._hidden: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
-
-    def reset(self, dtype=None, device=None) -> None:
-        dev = device if device is not None else next(self.model.parameters()).device
-        self._hidden = (
-            torch.zeros(self.hp.num_lstm_layers, 1, self.hp.hidden_dim, device=dev),
-            torch.zeros(self.hp.num_lstm_layers, 1, self.hp.hidden_dim, device=dev),
+    try:
+        # Python 3.9+: `files()` returns a Traversable.
+        with resources.as_file(
+            resources.files("voicefilter_lite").joinpath("models", filename)
+        ) as p:
+            return str(p)
+    except (ModuleNotFoundError, FileNotFoundError):
+        # Fallback: walk up from this file to find `models/<filename>`.
+        # Helpful in dev / when the package is loaded from a source
+        # checkout that's been symlinked or copied.
+        here = Path(__file__).resolve().parent
+        for cand in (here / "models" / filename, here.parent / "models" / filename):
+            if cand.is_file():
+                return str(cand)
+        raise FileNotFoundError(
+            f"Could not locate bundled model file {filename!r}. "
+            f"Tried: {here/'models'/filename}, {here.parent/'models'/filename}."
         )
 
-    def set_dvec(self, dvec: torch.Tensor) -> None:
-        self._dvec = dvec
 
-    def infer(self, stacked_logmel: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, float]:
-        dvec = self._dvec
-        model_device = dvec.device
-        flat = stacked_logmel.reshape(1, 1, -1)
-        if flat.device != model_device:
-            flat = flat.to(model_device)
-        with torch.no_grad():
-            x, self._hidden = self.model.lstm_forward(flat, dvec, self._hidden)
-            mask = torch.sigmoid(self.model.out_proj(self.model.dropout(x)))   # (1, 1, n_mels)
-            # Paper §3.4: f_adapt(S_in^(t)) — primary input is the current
-            # frame's noisy filterbank. Fall back to LSTM output when
-            # `alpha_head_use_current_frame=False` (paper §4.2 alternative).
-            last_frame = stacked_logmel[0, -1]
-            head_in = last_frame.to(mask.device) if self.hp.alpha_head_use_current_frame else x
-            if self.hp.use_noise_type_predictor:
-                f_adapt = float(torch.sigmoid(self.model.alpha_head(head_in)).item())
-            else:
-                f_adapt = 0.0
-        return mask[0, 0], last_frame, f_adapt
+# ---------------------------------------------------------- per-step machinery
 
+def _to_pcm_tensor(audio: ArrayLike) -> torch.Tensor:
+    """Coerce a wav-like input to a 1-D float32 CPU tensor.
 
-class _OnnxBackend(_Backend):
-    """Runs the exported ONNX graph via onnxruntime (stateful LSTM I/O)."""
-
-    name = "onnx"
-
-    def __init__(self, session, hp: HParams):
-        self.session = session
-        self.hp = hp
-        outputs = {o.name for o in session.get_outputs()}
-        # New graph (export_onnx.py StreamWrapper v2): mask + f_adapt + hN + cN.
-        # Legacy graph: enhanced + hN + cN (mask + blending baked in, no
-        # adaptive suppression). We auto-detect so older .onnx files keep
-        # working — their `enhanced` already encodes mask*Y without w-blend,
-        # which is mathematically close to the new path for clean frames
-        # (w≈0) but the two diverge under heavy overlap. Callers that want
-        # parity with the torch streaming wrapper must re-export with the
-        # new graph (`voicefilter-cli export onnx`).
-        self._output_mode = "mask" if "mask" in outputs and "f_adapt" in outputs else "enhanced"
-        self._dvec: Optional[np.ndarray] = None
-        self._h: Optional[np.ndarray] = None
-        self._c: Optional[np.ndarray] = None
-
-    def reset(self, dtype=np.float32, device=None) -> None:
-        self._h = np.zeros((self.hp.num_lstm_layers, 1, self.hp.hidden_dim), dtype=dtype)
-        self._c = np.zeros((self.hp.num_lstm_layers, 1, self.hp.hidden_dim), dtype=dtype)
-
-    def set_dvec(self, dvec: torch.Tensor) -> None:
-        self._dvec = dvec.detach().cpu().numpy().astype(np.float32).reshape(1, -1)
-
-    def infer(self, stacked_logmel: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, float]:
-        feed = {
-            "stacked_logmel": stacked_logmel.reshape(1, 1, -1).cpu().numpy().astype(np.float32),
-            "dvec": self._dvec,
-            "h0": self._h,
-            "c0": self._c,
-        }
-        outs = self.session.run(None, feed)
-        if self._output_mode == "mask":
-            mask_np, f_adapt_np, self._h, self._c = outs
-            last_frame = stacked_logmel[0, -1].cpu()
-            f_adapt = float(np.asarray(f_adapt_np).reshape(-1)[0])
-        else:
-            # Legacy graph: enhanced = (mask * cur_linear) already in log-mel.
-            # We can't recover the mask without the cur frame, but we can
-            # recover a numerical f_adapt: fall back to 0 (no adaptive
-            # suppression) and surface a one-shot warning.
-            enhanced_np, self._h, self._c = outs
-            mask_np = None
-            f_adapt = 0.0
-            last_frame = stacked_logmel[0, -1].cpu()
-        mask_t = torch.from_numpy(np.asarray(mask_np).reshape(1, 1, self.hp.n_mels)) if mask_np is not None else None
-        return mask_t, last_frame, f_adapt
-
-
-def _coerce_backend(model, hp: HParams) -> _Backend:
-    """Pick the right backend based on what the caller passed.
-
-    Accepted `model` values:
-      * `voicefilter_lite.model.VoiceFilterLite` (nn.Module) → torch
-      * `str` / `os.PathLike` (path to a `.onnx` file) → onnxruntime
-      * `onnxruntime.capi.onnxruntime_inference_collection.InferenceSession` → onnxruntime
+    Accepts numpy arrays or torch tensors. Multi-channel (T, C) or
+    (C, T) inputs are mean-pooled to mono. (T,) is returned as-is.
+    Non-float dtypes are cast to float32.
     """
-    if isinstance(model, _Backend):
-        return model
-    if isinstance(model, (str, os.PathLike)):
+    if isinstance(audio, torch.Tensor):
+        t = audio.detach().cpu().float()
+    elif isinstance(audio, np.ndarray):
+        t = torch.from_numpy(np.ascontiguousarray(audio)).float()
+    else:
+        raise TypeError(
+            f"audio must be a numpy array or torch tensor, got {type(audio).__name__}"
+        )
+    if t.dim() == 2:
+        # Mean-pool multi-channel down to mono. Channels-last (T, C)
+        # is the convention for `soundfile.read`; (C, T) is the
+        # torchaudio convention — either way mean over the last dim
+        # collapses channels correctly.
+        t = t.mean(dim=-1)
+    elif t.dim() != 1:
+        raise ValueError(
+            f"audio must be 1-D (T,) or 2-D (T, C) / (C, T); got shape {tuple(t.shape)}"
+        )
+    return t
+
+
+# ---------------------------------------------------------- d-vector ONNX setup
+
+def _extract_dvec(
+    wav: torch.Tensor,
+    hp: HParams,
+    dvec_session,                   # onnxruntime.InferenceSession (duck-typed)
+) -> np.ndarray:
+    """(T,) @ hp.sample_rate → (hp.d_vector_dim,) L2-normalised d-vector.
+
+    Mirrors `audio.extract_dvec` (paper §3.1) exactly, with the
+    `encoder.forward` call replaced by an onnxruntime session.run
+    call. The recipe is locked to match the pretrained embedder:
+
+      1) 40-mel log10 fbank       (librosa, hamming window)
+      2) 80-frame sliding windows (40-frame stride)
+      3) per window: embedder ONNX → L2
+      4) mean over windows
+      5) final L2
+    """
+    import librosa
+
+    wav_np = wav.detach().cpu().numpy().astype(np.float32)
+    # 1) Log-mel fbank (librosa, hamming window, no center pad).
+    S = librosa.feature.melspectrogram(
+        y=wav_np,
+        sr=hp.sample_rate,
+        n_fft=hp.dvector_n_fft,
+        win_length=hp.dvector_win_length,
+        hop_length=hp.dvector_hop_length,
+        n_mels=hp.dvector_n_mels,
+        window="hamming",
+        center=False,
+        power=2.0,
+    )                                              # (n_mels, T_frames)
+    feat = np.log10(S + 1e-10).T                  # (T_frames, n_mels)
+
+    win = hp.dvector_window                         # 80
+    hop = hp.dvector_stride                         # 40
+    n_mels = hp.dvector_n_mels
+    T_frames = feat.shape[0]
+
+    # Pad short refs up to one window so the LSTM still produces a vec.
+    if T_frames < win:
+        pad = np.zeros((win - T_frames, n_mels), dtype=feat.dtype)
+        feat = np.concatenate([feat, pad], axis=0)
+        T_frames = win
+
+    n_win = 1 + (T_frames - win) // hop
+
+    # 2) Sliding windows: (n_win, win, n_mels).
+    windows = np.zeros((n_win, win, n_mels), dtype=np.float32)
+    for i in range(n_win):
+        start = i * hop
+        windows[i] = feat[start:start + win]
+
+    # 3) ONNX encoder forward.
+    emb = dvec_session.run(None, {"mel_window": windows})[0]   # (n_win, emb_dim)
+
+    # 4) per-window L2 → mean → final L2.
+    norms = np.linalg.norm(emb, axis=-1, keepdims=True) + 1e-12
+    emb_n = emb / norms
+    mean = emb_n.mean(axis=0)
+    return (mean / (np.linalg.norm(mean, axis=-1, keepdims=True) + 1e-12)).astype(np.float32)
+
+
+# ---------------------------------------------------------- main class
+
+class StreamingVoiceFilter:
+    """Turnkey PCM-in / PCM-out streaming voice separator.
+
+    Args:
+        mask_model: optional path or `ort.InferenceSession` for the
+            mask-predictor ONNX. Defaults to the bundled INT8
+            `voicefilter_lite.int8.onnx`.
+        dvector_model: optional path or session for the embedder
+            ONNX. Defaults to the bundled INT8 `embedder.int8.onnx`.
+
+    Typical use::
+
+        import soundfile as sf
+        enroll, sr = sf.read("enroll.wav", dtype="float32")   # load yourself
+        if sr != 16000:
+            ...                                               # resample
+        sf = StreamingVoiceFilter()                           # bundled models
+        sf.set_enrollment(enroll)                              # numpy / torch PCM
+        for chunk in mic_stream:                              # each chunk is hp.hop samples
+            out = sf.step(chunk)                              # enhanced PCM, same shape
+    """
+
+    def __init__(
+        self,
+        mask_model: str | Path | object | None = None,
+        speaker_encoder_model: str | Path | object = None,
+    ) -> None:
         try:
             import onnxruntime as ort  # noqa: F401
         except ImportError as e:
             raise ImportError(
-                "Passing an ONNX path requires `onnxruntime`. "
+                "StreamingVoiceFilter requires `onnxruntime`. "
                 "Install with `pip install onnxruntime`."
             ) from e
         from onnxruntime import InferenceSession
-        session = InferenceSession(str(model), providers=["CPUExecutionProvider"])
-        return _OnnxBackend(session, hp)
-    # Duck-typed InferenceSession.
-    if hasattr(model, "run") and hasattr(model, "get_inputs") and hasattr(model, "get_outputs"):
-        return _OnnxBackend(model, hp)
-    # nn.Module fallback.
-    return _TorchBackend(model, hp)
 
-
-class StreamingVoiceFilter:
-    """Stateful frame-by-frame inference wrapper (torch or ONNX backend).
-
-    Usage:
-        # torch model:
-        sf = StreamingVoiceFilter(model, hp)
-        # ONNX path or session:
-        sf = StreamingVoiceFilter("voicefilter_lite.onnx", hp)
-
-        sf.set_dvector(dvec)                 # registration step (256-d from SpeakerEncoder)
-        for chunk_logmel_frame in stream:    # (n_mels,) each iteration
-            enhanced_frame = sf.step(chunk_logmel_frame)
-    """
-
-    def __init__(self, model, hp: HParams):
-        self.hp = hp
-        self._backend: _Backend = _coerce_backend(model, hp)
-        # Carry `.eval()`-equivalent behaviour regardless of backend.
-        self._dvec: Optional[torch.Tensor] = None
-        self._context: List[torch.Tensor] = []
-        self._adaptive: Optional[AdaptiveSuppression] = None
-
-    @property
-    def backend_name(self) -> str:
-        return self._backend.name
-
-    # ------------------------------------------------------------------ setup
-    @torch.no_grad()
-    def set_dvector(self, dvec: torch.Tensor) -> None:
-        """Register the target speaker embedding.
-
-        Args:
-            dvec: (hp.d_vector_dim,) or (1, hp.d_vector_dim) L2-normalised
-                speaker embedding produced by `SpeakerEncoder`.
-        """
-        if dvec.dim() == 1:
-            dvec = dvec.unsqueeze(0)
-        assert dvec.shape[-1] == self.hp.d_vector_dim, (
-            f"[streaming.set_dvector] dvec dim {dvec.shape[-1]} != "
-            f"hp.d_vector_dim ({self.hp.d_vector_dim}); encoder and model "
-            f"dims must match."
-        )
-        self._dvec = dvec
-        self._backend.set_dvec(dvec)
-        self.reset_state()
-
-    @torch.no_grad()
-    def reset_state(self) -> None:
-        """Drop LSTM hidden state and clear the left-context buffer."""
-        self._backend.reset()
-        self._context = []
-        if self._adaptive is not None:
-            self._adaptive.reset()
+        # Resolve `mask_model` to one of: (path to ONNX) | (ORT session) | None.
+        # Anything else (e.g. a torch nn.Module) is rejected at the
+        # duck-type check below — the new API only supports ONNX.
+        mask_path: Optional[str]
+        if mask_model is None:
+            mask_path = _bundled_path("voicefilter_lite.int8.onnx")
+        elif isinstance(mask_model, (str, Path)):
+            mask_path = str(mask_model)
+        elif _is_ort_session(mask_model):
+            mask_path = None
         else:
-            self._adaptive = AdaptiveSuppression(
-                beta=self.hp.adaptive_w_beta,
-                a=self.hp.adaptive_w_a,
-                b=self.hp.adaptive_w_b,
+            raise TypeError(
+                f"mask_model must be a path (str / Path), an "
+                f"onnxruntime.InferenceSession, or None; got {type(mask_model).__name__}."
             )
 
-    # ------------------------------------------------------------------ step
-    @torch.no_grad()
-    def step(self, frame_logmel: torch.Tensor) -> torch.Tensor:
-        """Process one log-mel frame.
+        dvec_path: str
+        if speaker_encoder_model is None:
+            dvec_path = _bundled_path("embedder.int8.onnx")
+        elif isinstance(speaker_encoder_model, (str, Path)):
+            dvec_path = str(speaker_encoder_model)
+        else:
+            # Could be an ORT session, in which case dvec_path is unused.
+            if not _is_ort_session(speaker_encoder_model):
+                raise TypeError(
+                    f"dvector_model must be a path (str / Path), an "
+                    f"onnxruntime.InferenceSession, or None; got "
+                    f"{type(speaker_encoder_model).__name__}."
+                )
+            dvec_path = ""  # sentinel — won't be opened below
+
+        # Build HParams from the mask ONNX, then overlay d-vector
+        # fields from the embedder ONNX. The two files are independent
+        # because the embedder can be re-trained / swapped without
+        # touching the mask predictor.
+        if mask_path is not None:
+            self.hp = HParams.from_onnx(mask_path)
+        else:
+            self.hp = HParams()
+        if dvec_path:
+            self.hp.apply_onnx_dvector_overrides(dvec_path)
+
+        # Open ONNX sessions. Use the CPU provider — this is the
+        # turnkey inference path; advanced users who want GPU can
+        # pass a pre-built `ort.InferenceSession(..., providers=["CUDAExecutionProvider"])`.
+        if mask_path is not None:
+            self._mask_sess = InferenceSession(mask_path, providers=["CPUExecutionProvider"])
+        else:
+            self._mask_sess = mask_model                       # already a session
+        if dvec_path:
+            self._dvec_sess = InferenceSession(dvec_path, providers=["CPUExecutionProvider"])
+        else:
+            self._dvec_sess = speaker_encoder_model                    # already a session
+
+        # ---- Cached mel basis (paper §3.2 forward) and its pseudo-inverse (for §3.4 inverse).
+        # Built once per (sample_rate, n_fft, n_mels). The basis itself
+        # is (n_freq, n_mels). The pseudo-inverse of `fb.T` (shape
+        # (n_mels, n_freq)) is (n_freq, n_mels) — `torch.linalg.pinv`
+        # swaps dims — so the inverse projection
+        # `mel_pinv @ linear_mel` maps (n_mels,) → (n_freq,) and
+        # `fb.T @ mag2` does the forward projection (n_freq,) → (n_mels,).
+        from voicefilter_lite.audio import make_mel_basis
+        self._mel = make_mel_basis(self.hp, torch.device("cpu"))
+        self._mel_fb = self._mel.mel_scale.fb.cpu()         # (n_freq, n_mels)
+        self._mel_pinv = torch.linalg.pinv(
+            self._mel_fb.transpose(-1, -2), rcond=0.1
+        )                                                  # (n_freq, n_mels)
+
+        # ---- Cached Hann window (paper §3.2 forward STFT).
+        # We use the SAME window the torchaudio MelSpectrogram uses
+        # internally (`make_mel_basis` sets `window_fn=hann_window`),
+        # so the forward STFT in `step` and the inverse OLA over
+        # `_spec_buf` are perfectly aligned.
+        self._hann = self._mel.spectrogram.window.cpu()     # (win_length,)
+
+        # ---- Streaming state.
+        # Number of frames that fit in the audio buffer.
+        self._n_freq = self.hp.n_fft // 2 + 1
+        self._L = (self.hp.n_fft + self.hp.hop_length - 1) // self.hp.hop_length
+        self._audio_buf_len = (self._L - 1) * self.hp.hop_length + self.hp.n_fft
+        self._wss = self._compute_wss()                    # (audio_buf_len,)
+
+        self._h: Optional[np.ndarray] = None
+        self._c: Optional[np.ndarray] = None
+        self._context: list[torch.Tensor] = []
+        self._audio_buf: Optional[torch.Tensor] = None
+        self._spec_buf: Optional[torch.Tensor] = None
+        self._w: float = 0.0
+        self._dvec: Optional[np.ndarray] = None
+
+        self.reset_state()
+
+    # ----------------------------------------------------------------- public
+    def set_enrollment(self, audio: Optional[ArrayLike] = None) -> None:
+        """Register the target speaker from PCM audio (or clear enrollment).
 
         Args:
-            frame_logmel: (n_mels,) or (1, n_mels).
+            audio: 1-D numpy array or torch tensor of PCM samples at
+                `hp.sample_rate` (16 kHz by default). Multi-channel
+                (T, C) or (C, T) inputs are mean-pooled to mono.
+
+                Pass `None` (or omit the argument) to **clear** the
+                enrollment. Subsequent `step()` calls will pass the
+                input through unchanged — no mask, no OLA, no d-vector.
+                This is useful for a "speaker-detected?" gate, or for
+                VAD-style "only enhance when a known speaker is around"
+                flows. You can call `set_enrollment(pcm)` again at any
+                time to switch target speakers mid-stream; the streaming
+                state is reset on every call (clear and re-enroll alike).
+
+        Note: file I/O is the caller's responsibility. To enroll from
+        a wav file, load it yourself first (e.g. with `soundfile` or
+        `torchaudio`) and resample to `hp.sample_rate` if needed.
+        Pass the resulting numpy array / torch tensor here.
+        """
+        if audio is None:
+            # Caller is explicitly clearing — drop the d-vector and
+            # zero the streaming state so the next `step()` is a clean
+            # passthrough. The audio/spec buffers are also reset so
+            # re-enrolling later doesn't blend old enhanced frames into
+            # the new mask's output.
+            self._dvec = None
+            self.reset_state()
+            return
+        wav = _to_pcm_tensor(audio)
+        if wav.numel() < int(0.1 * self.hp.sample_rate):
+            # 100 ms of audio is the practical minimum the
+            # d-vector pipeline needs to produce a stable speaker
+            # embedding (4 sliding windows at default settings).
+            raise ValueError(
+                f"Enrollment audio too short: {wav.numel()} samples "
+                f"({wav.numel() / self.hp.sample_rate:.2f}s); need at "
+                f"least 0.1s for a stable d-vector."
+            )
+        self._dvec = _extract_dvec(wav, self.hp, self._dvec_sess)
+        self.reset_state()
+
+    def clear_enrollment(self) -> None:
+        """Drop the registered d-vector; `step()` becomes a passthrough.
+
+        Equivalent to `set_enrollment(None)`. Provided as a
+        self-documenting no-argument alternative for code that reads
+        like a state machine.
+        """
+        self.set_enrollment(None)
+
+    @property
+    def hop_length(self) -> int:
+        return self.hp.hop_length
+
+    def reset_state(self) -> None:
+        """Zero LSTM hidden, audio buffer, spec buffer, and adaptive state.
+
+        Safe to call any time. Wipes everything except the registered
+        d-vector — `set_enrollment` calls this internally.
+        """
+        H = self.hp.hidden_dim
+        L = self.hp.num_lstm_layers
+        self._h = np.zeros((L, 1, H), dtype=np.float32)
+        self._c = np.zeros((L, 1, H), dtype=np.float32)
+        self._context = []
+        self._audio_buf = torch.zeros(self._audio_buf_len, dtype=torch.float32)
+        self._spec_buf = torch.zeros(self._n_freq, self._L, dtype=torch.complex64)
+        self._w = 0.0
+
+    @torch.no_grad()
+    def step(self, pcm_frame: ArrayLike) -> torch.Tensor:
+        """Process one hop of PCM, return one hop of enhanced PCM.
+
+        Args:
+            pcm_frame: 1-D numpy array or torch tensor of length
+                exactly `hp.hop_length` samples (16 kHz). Any
+                deviation raises `ValueError`.
 
         Returns:
-            (n_mels,) enhanced log-mel for this frame, on the caller's device.
+            1-D torch tensor of length `hp.hop_length`, float32,
+            on CPU.
+
+        If no enrollment is currently set (i.e. `set_enrollment` was
+        never called, or was called with `None`), the input is passed
+        through **unchanged** — no STFT, no mask, no OLA, no LSTM. This
+        is the safe default before a target speaker is known; the same
+        model instance can be used to "only enhance when the right
+        person is talking" by toggling enrollment with
+        `set_enrollment(pcm)` / `set_enrollment(None)` between calls.
+
+        The first `frame_stack + L` calls after enrolling are warmup;
+        their outputs are mathematically valid but lack the full left
+        context.
         """
+        # Coerce input once for both the passthrough and the
+        # enhanced paths so the hop-length check fires regardless of
+        # the enrollment state.
+        t = _to_pcm_tensor(pcm_frame)
+        if t.shape[-1] != self.hp.hop_length:
+            raise ValueError(
+                f"pcm_frame length {t.shape[-1]} != hp.hop_length "
+                f"({self.hp.hop_length}); pass exactly one hop per call."
+            )
         if self._dvec is None:
-            raise RuntimeError("Call set_dvector() before step().")
+            # Passthrough: no d-vector registered, so there's nothing
+            # to extract the target speaker for. Return the input
+            # chunk as-is, on CPU, in the same dtype the rest of the
+            # API returns. We deliberately do NOT touch the audio /
+            # spec / LSTM buffers here — `reset_state` already wiped
+            # them at clear-time, and we want the next
+            # `set_enrollment(pcm)` to start from a clean slate, not
+            # from a buffer half-filled with passthrough samples that
+            # would then bleed into the first enhanced frames.
+            return t.detach().cpu().to(torch.float32)
+        hp = self.hp
 
-        squeeze = frame_logmel.dim() == 1
-        if squeeze:
-            frame_logmel = frame_logmel.unsqueeze(0)
-        caller_device = frame_logmel.device
+        # 1) Slide audio buffer.
+        self._audio_buf = torch.cat(
+            [self._audio_buf[hp.hop_length:], t.to(torch.float32)]
+        )
 
-        stacked = self._build_stacked_input(frame_logmel)
-        mask, last_frame, f_adapt = self._backend.infer(stacked)
-        enhanced = self._apply_suppression(mask, last_frame, f_adapt)
-        if enhanced.device != caller_device:
-            enhanced = enhanced.to(caller_device)
-        return enhanced.squeeze(0) if squeeze else enhanced
+        # 2) STFT the new frame (Hann window, center=False, no zero pad).
+        # `make_mel_basis` already uses `center=False, n_fft, win_length,
+        # hann_window` — but it does its own padding, so we replicate
+        # the same forward STFT explicitly to keep the buffer /
+        # window relationship crystal-clear.
+        win_padded = torch.zeros(hp.n_fft, dtype=torch.float32)
+        win_padded[: hp.win_length] = self._hann
+        frame_audio = self._audio_buf[-hp.n_fft:]
+        spec = torch.fft.rfft(frame_audio * win_padded)     # (n_freq,) complex
 
-    # ------------------------------------------------------------------ helpers
-    def _build_stacked_input(self, frame_logmel: torch.Tensor) -> torch.Tensor:
-        """Roll the left-context buffer and right-align `frame_stack` frames.
+        # 3) Linear-mel via the cached basis, then log.
+        mag2 = spec.abs().pow(2)                             # (n_freq,)
+        linear_mel = self._mel_fb.T @ mag2                    # (n_mels,)
+        log_mel = torch.log(linear_mel + hp.log_mel_floor)    # (n_mels,)
 
-        Returns (1, frame_stack, n_mels) — zeros padding on the left for the
-        first `frame_stack - 1` frames, matching the training pipeline's
-        `frame_stack_left` exactly so warm-up behaviour is in distribution.
+        # 4) Frame stacking with left zero-padding (matches training).
+        stacked = self._stack_context(log_mel)               # (1, frame_stack, n_mels)
+
+        # 5) Run mask ONNX.
+        feed = {
+            "stacked_logmel": stacked.reshape(1, 1, -1).numpy().astype(np.float32),
+            "dvec":           self._dvec.reshape(1, -1) if self._dvec.shape[0] != 1 else self._dvec,
+            "h0":             self._h,
+            "c0":             self._c,
+        }
+        mask_np, fa_np, self._h, self._c = self._mask_sess.run(None, feed)
+        mask = torch.from_numpy(np.asarray(mask_np).reshape(-1)).float()
+        f_adapt = float(np.asarray(fa_np).reshape(-1)[0])
+
+        # 6) Mask + adaptive suppression in linear-mel (paper §3.2 / §3.4).
+        raw_lin = (torch.exp(log_mel) - hp.log_mel_floor).clamp(min=0.0)
+        filtered_lin = (mask * raw_lin).clamp(min=0.0)
+        a, b, beta = hp.adaptive_w_a, hp.adaptive_w_b, hp.adaptive_w_beta
+        target = a * f_adapt + b
+        self._w = max(0.0, min(1.0, beta * self._w + (1.0 - beta) * target))
+        enhanced_lin = self._w * filtered_lin + (1.0 - self._w) * raw_lin
+
+        # 7) Lift enhanced linear-mel back to linear-spectrum, then paint
+        #    the input's phase on top (the mic phase the model never
+        #    sees; combining it with the model's enhanced magnitude
+        #    is the "re-skin" trick — see `audio.reconstruct_wav_from_logmel`).
+        enh_mag2 = (self._mel_pinv @ enhanced_lin).clamp(min=0.0)
+        enh_spec = torch.sqrt(enh_mag2) * torch.exp(1j * torch.angle(spec))
+
+        # 8) Push to spec buffer (drop oldest, append newest).
+        self._spec_buf = torch.cat(
+            [self._spec_buf[:, 1:], enh_spec.unsqueeze(-1).to(torch.complex64)],
+            dim=-1,
+        )
+
+        # 9) Reconstruct audio via hand-rolled OLA over the spec buffer.
+        #    `wss` is precomputed in __init__ (constant — depends only on
+        #    L, hop, n_fft, win_length, hann). See audio.py's
+        #    `reconstruct_wav_from_logmel` for the same recipe.
+        ola = torch.zeros(self._audio_buf_len, dtype=torch.float32)
+        for t in range(self._L):
+            frame_time = torch.fft.irfft(
+                self._spec_buf[:, t], n=hp.n_fft
+            )
+            if hp.n_fft != hp.win_length:
+                frame_time = frame_time[..., : hp.win_length]
+            start = t * hp.hop_length
+            ola[start:start + hp.win_length] += frame_time * self._hann
+        # Normalise by per-sample window² sum. We precomputed `_wss`
+        # once in __init__; it's constant for the lifetime of the
+        # instance. Avoid the per-step recompute of the existing
+        # batch function.
+        nz = self._wss > 1e-10
+        ola[nz] = ola[nz] / self._wss[nz]
+        # Return the "newest hop" — the hop corresponding to the audio
+        # that was just received, located at positions
+        # [(L-1)·hop, (L-1)·hop + hop) in the OLA buffer. This is the
+        # fully overlap-added region (covered by all L frames' windows)
+        # and corresponds to the most recent input chunk. The very end
+        # of the OLA buffer (positions [start + win_length, end]) has
+        # zero wss by construction (Hann window zero endpoints), so we
+        # explicitly slice into the "fully covered" region.
+        newest_hop_start = (self._L - 1) * hp.hop_length
+        newest_hop_end = newest_hop_start + hp.hop_length
+        return ola[newest_hop_start:newest_hop_end].detach().cpu()
+
+    # ---------------------------------------------------------------- helpers
+    def _stack_context(self, frame_logmel: torch.Tensor) -> torch.Tensor:
+        """Right-align the new log-mel frame into a `(1, frame_stack, n_mels)` tensor.
+
+        Left-padded with zeros for the first `frame_stack-1` calls —
+        same warm-up pattern as the training pipeline (`frame_stack_left`).
         """
         stack = self.hp.frame_stack
         n_mels = self.hp.n_mels
-
         self._context.append(frame_logmel)
         if len(self._context) > stack:
             self._context = self._context[-stack:]
-
-        stacked = torch.zeros(1, stack, n_mels, dtype=frame_logmel.dtype, device=frame_logmel.device)
+        stacked = torch.zeros(1, stack, n_mels, dtype=torch.float32)
         offset = stack - len(self._context)
         for i, f in enumerate(self._context):
-            stacked[0, offset + i] = f[0]
+            stacked[0, offset + i] = f
         return stacked
 
-    def _apply_suppression(
-        self,
-        mask: Optional[torch.Tensor],
-        last_frame: torch.Tensor,
-        f_adapt: float,
-    ) -> torch.Tensor:
-        """Blend the filtered output with the raw input using w^(t).
+    def _compute_wss(self) -> torch.Tensor:
+        """Precompute the per-sample window² sum for the OLA normaliser.
 
-        Paper §3.2 / §3.4 — both the mask application and the adaptive
-        suppression blending happen in **linear** filterbank-energy
-        space (the mask is `M · S_in` on linear-mel, NOT log-mel, per
-        the paper's literal formulas). The result is converted back to
-        log-mel before return so the caller's ASR pipeline still sees
-        the same feature distribution it would have produced from the
-        un-filtered input.
+        Constant for the lifetime of the instance: depends only on
+        L, hop, n_fft, win_length, and the Hann window. Shape
+        `(audio_buf_len,)`, same as the OLA accumulator. The Hann
+        window has zero endpoints, so a few samples at the very
+        start / end of this buffer are zero — `step()` skips the
+        division at those positions (`nz = wss > 1e-10`), which
+        mirrors the forward STFT's silent-edge behaviour exactly.
         """
-        w = self._adaptive.update(f_adapt) if self._adaptive is not None else 1.0
-        floor = self.hp.log_mel_floor
+        win = self._hann
+        n_fft = self.hp.n_fft
+        win_length = self.hp.win_length
+        hop = self.hp.hop_length
+        L = self._L
+        # Place a `win`-length slice of `win^2` at every frame position,
+        # then sum overlaps. This is `reconstruct_wav_from_logmel`'s
+        # `wss` accumulation, but precomputed once.
+        win_padded = torch.zeros(n_fft, dtype=torch.float32)
+        win_padded[:win_length] = win
+        wss = torch.zeros(self._audio_buf_len, dtype=torch.float32)
+        for t in range(L):
+            start = t * hop
+            wss[start:start + win_length] += win_padded[:win_length] ** 2
+        return wss
 
-        # log → linear for both filtered and raw frames (single round-trip).
-        raw_linear = log_mel_to_linear(last_frame, floor=floor)
-        if mask is None:
-            # Legacy ONNX graph: the model already applied the mask in its
-            # own log-mel round-trip; we have nothing to multiply here.
-            filtered_linear = raw_linear
-        else:
-            filtered_linear = apply_mask(mask.reshape(-1), raw_linear)
 
-        # §3.4 Eq. 4: S_out = w · Ŝ_in + (1-w) · S_in (all in linear-mel).
-        enhanced_linear = w * filtered_linear + (1.0 - w) * raw_linear
-        return linear_to_log_mel(enhanced_linear, floor=floor)
+# ---------------------------------------------------------- session helpers
+
+def _is_ort_session(obj: object) -> bool:
+    """True if `obj` looks like an `onnxruntime.InferenceSession`."""
+    return (
+        callable(getattr(obj, "run", None))
+        and callable(getattr(obj, "get_inputs", None))
+        and callable(getattr(obj, "get_outputs", None))
+    )

@@ -124,6 +124,295 @@ def linear_to_log_mel(linear: torch.Tensor, floor: float = 1e-6) -> torch.Tensor
     return torch.log(linear + floor)
 
 
+# ---- Mel basis pseudo-inverse (cached, used by log-mel → wav inversion) ----
+#
+# Reusing the cached mel basis (n_mels, n_freq) across all calls — the basis
+# depends only on (sample_rate, n_fft, n_mels, mel_scale). The pseudo-inverse
+# itself is also cacheable on the same key. Used by `reconstruct_wav_from_logmel`
+# to lift linear-mel magnitudes back to linear-spectrum magnitudes.
+#
+# Why truncated SVD (`rcond=0.1`) instead of the default `rcond=1e-15`? With
+# `n_mels=128` and `n_fft=400` the mel basis has rank ≈ 107 — the upper
+# frequency bins are linearly dependent (their mel filter weights overlap
+# heavily). A full pseudo-inverse divides by all 128 singular values, the
+# last 21 of which are at numerical noise level; the resulting inverse
+# amplifies those small components by 50-100x and the reconstructed
+# spectrum spikes wildly. Truncating at `rcond=0.1` keeps only the well-
+# conditioned subspace and produces a much more conservative
+# reconstruction (relative error ~2% vs 50x spikes for the default).
+_MEL_PINV_CACHE: dict[Tuple[int, int, int, float], torch.Tensor] = {}
+
+
+def get_mel_pinv(
+    hp: HParams,
+    mel_transform: torchaudio.transforms.MelSpectrogram,
+    device: torch.device | None = None,
+    *,
+    rcond: float = 0.1,
+) -> torch.Tensor:
+    """Return the cached (n_mels, n_freq) Moore-Penrose inverse of the mel basis.
+
+    `fb` inside the torchaudio MelSpectrogram has shape (n_freq, n_mels), so
+    its pseudo-inverse (n_mels, n_freq) is the right operator for
+
+        linear_mel (n_mels, T)  @  mel_pinv (n_mels, n_freq)
+            →  linear_spec (n_freq, T).
+
+    `rcond` is the singular-value cutoff passed to `torch.linalg.pinv` —
+    any singular value below `rcond * max(sv)` is dropped, which tames
+    the rank-deficient parts of the mel basis (see module comment).
+
+    Cached on (sample_rate, n_fft, n_mels, rcond). Falls back to CPU
+    computation then moves to `device` if requested.
+    """
+    key = (hp.sample_rate, hp.n_fft, hp.n_mels, rcond)
+    cached = _MEL_PINV_CACHE.get(key)
+    if cached is None:
+        fb = mel_transform.mel_scale.fb                     # (n_freq, n_mels)
+        cached = torch.linalg.pinv(fb.transpose(-1, -2), rcond)   # (n_mels, n_freq)
+        _MEL_PINV_CACHE[key] = cached
+    if device is not None and cached.device != device:
+        cached = cached.to(device)
+        _MEL_PINV_CACHE[key] = cached
+    return cached
+
+
+def reconstruct_wav_from_logmel(
+    enhanced_logmel: torch.Tensor,
+    hp: HParams,
+    mel_transform: torchaudio.transforms.MelSpectrogram,
+    *,
+    ref_wav: Optional[torch.Tensor] = None,
+    method: str = "phase",
+    gl_iter: int = 16,
+) -> torch.Tensor:
+    """Inverse log-mel → waveform.
+
+    Two paths are supported, picked via `method`:
+
+    * ``"phase"`` (default, one-shot, no iteration). Borrows the STFT phase
+      from `ref_wav` (the same mixed wav the model's enhanced log-mel was
+      derived from) and combines it with the magnitude implied by
+      `enhanced_logmel`. This avoids Griffin-Lim's 16+ iteration loop and
+      — in practice — sounds noticeably better: human-grade phase + a
+      magnitude that has only lost the masker is already a good listen,
+      and STT-grade intelligibility is essentially free.
+
+      The mel basis is a (n_mels, n_freq) projection, so the model has
+      already collapsed `n_freq` channels of phase into `n_mels` channels of
+      magnitude. We *recover* the linear magnitude by pseudo-inverting
+      that projection, then paint the *original* phase back on. The
+      recovered phase is consistent (not random) and matches the time
+      alignment of the model's frame stack, so the iSTFT produces a
+      time-coherent waveform at `ref_wav`'s length.
+
+      `ref_wav` is REQUIRED for this path; missing it raises
+      ``ValueError``.
+
+    * ``"griffin_lim"`` (legacy, iterative). Estimates phase via
+      Griffin-Lim with `gl_iter` iterations. Use only when `ref_wav` is
+      unavailable (e.g. raw `enhanced_logmel` synthesised by hand). Sounds
+      metallic and degrades sharply with fewer iterations.
+
+    Args:
+        enhanced_logmel: (T, n_mels) post-blend log-mel (the streaming
+            wrapper's `step()` return value, stacked over time).
+        hp: HParams (n_mels, n_fft, hop_length, win_length, sample_rate,
+            log_mel_floor).
+        mel_transform: shared torchaudio `MelSpectrogram` from
+            `make_mel_basis(hp, ...)`. Carries the (n_freq, n_mels) mel
+            basis + the Hann window used in the forward STFT.
+        ref_wav: (T_samples,) reference waveform, REQUIRED for
+            ``method="phase"``. Same wav that was fed to `wav_to_log_mel`
+            to produce the model's input frames.
+        method: ``"phase"`` or ``"griffin_lim"``.
+        gl_iter: Griffin-Lim iterations, ignored unless
+            ``method="griffin_lim"``.
+
+    Returns:
+        (T_samples,) reconstructed waveform on CPU.
+    """
+    if method not in ("phase", "griffin_lim"):
+        raise ValueError(
+            f"method must be 'phase' or 'griffin_lim', got {method!r}"
+        )
+    if method == "phase" and ref_wav is None:
+        raise ValueError(
+            "method='phase' requires ref_wav (the mixed wav used to derive "
+            "the model's input log-mel)."
+        )
+
+    # 1) log-mel → linear-mel, (T, n_mels) → (n_mels, T)
+    linear = log_mel_to_linear(enhanced_logmel, floor=hp.log_mel_floor).T
+    # (n_mels, T) is the form we need to project up to (n_freq, T).
+
+    # Grab the same Hann window the MelSpectrogram used in its STFT so the
+    # forward (ref_wav) and inverse (iSTFT) match exactly.
+    window = mel_transform.spectrogram.window
+
+    if method == "phase":
+        assert ref_wav is not None
+        # 2a) Ref-wav STFT → phase AND a magnitude cap baseline.
+        target_device = linear.device
+        if ref_wav.dim() != 1:
+            ref_wav = ref_wav.squeeze(0)
+        ref_spec = torch.stft(
+            ref_wav.to(target_device),
+            n_fft=hp.n_fft,
+            hop_length=hp.hop_length,
+            win_length=hp.win_length,
+            window=window.to(target_device),
+            center=False,
+            return_complex=True,
+        )                                              # (n_freq, T_ref)
+        ref_mag = ref_spec.abs()
+
+        # 3a) linear-mel → linear-spectrum magnitude via the cached
+        # truncated-SVD pseudo-inverse, then `relu` (the magnitude is
+        # non-negative by definition) and a soft cap at 2× the ref
+        # magnitude. The cap is the bit that tames the rank-deficient
+        # parts of the mel basis: well-conditioned low-frequency bins
+        # pass through unchanged, and the wildest ill-conditioned bins
+        # (which can otherwise be 50x the true |S|) are clipped to
+        # something physical — the model can't create energy from
+        # nothing in a single frame, so 2x is a generous bound.
+        mel_pinv = get_mel_pinv(hp, mel_transform, device=target_device)
+        linear_spec = torch.relu(mel_pinv.to(linear.dtype) @ linear)   # (n_freq, T)
+
+        # Trim both to the common frame count (they should match exactly
+        # when ref_wav is the same wav that produced enhanced_logmel, but
+        # a `center=False` rounding can cost one frame in edge cases).
+        T = min(linear_spec.shape[-1], ref_mag.shape[-1])
+        linear_spec = linear_spec[..., :T]
+        ref_mag = ref_mag[..., :T]
+        # Cap: per-bin, never exceed 2x the ref. Where ref is silent
+        # (ref_mag < 1e-6), cap at a small constant so the cap itself
+        # doesn't blow up at a near-zero denominator.
+        cap = torch.where(ref_mag > 1e-6, ref_mag * 2.0, torch.full_like(ref_mag, 1e-3))
+        linear_spec = torch.minimum(linear_spec, cap)
+
+        # Combine: enhanced magnitude + ref phase. This is the
+        # VoiceFilter-Lite "re-skin" trick: borrow the original
+        # microphone's phase (which the model never sees), keep only
+        # the magnitude the model changed. Time-domain coherence is
+        # preserved by the ref phase, so iSTFT overlaps the windows
+        # without audible glitches.
+        phase = torch.angle(ref_spec[..., :T])
+        enhanced_spec = linear_spec * (torch.cos(phase) + 1j * torch.sin(phase))
+
+        # 4a) iSTFT back to waveform via a hand-rolled OLA loop.
+        #
+        # Why not `torch.istft(..., center=False)`? It checks
+        # `window_sq_sum >= WINDOW_OVERLAP_ADD_MIN` per sample and raises
+        # "window overlap add min: 1" when the Hann window has zero
+        # endpoints (so the first and last hops are only covered by a
+        # single window whose amplitude is `hann(0) = 0`). This bites any
+        # `n_fft == win_length` config — including the HParams default
+        # (`n_fft=400, win_length=400`) and the paper config (`n_fft=1200,
+        # win_length=400` — but with the larger n_fft, the window is
+        # padded internally to 1200 and COLA is fine; still, we want
+        # this helper to work for arbitrary configs without a magic
+        # threshold). The same configuration with `center=True` does work
+        # but shifts every frame by `n_fft // 2` samples, breaking the
+        # ref-phase alignment we carefully set up above.
+        #
+        # Hand-rolled OLA in 8 lines, no boundary check, exactly the
+        # frame alignment the model trained with.
+        win = window.to(target_device)
+        T_frames = enhanced_spec.shape[-1]
+        ola_len = (T_frames - 1) * hp.hop_length + hp.win_length
+        ola = torch.zeros(ola_len, dtype=enhanced_spec.real.dtype, device=target_device)
+        wss = torch.zeros_like(ola)
+        for t in range(T_frames):
+            # enhanced_spec[..., t] is (n_freq,); IRFFT along the only axis.
+            frame = torch.fft.irfft(enhanced_spec[..., t], n=hp.n_fft, dim=-1)
+            if hp.n_fft != hp.win_length:
+                frame = frame[..., : hp.win_length]
+            start = t * hp.hop_length
+            ola[start:start + hp.win_length] += frame * win
+            wss[start:start + hp.win_length] += win ** 2
+        # Normalise by per-sample window^2 sum. The Hann window has
+        # zero endpoints, so a handful of samples at the very start /
+        # end stay at zero — that's the same "edge silence" the
+        # forward STFT discarded when going wav → log-mel, so the
+        # alignment matches.
+        nz = wss > 1e-10
+        ola[nz] = ola[nz] / wss[nz]
+        # Edge trimming: the OLA only has one window of "coverage" in
+        # the first `win_length - hop_length` and the last
+        # `win_length - hop_length` samples, and that one window has
+        # small Hann amplitudes at its edges → dividing by tiny
+        # `wss` blows the value up by 10-100x. The forward
+        # `MelSpectrogram(center=False)` STFT silently drops exactly
+        # these same edge samples (it never even sees them), so the
+        # *model's* log-mel is "as if" they were zero. We mirror that
+        # here: zero out the unreliable edges before padding to
+        # `ref_len`. The result is the same length as the input wav
+        # with a clean interior.
+        edge = hp.win_length - hp.hop_length
+        if ola.shape[-1] > 2 * edge:
+            ola[:edge] = 0.0
+            ola[-edge:] = 0.0
+        # Pad/trim to the ref wav length so the caller gets a (T_samples,)
+        # tensor at the same length they handed in.
+        ref_len = ref_wav.shape[-1]
+        if ola.shape[-1] < ref_len:
+            ola = torch.nn.functional.pad(ola, (0, ref_len - ola.shape[-1]))
+        elif ola.shape[-1] > ref_len:
+            ola = ola[..., :ref_len]
+        return ola.detach().cpu()
+
+    # method == "griffin_lim"
+    # Same projection as the phase path. If `ref_wav` is available we
+    # apply the same `2x ref_mag` cap to tame the rank-deficient parts
+    # of the mel basis — without it, GL's iterative refinement can
+    # diverge on the spurious high-magnitude bins.
+    mel_pinv = get_mel_pinv(hp, mel_transform, device=linear.device)
+    linear_spec = torch.relu(mel_pinv.to(linear.dtype) @ linear)   # (n_freq, T)
+    if ref_wav is not None:
+        if ref_wav.dim() != 1:
+            ref_wav = ref_wav.squeeze(0)
+        ref_spec_gl = torch.stft(
+            ref_wav.to(linear.device),
+            n_fft=hp.n_fft, hop_length=hp.hop_length, win_length=hp.win_length,
+            window=mel_transform.spectrogram.window.to(linear.device),
+            center=False, return_complex=True,
+        )
+        ref_mag_gl = ref_spec_gl.abs()
+        T_gl = min(linear_spec.shape[-1], ref_mag_gl.shape[-1])
+        linear_spec = linear_spec[..., :T_gl]
+        ref_mag_gl = ref_mag_gl[..., :T_gl]
+        cap_gl = torch.where(
+            ref_mag_gl > 1e-6,
+            ref_mag_gl * 2.0,
+            torch.full_like(ref_mag_gl, 1e-3),
+        )
+        linear_spec = torch.minimum(linear_spec, cap_gl)
+    target_len = ref_wav.shape[-1] if ref_wav is not None else (
+        hp.sample_length_sec * hp.sample_rate
+    )
+    # Pad to the frame count that `GriffinLim(length=...)` will expect
+    # (`target_len // hop + 1`). Without this it complains about
+    # `specgram` vs the internally-derived frame count being 48 vs 51.
+    needed_frames = int(target_len) // hp.hop_length + 1
+    if linear_spec.shape[-1] < needed_frames:
+        pad = torch.zeros(
+            linear_spec.shape[0],
+            needed_frames - linear_spec.shape[-1],
+            dtype=linear_spec.dtype, device=linear_spec.device,
+        )
+        linear_spec = torch.cat([linear_spec, pad], dim=-1)
+    griffin = torchaudio.transforms.GriffinLim(
+        n_fft=hp.n_fft,
+        hop_length=hp.hop_length,
+        win_length=hp.win_length,
+        power=1.0,
+        n_iter=gl_iter,
+        length=int(target_len),
+    )
+    return griffin(linear_spec.unsqueeze(0)).squeeze(0)
+
+
 def frame_stack_left(
     log_mel: torch.Tensor,
     stack: int,

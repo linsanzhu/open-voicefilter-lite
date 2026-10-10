@@ -1,14 +1,23 @@
-"""open-voicefilter-lite — streaming targeted voice separation (VoiceFilter-Lite reimplementation).
+"""open-voicefilter-lite — streaming targeted voice separation.
 
-The library exposes only what a downstream consumer needs to run a
-pretrained model: model definition, audio/d-vector primitives, streaming
-inference, and config loading. Training-only code (data preparation,
-losses, training loops) lives in the sibling `open_voicefilter_lite_cli`
-package — see https://github.com/linsan/open-voicefilter-lite.
+The library exposes a single turnkey class: `StreamingVoiceFilter`. The
+bundled ONNX models (mask predictor + d-vector encoder) carry their
+own hyperparameters in `metadata_props`, so callers never see log-mel,
+frame stacking, d-vector extraction, or the LSTM state machine — just
+PCM in, PCM out:
+
+    from voicefilter_lite import StreamingVoiceFilter
+    sf = StreamingVoiceFilter()               # bundled ONNX
+    sf.set_enrollment("enroll.wav")           # target speaker
+    for chunk in mic_stream:                  # each chunk is hp.hop samples
+        enhanced = sf.step(chunk)             # same shape, enhanced PCM
+
+The internal modules (`hparams.py`, `audio.py`, `model.py`,
+`speaker_encoder.py`, `config.py`) remain importable by their full
+path for advanced / training-side use, but they're no longer part of
+the public surface.
 """
 
-from voicefilter_lite.hparams import HParams
-from voicefilter_lite.model import VoiceFilterLite, apply_mask
 from voicefilter_lite.streaming import StreamingVoiceFilter
 
-__all__ = ["HParams", "VoiceFilterLite", "StreamingVoiceFilter", "apply_mask"]
+__all__ = ["StreamingVoiceFilter"]

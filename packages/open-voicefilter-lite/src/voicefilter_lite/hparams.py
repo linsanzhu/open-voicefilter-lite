@@ -1343,6 +1343,120 @@ class HParams:
         nested, _legacy_cache_overrides = _coerce_to_nested(d, cls)
         return _from_dict(cls, nested)
 
+    @classmethod
+    def from_onnx(cls, mask_path: str | Path) -> "HParams":
+        """Build an HParams from a mask-predictor ONNX's embedded metadata.
+
+        The published `voicefilter_lite.int8.onnx` ships with a
+        `voicefilter_lite_config` JSON in its `metadata_props` (see
+        `voicefilter_cli._onnx_metadata`). This method reads that JSON
+        and routes it through `from_dict` so the consumer can run
+        inference without needing the source tree or a PyTorch
+        checkpoint — the model IS its own config.
+
+        Only the `model.*` block is populated from the ONNX (the
+        shipped graph has no knowledge of dataset / training config).
+        The d-vector fields that the inference path also needs
+        (`dvector_n_fft`, `dvector_n_mels`, etc.) live in the embedder
+        ONNX's metadata and must be applied separately via
+        `apply_onnx_dvector_overrides` — the streaming wrapper handles
+        that step for you.
+
+        Args:
+            mask_path: path to the mask-predictor ONNX file.
+
+        Returns:
+            HParams with `model.audio / arch / predictor / loss` populated
+            from the ONNX metadata; everything else is default.
+        """
+        from pathlib import Path as _Path
+
+        path = _Path(mask_path)
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"HParams.from_onnx: no such file {mask_path!s}"
+            )
+        try:
+            import onnx
+        except ImportError as e:
+            raise ImportError(
+                "HParams.from_onnx requires `onnx` to read metadata_props. "
+                "Install with `pip install onnx`."
+            ) from e
+        model = onnx.load(str(path))
+        props = {p.key: p.value for p in model.metadata_props}
+        if "voicefilter_lite_config" not in props:
+            raise ValueError(
+                f"{mask_path!s} has no `voicefilter_lite_config` metadata — "
+                f"the file was not exported with the current CLI. Re-export "
+                f"with `voicefilter-cli export onnx`."
+            )
+        import json
+        cfg = json.loads(props["voicefilter_lite_config"])
+        # Mask ONNX embeds everything under `model.*` — pass through as-is.
+        return cls.from_dict(cfg)
+
+    def apply_onnx_dvector_overrides(self, dvec_path: str | Path) -> None:
+        """Populate the d-vector HParams from the embedder ONNX metadata.
+
+        The shipped `embedder.int8.onnx` embeds a flat-key config (see
+        `voicefilter_cli.export_embedder_onnx._dvector_metadata`). The
+        lib's internal representation is the nested
+        `model.dvector.{n_fft, n_mels, window, ...}` block; we route
+        each field through the same `apply_overrides` helper the CLI
+        uses for YAML config.
+
+        This is a separate step from `from_onnx` because the two ONNX
+        files are independent — a user may override the d-vector model
+        (e.g. a fine-tuned embedder) without touching the main mask
+        predictor, so the configs are sourced separately.
+
+        Args:
+            dvec_path: path to the embedder ONNX file.
+        """
+        from pathlib import Path as _Path
+        import json
+
+        path = _Path(dvec_path)
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"apply_onnx_dvector_overrides: no such file {dvec_path!s}"
+            )
+        try:
+            import onnx
+        except ImportError as e:
+            raise ImportError(
+                "apply_onnx_dvector_overrides requires `onnx`. "
+                "Install with `pip install onnx`."
+            ) from e
+        model = onnx.load(str(path))
+        props = {p.key: p.value for p in model.metadata_props}
+        if "voicefilter_lite_config" not in props:
+            raise ValueError(
+                f"{dvec_path!s} has no `voicefilter_lite_config` metadata — "
+                f"the file was not exported with the current CLI."
+            )
+        cfg = json.loads(props["voicefilter_lite_config"])
+        # Map embedder-metadata flat keys to the nested dvector fields.
+        # `n_fft` here is the d-vector STFT (512, not the main 1200);
+        # `emb_dim` is the projection width (256). The mapping mirrors
+        # the export script's view of the d-vector config.
+        kwargs: dict[str, Any] = {
+            "model.dvector.n_fft":       cfg.get("n_fft"),
+            "model.dvector.n_mels":      cfg.get("n_mels"),
+            "model.dvector.win_length":  cfg.get("win_length"),
+            "model.dvector.hop_length":  cfg.get("hop_length"),
+            "model.dvector.window":      cfg.get("window"),
+            "model.dvector.stride":      cfg.get("stride"),
+            "model.dvector.lstm_hidden": cfg.get("lstm_hidden"),
+            "model.dvector.lstm_layers": cfg.get("lstm_layers"),
+            "model.dvector.emb_dim":     cfg.get("emb_dim"),
+        }
+        # Drop None so missing keys keep the existing dvector defaults.
+        kwargs = {k: v for k, v in kwargs.items() if v is not None}
+        from voicefilter_lite.config import apply_overrides
+        apply_overrides(self, kwargs)
+
 
 # ============================================================ #
 # (De)serialisation helpers                                       #

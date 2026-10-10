@@ -1,26 +1,16 @@
 #!/usr/bin/env python3
 """Example 01 — Offline separation of a pre-mixed WAV file.
 
-Given a trained checkpoint, an enrollment clip of the target speaker, and a
-mixed audio file (target speaker + other speakers / noise), this script runs
-VoiceFilter-Lite frame-by-frame and writes the enhanced log-mel back out as a
-16 kHz WAV using Griffin-Lim phase reconstruction.
-
-This is the simplest end-to-end path and the one most people will copy first.
-For real production deployment you would feed the enhanced log-mel straight
-into a streaming ASR instead of reconstructing waveform — see
-`02_streaming_inference.py` and `03_onnx_inference.py`.
+The turnkey API: hand the model an enrollment recording and a mixed
+audio file, get an enhanced WAV back. The mask ONNX, embedder ONNX,
+log-mel, frame stacking, and waveform reconstruction are all internal.
 
 Usage
 -----
     python examples/01_offline_separation.py \\
-        --checkpoint runs/exp1/ckpt_final.pt \\
-        --enrollment  data/enroll.wav \\
-        --mixed       data/mixed.wav \\
-        --out         data/enhanced.wav
-
-The script auto-selects MPS / CUDA / CPU. No GPU is required — a few-second
-clip runs in well under a second on CPU.
+        --enrollment data/enroll.wav \\
+        --mixed      data/mixed.wav \\
+        --out        data/enhanced.wav
 """
 
 from __future__ import annotations
@@ -28,182 +18,77 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from pathlib import Path
 
 import soundfile as sf
 import torch
 
-# Self-contained: add the `src/` layout to sys.path so this works without
-# `pip install -e .`.
-HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.abspath(os.path.join(HERE, "..", "src")))
+# Self-contained: add the lib's `src/` layout to sys.path so this works
+# without `pip install -e .`.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..",
+    "packages", "open-voicefilter-lite", "src")))
 
-from open_voicefilter_lite.audio import (  # noqa: E402
-    extract_dvec,
-    make_mel_basis,
-    wav_to_log_mel,
-)
-from open_voicefilter_lite.hparams import HParams  # noqa: E402
-from open_voicefilter_lite.model import (  # noqa: E402
-    StreamingVoiceFilter,
-    VoiceFilterLite,
-)
-from open_voicefilter_lite.speaker_encoder import SpeakerEncoder  # noqa: E402
+from voicefilter_lite import StreamingVoiceFilter
 
 
-def _select_device(requested: str) -> torch.device:
-    if requested != "auto":
-        return torch.device(requested)
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
+def _load_audio_mono_16k(path: str, target_sr: int = 16000) -> torch.Tensor:
+    """Read a wav file → 1-D float32 tensor at `target_sr` mono."""
+    wav, sr = sf.read(path, dtype="float32")
+    if wav.ndim > 1:
+        wav = wav.mean(axis=1)
+    if sr != target_sr:
+        import torchaudio
+        wav = torchaudio.functional.resample(
+            torch.from_numpy(wav), sr, target_sr
+        ).numpy()
+    return torch.from_numpy(wav.astype("float32"))
 
 
-def _load_enrollment_dvec(
-    encoder,
-    wav: torch.Tensor,
-    hp: HParams,
-    device: torch.device,
-) -> torch.Tensor:
-    """`audio.extract_dvec` returns (1, d_vector_dim=256); squeeze to
-    (d_vector_dim,) for StreamingVoiceFilter."""
-    with torch.no_grad():
-        return extract_dvec(wav, hp, encoder, device=device).squeeze(0).cpu()
+def _stream_pcm_through(model: StreamingVoiceFilter, pcm: torch.Tensor) -> torch.Tensor:
+    """Slice `pcm` into `hop`-sized chunks, run `step`, concat the outputs.
 
-
-def _logmel_to_wav(log_mel: torch.Tensor, hp: HParams, n_iter: int = 16) -> torch.Tensor:
-    """Inverse log-mel → waveform via Griffin-Lim.
-
-    NOTE: This is for offline audition only. Production streaming pipelines
-    feed `enhanced_logmel` directly into an ASR frontend.
+    Drops the trailing partial chunk (a partial hop can't be fully
+    overlap-added by the model's OLA).
     """
-    import torchaudio
-
-    mel = torch.exp(log_mel) - hp.log_mel_floor        # (T, F)
-    mel = mel.transpose(0, 1).unsqueeze(0)             # (1, F, T)
-
-    inv_mel = torchaudio.transforms.InverseMelScale(
-        n_stft=hp.n_fft // 2 + 1,
-        n_mels=hp.n_mels,
-        sample_rate=hp.sample_rate,
-        max_iter=128,
-    )
-    linear = inv_mel(mel)                              # (1, n_freq, T)
-
-    # torchaudio's GriffinLim rebuilds via STFT(center=True), which expects
-    # T_frames = target_len // hop + 1 (e.g. 48000/160 + 1 = 301) for the
-    # target output length. Our STFT was center=False and yields 298 frames
-    # for 48000 samples — the trailing half-window is dropped. Right-pad
-    # with silence so the internal `specgram * angles` matmul shape matches
-    # and the wav round-trips to the full `target_len`.
-    target_len = int(hp.sample_length_sec * hp.sample_rate)
-    needed_frames = target_len // hp.hop_length + 1
-    if linear.shape[-1] < needed_frames:
-        pad = torch.zeros(
-            1, linear.shape[1], needed_frames - linear.shape[-1],
-            dtype=linear.dtype, device=linear.device,
-        )
-        linear = torch.cat([linear, pad], dim=-1)
-
-    griffin = torchaudio.transforms.GriffinLim(
-        n_fft=hp.n_fft,
-        hop_length=hp.hop_length,
-        win_length=hp.win_length,
-        power=1.0,
-        n_iter=n_iter,
-        length=target_len,
-    )
-    return griffin(linear).squeeze(0)
+    hop = model.hop_length
+    n_full = pcm.shape[-1] // hop
+    usable = n_full * hop
+    if n_full == 0:
+        return torch.zeros(0, dtype=torch.float32)
+    out_chunks = [
+        model.step(pcm[i * hop:(i + 1) * hop].numpy())
+        for i in range(n_full)
+    ]
+    return torch.cat(out_chunks)[:usable]
 
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--checkpoint", required=True, help="Path to ckpt_*.pt")
-    p.add_argument("--enrollment", required=True, help="16 kHz mono WAV of the target speaker")
-    p.add_argument("--mixed", required=True, help="16 kHz mono WAV to be separated")
+    p.add_argument("--enrollment", required=True,
+                   help="Path to a wav of the target speaker (any SR; resampled to 16 kHz)")
+    p.add_argument("--mixed", required=True,
+                   help="Path to a 16 kHz mono WAV to be separated")
     p.add_argument("--out", required=True, help="Where to write the enhanced WAV")
-    p.add_argument("--device", default="auto", help="auto | mps | cuda | cpu")
-    p.add_argument("--gl-iter", type=int, default=16, help="Griffin-Lim iterations (more = better)")
     args = p.parse_args()
 
-    device = _select_device(args.device)
-    print(f"[offline] device={device}")
+    enroll = _load_audio_mono_16k(args.enrollment)
+    mixed = _load_audio_mono_16k(args.mixed)
+    print(f"[offline] enroll={enroll.shape[-1] / 16000:.2f}s, "
+          f"mixed={mixed.shape[-1] / 16000:.2f}s")
 
-    # ---- Load checkpoint + restore hparams ----
-    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    hp = HParams.from_dict(ckpt["hparams"])
-    hp.device = str(device)
+    model = StreamingVoiceFilter()          # bundled ONNX, no paths needed
+    model.set_enrollment(enroll)
+    print(f"[offline] d-vector dim={model.hp.d_vector_dim}, "
+          f"hop={model.hop_length} samples")
 
-    model = VoiceFilterLite(hp).to(device).eval()
-    # Training wraps the model with `torch.compile` (see train.py), which
-    # saves state_dict keys prefixed by `_orig_mod.` — strip it so the
-    # un-compiled model here can load the weights unchanged.
-    model_state = {
-        k.removeprefix("_orig_mod."): v for k, v in ckpt["model_state"].items()
-    }
-    model.load_state_dict(model_state)
-    print(f"[offline] loaded {args.checkpoint} (step={ckpt.get('step')})")
+    enhanced = _stream_pcm_through(model, mixed)
 
-    # ---- Speaker encoder (lazy-loads d-vector weights on first call) ----
-    encoder = SpeakerEncoder(hp).to(device)
-    if Path(hp.dvector_pt_path).is_file():
-        encoder.load_pretrained(hp.dvector_pt_path)
-        print(f"[offline] SpeakerEncoder loaded from {hp.dvector_pt_path} (d_vector_dim={hp.d_vector_dim})")
-    else:
-        print(
-            f"[offline] WARNING: dvector weights not found at {hp.dvector_pt_path}; "
-            f"encoder will use RANDOM init. The pretrained embedder "
-            f"(`models/embedder.pt`) ships with this repo (from "
-            f"https://github.com/maum-ai/voicefilter)."
-        )
-        encoder.freeze()
-
-    # ---- Audio IO ----
-    enroll_wav, sr_enroll = sf.read(args.enrollment, dtype="float32")
-    if sr_enroll != hp.sample_rate:
-        import torchaudio
-        enroll_wav = torchaudio.functional.resample(
-            torch.from_numpy(enroll_wav), sr_enroll, hp.sample_rate
-        ).numpy()
-    if enroll_wav.ndim > 1:
-        enroll_wav = enroll_wav.mean(axis=1)
-    enroll_wav_t = torch.from_numpy(enroll_wav)
-
-    mixed_wav, sr_mix = sf.read(args.mixed, dtype="float32")
-    if sr_mix != hp.sample_rate:
-        import torchaudio
-        mixed_wav = torchaudio.functional.resample(
-            torch.from_numpy(mixed_wav), sr_mix, hp.sample_rate
-        ).numpy()
-    if mixed_wav.ndim > 1:
-        mixed_wav = mixed_wav.mean(axis=1)
-    mixed_wav_t = torch.from_numpy(mixed_wav)
-    print(f"[offline] mixed={mixed_wav_t.shape[-1] / hp.sample_rate:.2f}s")
-
-    # ---- Register speaker ----
-    dvec = _load_enrollment_dvec(encoder, enroll_wav_t, hp, device)
-    sf_model = StreamingVoiceFilter(model, hp)
-    sf_model.set_dvector(dvec)
-
-    # ---- Frame-by-frame streaming inference ----
-    mel_fn = make_mel_basis(hp, device=torch.device("cpu"))
-    mixed_logmel = wav_to_log_mel(mixed_wav_t, hp, mel_fn)         # (T, 80)
-
-    enhanced_frames = []
-    for t in range(mixed_logmel.shape[0]):
-        enhanced_frames.append(sf_model.step(mixed_logmel[t]).cpu())
-    enhanced_logmel = torch.stack(enhanced_frames, dim=0)           # (T, 80)
-
-    # ---- Reconstruct waveform + save ----
-    enhanced_wav = _logmel_to_wav(enhanced_logmel, hp, n_iter=args.gl_iter)
-    peak = enhanced_wav.abs().max().clamp(min=1e-8)
+    peak = enhanced.abs().max().clamp(min=1e-8)
     if peak > 1.0:
-        enhanced_wav = enhanced_wav / peak
+        enhanced = enhanced / peak
 
-    sf.write(args.out, enhanced_wav.numpy(), hp.sample_rate)
-    print(f"[offline] wrote {args.out} ({enhanced_wav.shape[-1] / hp.sample_rate:.2f}s)")
+    sf.write(args.out, enhanced.numpy(), 16000)
+    print(f"[offline] wrote {args.out} ({enhanced.shape[-1] / 16000:.2f}s)")
 
 
 if __name__ == "__main__":
